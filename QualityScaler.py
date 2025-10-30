@@ -52,7 +52,8 @@ from os.path import (
 from subprocess import (
     Popen as subprocess_Popen,
     STARTUPINFO,
-    STARTF_USESHOWWINDOW
+    STARTF_USESHOWWINDOW,
+    PIPE as subprocess_PIPE
 )
 
 # Third-party library imports
@@ -2000,12 +2001,16 @@ def upscale_video(
         extraction_command = [
             FFMPEG_EXE_PATH,
             "-y",
-            "-loglevel",   "error",
-            "-err_detect", "ignore_err",
-            "-i",          video_path,
-            "-r",          str(frame_rate),
-            "-qscale:v",   "3",
-            output_pattern
+            "-hide_banner",
+            "-loglevel",    "error",
+            "-err_detect",  "ignore_err",
+            "-i",           video_path,
+            "-r",           str(frame_rate),
+            "-qscale:v",    "3",
+            "-c:v",         "mjpeg",
+            "-f",           "image2pipe",
+            "-"
+            # output_pattern
         ]
         
         # 5. Execute FFMPEG command
@@ -2014,18 +2019,23 @@ def upscale_video(
             startupinfo = STARTUPINFO()
             startupinfo.dwFlags |= STARTF_USESHOWWINDOW
 
+
         ffmpeg_process = None
         try:
-            ffmpeg_process = subprocess_Popen(extraction_command, startupinfo = startupinfo)
-            while ffmpeg_process.poll() is None:
-                if event_stop_upscale_process.is_set():
-                    print("[FFMPEG] Stop richiesto, terminazione in corso")
-                    ffmpeg_process.terminate()
-                    ffmpeg_process.wait()
-                    stop_extraction_event.set()
-                    monitor_thread.join()
-                    return []
-                sleep(0.25)
+            with open(os_path_join(target_directory, "garbage.bin"), "w") as garbage:
+                ffmpeg_process = subprocess_Popen(
+                    extraction_command, startupinfo = startupinfo,
+                    stdout = garbage,
+                )
+                while ffmpeg_process.poll() is None:
+                    if event_stop_upscale_process.is_set():
+                        print("[FFMPEG] Stop richiesto, terminazione in corso")
+                        ffmpeg_process.terminate()
+                        ffmpeg_process.wait()
+                        stop_extraction_event.set()
+                        monitor_thread.join()
+                        return []
+                    sleep(0.25)
 
         except Exception as e:
             write_process_status(process_status_q, f"{ERROR_STATUS} Frame extraction failed: {e}")
@@ -2044,6 +2054,8 @@ def upscale_video(
             for f in natsorted(os_listdir(target_directory))
             if f.endswith(".jpg") and f.startswith("frame_")
         ]
+
+        raise Exception("Frame extraction checkpoint, check it out")
 
         return extracted_files
 

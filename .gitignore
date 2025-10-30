@@ -1,0 +1,4 @@
+.idea/
+AI-onnx/
+!AI-onnx/DOWNLOAD_AI_ONNX_FILES_AND_PLACE_HERE.txt
+Assets/ffmpeg.exe

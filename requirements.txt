@@ -1,3 +1,4 @@
+typing-extensions
 #AI
 onnxruntime-directml==1.23.0
 numpy

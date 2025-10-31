@@ -125,6 +125,8 @@ from customtkinter import (
     set_default_color_theme
 )
 
+from FrameIndexer import FrameIndexer
+
 if sys.stdout is None: sys.stdout = open(os_devnull, "w")
 if sys.stderr is None: sys.stderr = open(os_devnull, "w")
 
@@ -2022,20 +2024,25 @@ def upscale_video(
 
         ffmpeg_process = None
         try:
-            with open(os_path_join(target_directory, "garbage.bin"), "w") as garbage:
-                ffmpeg_process = subprocess_Popen(
-                    extraction_command, startupinfo = startupinfo,
-                    stdout = garbage,
-                )
-                while ffmpeg_process.poll() is None:
-                    if event_stop_upscale_process.is_set():
-                        print("[FFMPEG] Stop richiesto, terminazione in corso")
-                        ffmpeg_process.terminate()
-                        ffmpeg_process.wait()
-                        stop_extraction_event.set()
-                        monitor_thread.join()
-                        return []
-                    sleep(0.25)
+            ffmpeg_process = subprocess_Popen(
+                extraction_command, startupinfo = startupinfo,
+                stdout = subprocess_PIPE,
+            )
+
+            indexer = FrameIndexer(ffmpeg_process.stdout, os_path_join(target_directory, "framevault.mpeg"))
+            indexer_thread = Thread(target = indexer.read_to_end)
+            indexer_thread.start()
+
+            while ffmpeg_process.poll() is None:
+                if event_stop_upscale_process.is_set():
+                    print("[FFMPEG] Stop richiesto, terminazione in corso")
+                    ffmpeg_process.terminate()
+                    ffmpeg_process.wait()
+                    stop_extraction_event.set()
+                    monitor_thread.join()
+                    indexer_thread.join()
+                    return []
+                sleep(0.1)
 
         except Exception as e:
             write_process_status(process_status_q, f"{ERROR_STATUS} Frame extraction failed: {e}")
@@ -2043,6 +2050,16 @@ def upscale_video(
             stop_extraction_event.set()
             monitor_thread.join()
             return []
+
+        f0 = open(os_path_join(target_directory, "frame0.jpg"), "a+b")
+        f0.truncate()
+        f0.write(indexer.get_frame(0))
+        f0.close()
+
+        fl = open(os_path_join(target_directory, "framelast.jpg"), "a+b")
+        fl.truncate()
+        fl.write(indexer.get_frame(len(indexer.jpg_segments) - 1))
+        fl.close()
 
         # 6. Stop monitoring thread
         stop_extraction_event.set()

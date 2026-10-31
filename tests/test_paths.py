@@ -27,8 +27,8 @@ class ResourcePathTests(unittest.TestCase):
         bundle = os.path.abspath("bundled resources")
         with patch.object(sys, "_MEIPASS", bundle, create=True):
             self.assertEqual(
-                find_by_relative_path(os.path.join("Assets", "exiftool.exe")),
-                os.path.join(bundle, "Assets", "exiftool.exe"),
+                find_by_relative_path(os.path.join("Assets", "logo.png")),
+                os.path.join(bundle, "Assets", "logo.png"),
             )
 
     def test_absolute_resource_path_is_unchanged(self):
@@ -59,39 +59,73 @@ class OutputPathTests(unittest.TestCase):
                     os.path.join(destination, "猫 🐈.original_upscaled.png"),
                 )
 
-    def test_model_factors_and_blending_do_not_change_names(self):
+    def test_model_factors_and_sharpening_do_not_change_names(self):
         for helper in (prepare_output_image_filename, prepare_output_video_filename):
             for model in ("BSRGANx2", "RealESR_Gx4", "IRCNN_Mx1"):
                 for input_factor, output_factor in ((1, 1), (0.1239, 2.999), (2, 0.5)):
-                    for blending in (0, 0.3, 0.5, 0.7, 0.4):
+                    for sharpening in (0, 0.3, 0.5):
                         with self.subTest(
                             helper=helper.__name__,
                             model=model,
                             factors=(input_factor, output_factor),
-                            blending=blending,
+                            sharpening=sharpening,
                         ):
                             self.assertEqual(
                                 helper(
                                     "clip.jpg", OUTPUT_PATH_CODED, model,
-                                    input_factor, output_factor, ".tiff", blending,
+                                    input_factor, output_factor, ".tiff", sharpening,
                                 ),
                                 "clip_upscaled.tiff",
                             )
 
+    def test_filename_helpers_accept_canonical_sharpening_keyword(self):
+        for helper, source_keyword, extension_keyword in (
+            (prepare_output_image_filename, "image_path", "selected_image_extension"),
+            (prepare_output_video_filename, "video_path", "selected_video_extension"),
+        ):
+            with self.subTest(helper=helper.__name__):
+                self.assertEqual(
+                    helper(
+                        **{
+                            source_keyword: os.path.join("input", "clip.original.jpg"),
+                            "selected_output_path": "output",
+                            "selected_AI_model": "RealESR_Gx4",
+                            "input_resize_factor": 0.5,
+                            "output_resize_factor": 2,
+                            extension_keyword: ".png",
+                            "selected_sharpening_amount": 0.3,
+                        }
+                    ),
+                    os.path.join("output", "clip.original_upscaled.png"),
+                )
+
     def test_cache_directory_is_stable_and_includes_source_extension(self):
         source = os.path.join("入力", "映像.final.mp4")
-        for model, input_factor, output_factor, blending in (
+        for model, input_factor, output_factor, sharpening in (
             ("BSRGANx4", 1, 1, 0),
-            ("RealESR_Gx4", 0.1239, 2.999, 0.7),
+            ("RealESR_Gx4", 0.1239, 2.999, 0.5),
         ):
             with self.subTest(model=model):
                 self.assertEqual(
                     prepare_output_video_directory_name(
                         source, OUTPUT_PATH_CODED, model,
-                        input_factor, output_factor, blending,
+                        input_factor, output_factor, sharpening,
                     ),
                     os.path.join("入力", "映像.final.mp4.qualityscaler"),
                 )
+
+    def test_cache_directory_accepts_canonical_sharpening_keyword(self):
+        self.assertEqual(
+            prepare_output_video_directory_name(
+                video_path=os.path.join("input", "clip.mp4"),
+                selected_output_path=OUTPUT_PATH_CODED,
+                selected_AI_model="RealESR_Gx4",
+                input_resize_factor=0.5,
+                output_resize_factor=2,
+                selected_sharpening_amount=0.5,
+            ),
+            os.path.join("input", "clip.mp4.qualityscaler"),
+        )
 
     def test_custom_cache_directory_and_distinct_source_extensions(self):
         destination = os.path.join("output", "cache")

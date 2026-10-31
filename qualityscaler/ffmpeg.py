@@ -40,19 +40,21 @@ class FFmpeg:
                 process.wait()
 
     @contextmanager
-    def _pipe(self, arguments, stop_event, *, writing=False):
+    def _pipe(self, arguments, stop_event, *, writing=False, progress=None):
         if stop_event.is_set():
             raise UpscaleCancelled()
         process = subprocess.Popen(
             [self.executable, "-hide_banner", "-loglevel", "error", *arguments],
             stdin=subprocess.PIPE if writing else subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL if writing else subprocess.PIPE,
+            stdout=subprocess.PIPE if not writing or progress else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.IDLE_PRIORITY_CLASS)
+            if sys.platform == "win32" else 0,
         )
         # Drain stderr continuously to avoid a full-pipe deadlock, retaining at
         # most 64 KiB even if a damaged video emits diagnostics for every frame.
         errors = deque(maxlen=8)
+        progress_errors = []
         truncated = Event()
         finished = Event()
 
@@ -78,8 +80,26 @@ class FFmpeg:
                     return
 
         error_reader = Thread(target=drain_errors, daemon=True)
+        def drain_progress():
+            for line in process.stdout:
+                if line.startswith(b"frame="):
+                    try:
+                        frame = int(line.partition(b"=")[2])
+                    except ValueError:
+                        continue
+                    try:
+                        progress(frame)
+                    except Exception as error:
+                        # Keep draining even if a UI/status consumer fails,
+                        # otherwise a full progress pipe could deadlock FFmpeg.
+                        if not progress_errors:
+                            progress_errors.append(error)
+
+        progress_reader = Thread(target=drain_progress, daemon=True) if writing and progress else None
         watcher = Thread(target=watch_cancellation, daemon=True)
         error_reader.start()
+        if progress_reader:
+            progress_reader.start()
         watcher.start()
         pipe = process.stdin if writing else process.stdout
         try:
@@ -98,6 +118,10 @@ class FFmpeg:
                 raise UpscaleCancelled()
             if returncode:
                 raise RuntimeError(f"FFmpeg failed ({returncode}): {diagnostic()}")
+            if progress_reader:
+                progress_reader.join()
+                if progress_errors:
+                    raise progress_errors[0]
         finally:
             self._terminate(process)
             try:
@@ -107,13 +131,17 @@ class FFmpeg:
             finished.set()
             watcher.join()
             error_reader.join()
+            if progress_reader:
+                progress_reader.join()
+                process.stdout.close()
             process.stderr.close()
 
     def extract(self, video_path, fps, stop_event, save_frame):
         """Pass each complete JPEG to save_frame(index, bytes) in display order."""
         arguments = [
+            "-threads", "0", "-err_detect", "ignore_err", "-hwaccel", "auto",
             "-i", str(video_path), "-map", "0:v:0", "-an",
-            "-r", str(fps), "-qscale:v", "3", "-c:v", "mjpeg",
+            "-vf", f"fps={fps}", "-qscale:v", "3", "-c:v", "mjpeg",
             "-f", "image2pipe", "pipe:1",
         ]
         count = 0
@@ -127,7 +155,8 @@ class FFmpeg:
             raise ValueError("FFmpeg extracted no video frames")
         return count
 
-    def encode(self, video_path, output_path, fps, codec, frames, stop_event):
+    def encode(self, video_path, output_path, fps, codec, frames, stop_event, *,
+               output_size=None, total_frames=None, status=None):
         """Encode ordered cached JPEGs and copy optional audio in one invocation.
 
         Publish only a successful encode; an existing output is never replaced
@@ -144,23 +173,53 @@ class FFmpeg:
         os.close(descriptor)
         partial = Path(partial_name)
         codec = {"x264": "libx264", "x265": "libx265"}.get(codec, codec)
-        arguments = [
-            "-y", "-f", "image2pipe", "-framerate", str(fps),
-            "-c:v", "mjpeg", "-i", "pipe:0", "-i", str(video_path),
-            "-map", "0:v:0", "-map", "1:a?",
-            "-map_metadata", "1", "-c:v", codec,
-            "-vf", "scale=in_range=full:out_range=limited,format=yuv420p",
-            "-color_range", "tv", "-b:v", "12000k", "-c:a", "copy",
-            str(partial),
-        ]
+        codecs = [codec] if codec == "libx264" else [codec, "libx264"]
+        filters = "format=yuv420p"
+        if output_size is not None:
+            filters = f"scale={output_size[0]}:{output_size[1]}," + filters
+        # A callable supplies a fresh ordered SQLite iterator for codec retries.
+        # Sequences are naturally replayable; a bare iterator is single-use.
+        if callable(frames):
+            frame_factory = frames
+        elif iter(frames) is frames:
+            frame_factory = lambda: frames
+            codecs = codecs[:1]
+        else:
+            frame_factory = lambda: iter(frames)
+
+        def progress(count):
+            percent = min(100, int(count * 100 / total_frames)) if total_frames else 0
+            status(f"Encoding upscaled video {percent}%")
+
         try:
-            with self._pipe(arguments, stop_event, writing=True) as pipe:
-                for frame in frames:
+            for index, current_codec in enumerate(codecs):
+                arguments = [
+                    "-y", "-f", "image2pipe", "-framerate", str(fps),
+                    "-c:v", "mjpeg", "-i", "pipe:0", "-i", str(video_path),
+                    "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1",
+                    "-c:v", current_codec, "-c:a", "copy", "-g", str(max(1, round(fps))),
+                    "-vf", filters, "-color_range", "tv", "-b:v", "50000k",
+                ]
+                if output.suffix.lower() in (".mp4", ".mov", ".m4v"):
+                    arguments += ["-movflags", "+faststart"]
+                if status:
+                    arguments += ["-progress", "pipe:1", "-nostats"]
+                arguments.append(str(partial))
+                if index and status:
+                    status("Encoding upscaled video (x264 fallback)")
+                try:
+                    with self._pipe(arguments, stop_event, writing=True,
+                                    progress=progress if status else None) as pipe:
+                        for frame in frame_factory():
+                            if stop_event.is_set():
+                                raise UpscaleCancelled()
+                            pipe.write(frame)
                     if stop_event.is_set():
                         raise UpscaleCancelled()
-                    pipe.write(frame)
-            if stop_event.is_set():
-                raise UpscaleCancelled()
-            os.replace(partial, output)
+                    os.replace(partial, output)
+                    return
+                except RuntimeError:
+                    if index == len(codecs) - 1:
+                        raise
         finally:
             partial.unlink(missing_ok=True)

@@ -1,44 +1,27 @@
+"""The 2026.4 desktop UI; processing and persistence live in backend modules.
 
-# Standard library imports
-import sys
-from time       import sleep
-from webbrowser import open as open_browser
+Importing this module creates neither Tk nor multiprocessing resources. The
+minimal launcher imports it only for a desktop launch, never in spawn workers.
+"""
 
-from typing    import Callable
-from threading import Thread
-from queue     import Empty
-from multiprocessing import (
-    Process,
-    Event          as multiprocessing_Event,
-    Manager        as multiprocessing_Manager,
-    freeze_support as multiprocessing_freeze_support
-)
-
-from json import (
-    load  as json_load,
-    dumps as json_dumps
-)
-
-from os import (
-    sep        as os_separator,
-    devnull    as os_devnull
-)
-
+from dataclasses import dataclass, field
+from json import load as json_load, dumps as json_dumps
+from multiprocessing import Manager as multiprocessing_Manager, Process
+from os import sep as os_separator
 from os.path import (
-    basename   as os_path_basename,
-    join       as os_path_join,
-    exists     as os_path_exists,
-    expanduser as os_path_expanduser
+    basename as os_path_basename,
+    dirname as os_path_dirname,
+    exists as os_path_exists,
+    expanduser as os_path_expanduser,
+    join as os_path_join,
 )
-
-# Third-party library imports
-from psutil import Process as psutil_Process, NoSuchProcess, AccessDenied
-from onnxruntime import get_available_providers as onnxruntime_get_available_providers
-
-from PIL.Image import (
-    open      as pillow_image_open,
-    fromarray as pillow_image_fromarray
-)
+from pathlib import Path
+from queue import Empty
+from shutil import disk_usage as shutil_disk_usage
+import sys
+from tkinter import DISABLED, StringVar, TclError
+from typing import Any, Callable, Optional
+from webbrowser import open as open_browser
 
 from cv2 import (
     CAP_PROP_FPS,
@@ -46,1876 +29,1691 @@ from cv2 import (
     CAP_PROP_FRAME_HEIGHT,
     CAP_PROP_FRAME_WIDTH,
     COLOR_BGR2RGB,
-    error        as opencv_error,
+    COLOR_BGRA2RGBA,
+    COLOR_GRAY2RGB,
+    error as opencv_error,
     VideoCapture as opencv_VideoCapture,
-    cvtColor     as opencv_cvtColor,
-    resize       as opencv_resize,
+    cvtColor as opencv_cvtColor,
+    resize as opencv_resize,
 )
-
-from qualityscaler.ffmpeg import FFmpeg
-from qualityscaler.drag_drop import FileDropTarget, FileDropWindow
-from qualityscaler.inputs import merge_input_files, supported_input_files
-from qualityscaler.jobs import check_if_file_is_video, upscale_orchestrator
-from qualityscaler.media import (
-    get_image_resolution,
-    image_read,
-)
-from qualityscaler.paths import (
-    OUTPUT_PATH_CODED,
-    find_by_relative_path,
-)
-from qualityscaler.status import write_process_status
-
-# GUI imports
-from tkinter import StringVar
-from tkinter import DISABLED
+from PIL.Image import open as pillow_image_open, fromarray as pillow_image_fromarray
+from psutil import Process as psutil_Process, NoSuchProcess, AccessDenied
 from customtkinter import (
-    CTkFrame,
-    CTkButton,
-    CTkEntry,
-    CTkFont,
-    CTkImage,
-    CTkLabel,
-    CTkOptionMenu,
-    CTkScrollableFrame,
-    CTkToplevel,
-    filedialog,
-    set_appearance_mode,
-    set_default_color_theme
+    CTk, CTkFrame, CTkButton, CTkEntry, CTkFont, CTkImage, CTkLabel,
+    CTkOptionMenu, CTkProgressBar, CTkScrollableFrame, CTkToplevel, CTkCanvas,
+    filedialog, set_appearance_mode, set_default_color_theme,
+    set_widget_scaling, set_window_scaling,
 )
 
-if sys.stdout is None: sys.stdout = open(os_devnull, "w")
-if sys.stderr is None: sys.stderr = open(os_devnull, "w")
+from .ai import get_model_upscale_factor
+from .catalog import (
+    APP_NAME as app_name, VERSION as version, AI_models_list,
+    MODEL_NAMES, VRAM_model_usage,
+)
+from .config import ProcessingConfig
+from .drag_drop import FileDropTarget, FileDropWindow
+from .formats import VIDEO_EXTENSIONS
+from .gpu import GPU, get_AI_engine_info
+from .inputs import merge_input_files, supported_input_files
+from .jobs import upscale_orchestrator
+from .media import get_image_resolution, image_read
+from .paths import OUTPUT_PATH_CODED, find_by_relative_path
+from .platform_support import prevent_sleep, allow_sleep, show_completion_notification
+from .status import write_process_status
+from .video import VideoSettings, get_resume_progress
 
-app_name   = "QualityScaler"
-version    = "4.7"
-githubme   = "https://github.com/Djdefrag/QualityScaler/releases"
+githubme = "https://github.com/Djdefrag/QualityScaler/releases"
 telegramme = "https://linktr.ee/j3ngystudio"
-
-app_name_color          = "#F274EE"
-background_color        = "#000000"
+app_name_color = "#F274EE"
+background_color = "#000000"
 widget_background_color = "#181818"
-text_color              = "#B8B8B8"
+text_color = "#C8C8C8"
+CARD_BACKGROUND_COLOR = "#1A1A1A"
+CARD_BORDER_COLOR = "#2B2B2B"
+CARD_TITLE_COLOR = "#ECECEC"
+CARD_VALUE_COLOR = "#C8C8C8"
+CARD_MUTED_COLOR = "#7E7E7E"
+CARD_FAINT_COLOR = "#6A6A6A"
+CARD_ACCENT_COLOR = "#5AA9FF"
+RESUME_BADGE_COLOR = "#16261C"
+RESUME_ACCENT_COLOR = "#4ADE80"
+RESUME_BAR_DIM_COLOR = "#1E4A33"
+MESSAGE_SUCCESS_COLOR = "#4ADE80"
+MESSAGE_WARNING_COLOR = "#F0B85A"
+MESSAGE_ERROR_COLOR = "#FF5C5C"
+UI_ACCENT_COLOR = CARD_ACCENT_COLOR
+UI_BORDER_COLOR = CARD_BORDER_COLOR
+UI_CORNER_RADIUS = 6
 
-VRAM_model_usage = {
-    'RealESR_Gx4':     2.5,
-    'RealESR_Animex4': 2.5,
-    'BSRGANx4':        0.75,
-    'RealESRGANx4':    0.75,
-    'BSRGANx2':        0.8,
-    'IRCNN_Mx1':       4,
-    'IRCNN_Lx1':       4,
-
-    'LVAx2': 2.5,
-    'LVAx4': 2.5
-}
-
-MENU_LIST_SEPARATOR         = [ "----" ]
-SRVGGNetCompact_models_list = [ "RealESR_Gx4", "RealESR_Animex4"                ]
-BSRGAN_models_list          = [ "BSRGANx2",    "BSRGANx4",       "RealESRGANx4" ]
-IRCNN_models_list           = [ "IRCNN_Mx1",   "IRCNN_Lx1"                      ]
-in_testing_model_list       = [ "LVAx2",       "LVAx4"                          ]
-
-AI_models_list = (
-    SRVGGNetCompact_models_list
-    + MENU_LIST_SEPARATOR + BSRGAN_models_list
-    + MENU_LIST_SEPARATOR + IRCNN_models_list
-    #+ MENU_LIST_SEPARATOR + in_testing_model_list
-    )
-
-AI_multithreading_list = [ "OFF", "2 threads", "4 threads", "6 threads", "8 threads"]
-blending_list          = [ "OFF", "Low", "Medium", "High" ]
-gpus_list              = [ "Auto", "GPU 1", "GPU 2", "GPU 3", "GPU 4" ]
-keep_frames_list       = [ "OFF", "ON" ]
-image_extension_list   = [ ".png", ".jpg", ".bmp", ".tiff" ]
-video_extension_list   = [ ".mp4", ".mkv", ".avi", ".mov" ]
+zoom_option_list = ["50%", "75%", "100%", "125%", "150%", "175%"]
+AI_multithreading_list = ["OFF", "2 threads", "4 threads", "6 threads", "8 threads"]
+sharpening_list = ["OFF", "Low", "High"]
+gpus_list = ["No GPU found"]
+keep_frames_list = ["OFF", "ON"]
+image_extension_list = [".png", ".jpg", ".bmp", ".tiff"]
+video_extension_list = [".mp4", ".mkv", ".avi", ".mov"]
 video_codec_list = [
-    "x264",       "x265",       MENU_LIST_SEPARATOR[0],
-    "h264_nvenc", "hevc_nvenc", MENU_LIST_SEPARATOR[0],
-    "h264_amf",   "hevc_amf",   MENU_LIST_SEPARATOR[0],
-    "h264_qsv",   "hevc_qsv",
-    ]
-
-DOCUMENT_PATH        = os_path_join(os_path_expanduser('~'), 'Documents')
-USER_PREFERENCE_PATH = find_by_relative_path(f"{DOCUMENT_PATH}{os_separator}{app_name}_{version}_UserPreference.json")
-FFMPEG_EXE_PATH      = FFmpeg().executable
-
+    "x264", "x265", "----",
+    "h264_nvenc", "hevc_nvenc", "----",
+    "h264_amf", "hevc_amf", "----",
+    "h264_qsv", "hevc_qsv",
+]
+DOCUMENT_PATH = os_path_join(os_path_expanduser("~"), "Documents")
+USER_PREFERENCE_PATH = os_path_join(
+    DOCUMENT_PATH, f"{app_name}_{version}_userpreference.json"
+)
+MIN_FREE_DISK_SPACE_GB = 2
 COMPLETED_STATUS = "Completed"
-ERROR_STATUS     = "Error"
-STOP_STATUS      = "Stop"
+ERROR_STATUS = "Error"
+STOP_STATUS = "Stop"
+CLOSE_APP_STATUS = "CloseApp"
 
 
-offset_y_options = 0.0825
-row1  = 0.125
-row2  = row1 + offset_y_options
-row3  = row2 + offset_y_options
-row4  = row3 + offset_y_options
-row5  = row4 + offset_y_options
-row6  = row5 + offset_y_options
-row7  = row6 + offset_y_options
-row8  = row7 + offset_y_options
-row9  = row8 + offset_y_options
-row10 = row9 + offset_y_options
+@dataclass
+class UserPreferences:
+    app_zoom: str = "100%"
+    ai_model: str = AI_models_list[0]
+    ai_multithreading: str = AI_multithreading_list[0]
+    gpu: str = gpus_list[0]
+    keep_frames: bool = True
+    image_extension: str = image_extension_list[0]
+    video_extension: str = video_extension_list[0]
+    video_codec: str = video_codec_list[0]
+    sharpening: str = sharpening_list[1]
+    output_path: str = OUTPUT_PATH_CODED
+    input_resize_factor: str = "50"
+    output_resize_factor: str = "100"
+    vram_limiter: str = "4"
 
-column_offset = 0.2
-column_info1  = 0.625
-column_info2  = 0.858
-column_1      = 0.66
-column_2      = column_1 + column_offset
-column_1_5    = column_info1 + 0.08
-column_1_4    = column_1_5 - 0.0127
-column_3      = column_info2 + 0.08
-column_2_9    = column_3 - 0.0127
-column_3_5    = column_2 + 0.0355
 
+@dataclass
+class AppState:
+    preferences: UserPreferences
+    window: Optional[CTk] = None
+    info_message: Optional[StringVar] = None
+    selected_output_path: Optional[StringVar] = None
+    selected_input_resize_factor: Optional[StringVar] = None
+    selected_output_resize_factor: Optional[StringVar] = None
+    selected_VRAM_limiter: Optional[StringVar] = None
+    selected_video_codec: Optional[StringVar] = None
+    file_widget: Optional["FileWidget"] = None
+    process_upscale_orchestrator: Optional[Any] = None
+    process_status_q: Optional[Any] = None
+    event_stop_upscale_process: Optional[Any] = None
+    selected_file_list: list[str] = field(default_factory=list)
+    input_widgets: tuple = ()
+    action_button: Optional[Any] = None
+    processing: bool = False
+    stopping: bool = False
+    closing: bool = False
+    poll_after_id: Optional[str] = None
+    after_ids: set = field(default_factory=set)
+    traces: list = field(default_factory=list)
+
+
+app_state: Optional[AppState] = None
+ROW_STEP = 0.0825
+ROW_HEADER = 0.05
+
+
+def _row(index: int) -> float:
+    return 0.125 + index * ROW_STEP
+
+
+ROW_AI_MODEL = _row(0)
+ROW_AI_SHARPENING = _row(1)
+ROW_AI_MULTITHREADING = _row(2)
+ROW_RESOLUTION = _row(3)
+ROW_GPU = _row(4)
+ROW_OUTPUT_FORMAT = _row(5)
+ROW_CODEC = _row(6)
+ROW_OUTPUT_PATH = _row(9)
+ROW_ACTIONS = _row(10)
+COL_INFO_L = 0.625
+COL_INFO_R = 0.858
+COL_TEXT_L = COL_INFO_L + 0.08
+COL_TEXT_R = COL_INFO_R + 0.08
+COL_MENU_L = COL_TEXT_L - 0.0127
+COL_MENU_R = COL_TEXT_R - 0.0127
+COL_TITLE = 0.66
+COL_ZOOM = COL_TITLE + 0.2
+COL_MENU_C = COL_ZOOM + 0.0355
 little_textbox_width = 74
 little_menu_width = 98
 
 
-
-file_widget = None
-input_widgets = ()
-
+def check_if_file_is_video(path: str) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
 
 
-# GUI utils ---------------------------
+def lerp_hex(color_a: str, color_b: str, t: float) -> str:
+    a = (int(color_a[1:3], 16), int(color_a[3:5], 16), int(color_a[5:7], 16))
+    b = (int(color_b[1:3], 16), int(color_b[3:5], 16), int(color_b[5:7], 16))
+    r, g, blue = (round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+    return f"#{r:02X}{g:02X}{blue:02X}"
+
+
+def _schedule(delay: int, callback: Callable) -> Optional[str]:
+    """Schedule on Tk's thread and retain handles for deterministic shutdown."""
+    state = app_state
+    if state is None or state.closing:
+        return None
+
+    def run():
+        state.after_ids.discard(handle)
+        if not state.closing:
+            callback()
+
+    handle = state.window.after(delay, run)
+    state.after_ids.add(handle)
+    return handle
+
+
+def _cancel_after(handle):
+    if handle is None or app_state.window is None:
+        return
+    try:
+        app_state.window.after_cancel(handle)
+    except TclError:
+        pass
+    app_state.after_ids.discard(handle)
+
 
 class MessageBox(CTkToplevel):
-
-    def __init__(
-            self,
-            messageType: str,
-            title: str,
-            subtitle: str,
-            default_value: str,
-            option_list: list,
-            ) -> None:
-
-        super().__init__()
-
-        self._running: bool = False
-
+    def __init__(self, messageType, title, subtitle, default_value, option_list):
+        super().__init__(master=App.get_app_window())
+        self.configure(fg_color=background_color)
         self._messageType = messageType
-        self._title       = title
-        self._subtitle    = subtitle
+        self._title = title
+        self._subtitle = subtitle
         self._default_value = default_value
-        self._option_list   = option_list
-        self._ctkwidgets_index = 0
-
-        self.title('')
-        self.lift()                          # lift window on top
-        self.attributes("-topmost", True)    # stay on top
+        self._option_list = option_list
+        self.title("")
+        self.lift()
+        self.attributes("-topmost", True)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
-        self.after(10, self._create_widgets)  # create widgets with slight delay, to avoid white flickering of background
+        self._create_after = self.after(10, self._create_widgets)
         self.resizable(False, False)
-        self.grab_set()                       # make other windows not clickable
+        self.grab_set()
 
-    def _ok_event(
-            self,
-            event = None
-            ) -> None:
+    def destroy(self):
+        handle = getattr(self, "_create_after", None)
+        if handle is not None:
+            self.after_cancel(handle)
+            self._create_after = None
+        super().destroy()
+
+    def _ok_event(self, event=None):
         self.grab_release()
         self.destroy()
 
-    def _on_closing(
-            self
-            ) -> None:
-        self.grab_release()
-        self.destroy()
+    def _on_closing(self):
+        self._ok_event()
 
-    def createEmptyLabel(self) -> CTkLabel:
-        return CTkLabel(
-            master   = self,
-            fg_color = "transparent",
-            width    = 500,
-            height   = 17,
-            text     = ''
+    def _copy_log_to_clipboard(self, copy_button):
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(self._option_list))
+        self.update()
+        copy_button.configure(text="Copied!")
+
+    def _create_widgets(self):
+        self._create_after = None
+        self.grid_columnconfigure(0, weight=1)
+        tint = UI_ACCENT_COLOR if self._messageType == "info" else MESSAGE_ERROR_COLOR
+        CTkLabel(self, text=self._title, font=bold22, text_color=tint,
+                 anchor="w", justify="left").grid(
+            row=0, column=0, padx=25, pady=(20, 0), sticky="ew"
         )
-
-    def placeInfoMessageTitleSubtitle(self) -> None:
-
-        spacingLabel1 = self.createEmptyLabel()
-        spacingLabel2 = self.createEmptyLabel()
-
-        if self._messageType == "info":
-            title_subtitle_text_color = "#3399FF"
-        elif self._messageType == "error":
-            title_subtitle_text_color = "#FF3131"
-
-        titleLabel = CTkLabel(
-            master     = self,
-            width      = 500,
-            anchor     = 'w',
-            justify    = "left",
-            fg_color   = "transparent",
-            text_color = title_subtitle_text_color,
-            font       = bold22,
-            text       = self._title
+        if self._default_value is not None:
+            CTkLabel(self, text=f"Default: {self._default_value}", font=bold17,
+                     text_color=CARD_MUTED_COLOR, anchor="w").grid(
+                row=1, column=0, padx=25, sticky="ew"
             )
-
-        if self._default_value != None:
-            defaultLabel = CTkLabel(
-                master     = self,
-                width      = 500,
-                anchor     = 'w',
-                justify    = "left",
-                fg_color   = "transparent",
-                text_color = "#3399FF",
-                font       = bold17,
-                text       = f"Default: {self._default_value}"
-                )
-
-        subtitleLabel = CTkLabel(
-            master     = self,
-            width      = 500,
-            anchor     = 'w',
-            justify    = "left",
-            fg_color   = "transparent",
-            text_color = title_subtitle_text_color,
-            font       = bold14,
-            text       = self._subtitle
-            )
-
-        spacingLabel1.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 0, pady = 0, sticky = "ew")
-
-        self._ctkwidgets_index += 1
-        titleLabel.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 25, pady = 0, sticky = "ew")
-
-        if self._default_value != None:
-            self._ctkwidgets_index += 1
-            defaultLabel.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 25, pady = 0, sticky = "ew")
-
-        self._ctkwidgets_index += 1
-        subtitleLabel.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 25, pady = 0, sticky = "ew")
-
-        self._ctkwidgets_index += 1
-        spacingLabel2.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 0, pady = 0, sticky = "ew")
-
-    def placeInfoMessageOptionsText(self) -> None:
-
-        for option_text in self._option_list:
-            optionLabel = CTkLabel(
-                master        = self,
-                width         = 600,
-                height        = 45,
-                anchor        = 'w',
-                justify       = "left",
-                text_color    = text_color,
-                fg_color      = "#282828",
-                bg_color      = "transparent",
-                font          = bold13,
-                text          = option_text,
-                corner_radius = 10,
-            )
-
-            self._ctkwidgets_index += 1
-            optionLabel.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 25, pady = 4, sticky = "ew")
-
-        spacingLabel3 = self.createEmptyLabel()
-
-        self._ctkwidgets_index += 1
-        spacingLabel3.grid(row = self._ctkwidgets_index, column = 0, columnspan = 2, padx = 0, pady = 0, sticky = "ew")
-
-    def placeInfoMessageOkButton(
-            self
-            ) -> None:
-
-        ok_button = CTkButton(
-            master  = self,
-            command = self._ok_event,
-            text    = 'OK',
-            width   = 125,
-            font         = bold11,
-            border_width = 1,
-            fg_color     = "#282828",
-            text_color   = "#E0E0E0",
-            border_color = "#0096FF"
+        CTkLabel(self, text=self._subtitle, font=bold14, text_color=CARD_VALUE_COLOR,
+                 anchor="w", justify="left").grid(
+            row=2, column=0, padx=25, pady=(0, 17), sticky="ew"
         )
+        for index, option in enumerate(self._option_list, start=3):
+            CTkLabel(self, text=option, width=600, height=45, font=bold13,
+                     anchor="w", justify="left", text_color=CARD_VALUE_COLOR,
+                     fg_color=CARD_BACKGROUND_COLOR, corner_radius=10).grid(
+                row=index, column=0, padx=25, pady=4, sticky="ew"
+            )
+        buttons = CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=3 + len(self._option_list), column=0,
+                     padx=20, pady=20, sticky="e")
+        style = dict(width=125, font=bold11, border_width=2,
+                     corner_radius=UI_CORNER_RADIUS, fg_color=CARD_BACKGROUND_COLOR,
+                     hover_color=widget_background_color, text_color="#E0E0E0",
+                     border_color=UI_ACCENT_COLOR)
+        if self._messageType == "error":
+            copy_button = CTkButton(buttons, text="Copy log", **style)
+            copy_button.configure(command=lambda: self._copy_log_to_clipboard(copy_button))
+            copy_button.pack(side="left", padx=(0, 10))
+        CTkButton(buttons, text="OK", command=self._ok_event, **style).pack(side="left")
 
-        self._ctkwidgets_index += 1
-        ok_button.grid(row = self._ctkwidgets_index, column = 1, columnspan = 1, padx = (10, 20), pady = (10, 20), sticky = "e")
-
-    def _create_widgets(
-            self
-            ) -> None:
-
-        self.grid_columnconfigure((0, 1), weight=1)
-        self.rowconfigure(0, weight=1)
-
-        self.placeInfoMessageTitleSubtitle()
-        self.placeInfoMessageOptionsText()
-        self.placeInfoMessageOkButton()
 
 class FileWidget(CTkScrollableFrame):
+    """Upstream file cards with lifecycle-bound thumbnails and animations."""
 
-    def __init__(
-            self,
-            master,
-            selected_file_list,
-            upscale_factor       = 1,
-            input_resize_factor  = 0,
-            output_resize_factor = 0,
-            **kwargs
-            ) -> None:
-
+    def __init__(self, master, selected_file_list, upscale_factor=1,
+                 input_resize_factor=0, output_resize_factor=0, **kwargs):
         super().__init__(master, **kwargs)
-        self.grid_columnconfigure(0, weight = 1)
-
-        self.file_list            = selected_file_list
-        self.upscale_factor       = upscale_factor
-        self.input_resize_factor  = input_resize_factor
+        self.grid_columnconfigure(0, weight=1)
+        self.file_list = list(selected_file_list)
+        self.unreadable_files = []
+        self.upscale_factor = upscale_factor
+        self.input_resize_factor = input_resize_factor
         self.output_resize_factor = output_resize_factor
-
         self.index_row = 1
         self.ui_components = []
-        self._icons = {}
-        self._header_created = False
-        self.unreadable_files = []
-        self._create_widgets()
+        self._animation_ids = {}
+        self.add_clean_button()
+        self._render_cards()
 
-    def _destroy_(self) -> None:
-        clear_input_files()
+    def _cancel_animations(self):
+        for handle, owner in self._animation_ids.items():
+            try:
+                owner.after_cancel(handle)
+            except TclError:
+                pass
+        self._animation_ids.clear()
 
-    def _create_widgets(self) -> None:
-        if not self._header_created:
-            self.add_clean_button()
-            self._header_created = True
+    def _animate_after(self, owner, delay, callback):
+        def run():
+            self._animation_ids.pop(handle, None)
+            if owner.winfo_exists():
+                callback()
+        handle = owner.after(delay, run)
+        self._animation_ids[handle] = owner
+
+    def destroy(self):
+        self._cancel_animations()
+        # A global functools.cache on a bound method retains the entire
+        # destroyed scroll frame and all its Tk images indefinitely.
+        self.ui_components.clear()
+        super().destroy()
+
+    def _destroy_(self):
+        return clear_input_files()
+
+    def _render_cards(self):
         readable = []
-        self.unreadable_files = []
         for file_path in self.file_list:
             try:
-                file_name_label, file_info_label = self.add_file_information(file_path)
-            except (OSError, ValueError, opencv_error, ZeroDivisionError):
+                item = self._create_file_card(file_path)
+            except (OSError, ValueError, opencv_error):
                 self.unreadable_files.append(file_path)
                 continue
             readable.append(file_path)
-            self.ui_components.append(file_name_label)
-            self.ui_components.append(file_info_label)
+            self.ui_components.append(item)
         self.file_list = readable
 
-    def add_file_information(self, file_path) -> tuple:
-        infos, icon = self.extract_file_info(file_path)
+    def _remove_file(self, file_path):
+        if inputs_are_busy() or file_path not in self.file_list:
+            return
+        self.file_list.remove(file_path)
+        if not self.file_list:
+            self._destroy_()
+            return
+        self.clean_file_list()
+        self._render_cards()
+        app_state.selected_file_list = list(self.file_list)
 
-        # File name
-        file_name_label = CTkLabel(
-            self,
-            text       = os_path_basename(file_path),
-            font       = bold14,
-            text_color = text_color,
-            compound   = "left",
-            anchor     = "w",
-            padx       = 10,
-            pady       = 5,
-            justify    = "left",
+    def _create_file_card(self, file_path):
+        is_video, width, height, num_frames, frame_rate = self._read_media_properties(file_path)
+        file_icon = self.extract_file_icon(file_path)
+        card = CTkFrame(self, fg_color=CARD_BACKGROUND_COLOR, corner_radius=12,
+                        border_width=2, border_color=CARD_BORDER_COLOR)
+        card.grid(row=self.index_row, column=0, columnspan=3, padx=6,
+                  pady=(3, 9), sticky="ew")
+        card.grid_columnconfigure(1, weight=1)
+        thumbnail = CTkLabel(card, text="", image=file_icon)
+        thumbnail.grid(row=0, column=0, padx=(12, 14), pady=12, sticky="n")
+        remove_button = CTkButton(
+            card, command=lambda: self._remove_file(file_path), text="X",
+            width=24, height=24, font=bold11, fg_color="transparent",
+            hover_color="#8C3B3B", border_width=2, border_color=MESSAGE_ERROR_COLOR,
+            text_color=MESSAGE_ERROR_COLOR, corner_radius=UI_CORNER_RADIUS,
         )
-        file_name_label.grid(
-            row    = self.index_row,
-            column = 0,
-            columnspan = 3,
-            pady   = (0, 2),
-            padx   = (3, 3),
-            sticky = "w"
+        remove_button.grid(row=0, column=2, padx=(0, 8), pady=12, sticky="n")
+        for widget in (remove_button, remove_button._text_label):
+            widget.bind("<Enter>", lambda e: remove_button._text_label.configure(fg="#FFFFFF"), add="+")
+            widget.bind("<Leave>", lambda e: remove_button._text_label.configure(fg=MESSAGE_ERROR_COLOR), add="+")
+        content = CTkFrame(card, fg_color="transparent")
+        content.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=11)
+        content.grid_columnconfigure(0, weight=1)
+        CTkLabel(content, text=os_path_basename(file_path), font=bold14,
+                 text_color=CARD_TITLE_COLOR, anchor="w", justify="left").grid(
+            row=0, column=0, sticky="ew"
         )
-
-        # File infos and icon
-        file_info_label = CTkLabel(
-            self,
-            text       = infos,
-            image      = icon,
-            font       = bold12,
-            text_color = text_color,
-            compound   = "left",
-            anchor     = "w",
-            padx       = 10,
-            pady       = 5,
-            justify    = "left",
+        CTkLabel(
+            content,
+            text=self._format_source_meta(is_video, width, height, num_frames, frame_rate),
+            font=bold12, text_color=CARD_MUTED_COLOR, anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        dynamic_section = self._create_dynamic_section(
+            content, 2, is_video, file_path, width, height
         )
-        file_info_label.grid(
-            row    = self.index_row + 1,
-            column = 0,
-            columnspan = 3,
-            pady   = (0, 15),
-            padx   = (3, 3),
-            sticky = "w"
-        )
+        self.index_row += 1
+        return dict(card=card, content=content, dynamic_row=2, is_video=is_video,
+                    file_path=file_path, width=width, height=height,
+                    dynamic_section=dynamic_section, icon=file_icon)
 
-        self.index_row += 2
+    def _create_dynamic_section(self, content, start_row, is_video, file_path, width, height):
+        resume_percent = get_video_resume_progress(file_path) if is_video else None
+        has_pipeline = all((self.input_resize_factor, self.output_resize_factor, self.upscale_factor))
+        display_percent = resume_percent if resume_percent is not None else 0
+        if not is_video and not has_pipeline:
+            return None
+        section = CTkFrame(content, fg_color="transparent")
+        section.grid_columnconfigure(0, weight=1)
+        section.grid(row=start_row, column=0, sticky="ew")
+        inner_row = 0
+        if is_video:
+            badge = self._create_resume_badge(section, display_percent)
+            badge.grid(row=inner_row, column=0, sticky="ew", pady=(8, 0))
+            inner_row += 1
+        if has_pipeline:
+            CTkFrame(section, fg_color=CARD_BORDER_COLOR, height=1).grid(
+                row=inner_row, column=0, sticky="ew", pady=(7, 6)
+            )
+            pipeline_table = self._create_pipeline_table(
+                section, self._compute_pipeline_rows(width, height)
+            )
+            pipeline_table.grid(row=inner_row + 1, column=0, sticky="ew")
+        return section
 
-        return file_name_label, file_info_label
+    def add_clean_button(self):
+        style = dict(height=28, font=bold11, border_width=2,
+                     corner_radius=UI_CORNER_RADIUS, fg_color="#282828",
+                     text_color="#E0E0E0", border_color=UI_ACCENT_COLOR)
+        CTkButton(self, command=open_files_action, text="ADD FILES", width=110,
+                  **style).grid(row=0, column=0, pady=7, padx=7, sticky="w")
+        CTkButton(self, command=clear_input_files, text="CLEAN", image=clear_icon,
+                  width=90, **style).grid(row=0, column=2, pady=7, padx=(0, 7))
 
-    def add_clean_button(self) -> None:
-        hint = CTkLabel(self, text="Drop more files here", font=bold12, text_color=text_color)
-        hint.grid(row=0, column=0, padx=(3, 8), pady=(7, 7), sticky="w")
-        add_button = CTkButton(
-            self, text="ADD FILES", command=open_files_action, width=90, height=28,
-            font=bold11, corner_radius=1, fg_color="#282828",
-        )
-        add_button.grid(row=0, column=1, padx=(0, 7), pady=(7, 7))
-
-        button = CTkButton(
-            master        = self,
-            command       = self._destroy_,
-            text          = "CLEAN",
-            image         = clear_icon,
-            width         = 90,
-            height        = 28,
-            font          = bold11,
-            border_width  = 1,
-            corner_radius = 1,
-            fg_color      = "#282828",
-            text_color    = "#E0E0E0",
-            border_color  = "#0096FF"
-        )
-
-        button.grid(row = 0, column=2, pady=(7, 7), padx = (0, 7))
-
-
-
-
-    def extract_file_icon(self, file_path) -> CTkImage:
-        if file_path in self._icons:
-            return self._icons[file_path]
-        max_size = 60
-
+    def extract_file_icon(self, file_path):
         if check_if_file_is_video(file_path):
-            video_cap   = opencv_VideoCapture(file_path)
+            video_cap = opencv_VideoCapture(file_path)
             try:
-                success, frame = video_cap.read()
-                if not success or frame is None:
-                    raise ValueError(f"Unable to read video: {file_path}")
-                source_icon = opencv_cvtColor(frame, COLOR_BGR2RGB)
+                ret, source_icon = video_cap.read()
             finally:
                 video_cap.release()
+            if not ret or source_icon is None:
+                raise ValueError("Unreadable video preview")
         else:
-            source_icon = opencv_cvtColor(image_read(file_path), COLOR_BGR2RGB)
+            source_icon = image_read(file_path)
+        if source_icon is None:
+            raise ValueError("Unreadable image preview")
+        if source_icon.ndim == 2:
+            source_icon = opencv_cvtColor(source_icon, COLOR_GRAY2RGB)
+        elif source_icon.shape[2] == 4:
+            source_icon = opencv_cvtColor(source_icon, COLOR_BGRA2RGBA)
+        else:
+            source_icon = opencv_cvtColor(source_icon, COLOR_BGR2RGB)
+        ratio = min(60 / source_icon.shape[0], 60 / source_icon.shape[1])
+        size = (max(1, int(source_icon.shape[1] * ratio)),
+                max(1, int(source_icon.shape[0] * ratio)))
+        source_icon = opencv_resize(source_icon, size)
+        return CTkImage(pillow_image_fromarray(source_icon), size=size)
 
-        ratio       = min(max_size / source_icon.shape[0], max_size / source_icon.shape[1])
-        new_width   = int(source_icon.shape[1] * ratio)
-        new_height  = int(source_icon.shape[0] * ratio)
-        source_icon = opencv_resize(source_icon,(new_width, new_height))
-        ctk_icon    = CTkImage(pillow_image_fromarray(source_icon, mode="RGB"), size = (new_width, new_height))
-
-        self._icons[file_path] = ctk_icon
-        return ctk_icon
-
-    def extract_file_info(self, file_path) -> tuple:
-
+    def _read_media_properties(self, file_path):
         if check_if_file_is_video(file_path):
-            cap          = opencv_VideoCapture(file_path)
+            cap = opencv_VideoCapture(file_path)
             try:
-                width        = round(cap.get(CAP_PROP_FRAME_WIDTH))
-                height       = round(cap.get(CAP_PROP_FRAME_HEIGHT))
-                num_frames   = int(cap.get(CAP_PROP_FRAME_COUNT))
-                frame_rate   = cap.get(CAP_PROP_FPS)
-                if frame_rate <= 0:
-                    raise ValueError(f"Invalid video frame rate: {file_path}")
-                duration     = num_frames/frame_rate
-                minutes      = int(duration/60)
-                seconds      = duration % 60
+                width = round(cap.get(CAP_PROP_FRAME_WIDTH))
+                height = round(cap.get(CAP_PROP_FRAME_HEIGHT))
+                num_frames = int(cap.get(CAP_PROP_FRAME_COUNT))
+                fps = cap.get(CAP_PROP_FPS)
             finally:
                 cap.release()
+            if width <= 0 or height <= 0 or num_frames <= 0:
+                raise ValueError("Unreadable video")
+            from math import isfinite
+            frame_rate = fps if isfinite(fps) and fps > 0 else 30.0
+            return True, width, height, num_frames, frame_rate
+        image = image_read(file_path)
+        if image is None:
+            raise ValueError("Unreadable image")
+        height, width = get_image_resolution(image)
+        return False, width, height, 0, 0.0
 
-            file_icon  = self.extract_file_icon(file_path)
-            file_infos = f"{minutes}m:{round(seconds)}s • {num_frames}frames • {width}x{height} \n"
+    def _format_source_meta(self, is_video, width, height, num_frames, frame_rate):
+        if not is_video:
+            return f"{width}×{height}"
+        duration = num_frames / frame_rate if frame_rate else 0
+        minutes = int(duration / 60)
+        seconds = round(duration % 60)
+        return f"{minutes}m {seconds}s  |  {width}×{height}  |  {round(frame_rate, 1)} fps"
 
-            if self.input_resize_factor != 0 and self.output_resize_factor != 0 and self.upscale_factor != 0 :
-                input_resized_height = int(height * (self.input_resize_factor/100))
-                input_resized_width  = int(width * (self.input_resize_factor/100))
+    def _compute_pipeline_rows(self, width, height):
+        input_width = int(width * (self.input_resize_factor / 100))
+        input_height = int(height * (self.input_resize_factor / 100))
+        ai_width = int(input_width * self.upscale_factor)
+        ai_height = int(input_height * self.upscale_factor)
+        output_width = int(ai_width * (self.output_resize_factor / 100))
+        output_height = int(ai_height * (self.output_resize_factor / 100))
+        return [
+            ("Input", f"{self.input_resize_factor}%", f"{input_width}×{input_height}", False),
+            ("AI", f"x{self.upscale_factor}", f"{ai_width}×{ai_height}", True),
+            ("Output", f"{self.output_resize_factor}%", f"{output_width}×{output_height}", False),
+        ]
 
-                upscaled_height = int(input_resized_height * self.upscale_factor)
-                upscaled_width  = int(input_resized_width * self.upscale_factor)
+    def _create_resume_badge(self, parent, percent):
+        badge = CTkFrame(parent, fg_color=RESUME_BADGE_COLOR, corner_radius=8)
+        badge.grid_columnconfigure(1, weight=1)
+        CTkLabel(badge, text="Completed", font=bold12, text_color=RESUME_ACCENT_COLOR,
+                 anchor="w").grid(row=0, column=0, padx=(10, 10), pady=7, sticky="w")
+        bar = CTkProgressBar(badge, height=8, corner_radius=4,
+                             fg_color=CARD_BORDER_COLOR, progress_color=RESUME_ACCENT_COLOR)
+        bar.set(0)
+        bar.grid(row=0, column=1, pady=7, sticky="ew")
+        percent_label = CTkLabel(badge, text="0%", font=bold12,
+                                 text_color=RESUME_ACCENT_COLOR, width=42, anchor="e")
+        percent_label.grid(row=0, column=2, padx=(10, 10), pady=7, sticky="e")
+        self._animate_progress_bar(bar, percent / 100, percent_label, percent)
+        return badge
 
-                output_resized_height = int(upscaled_height * (self.output_resize_factor/100))
-                output_resized_width  = int(upscaled_width * (self.output_resize_factor/100))
+    def _animate_progress_bar(self, bar, target, percent_label=None, percent=0, current=0.0):
+        if not bar.winfo_exists():
+            return
+        current += (target - current) * 0.08
+        ratio = current / target if target > 0 else 1.0
+        bar.configure(progress_color=lerp_hex(RESUME_BAR_DIM_COLOR, RESUME_ACCENT_COLOR, min(1.0, ratio)))
+        if percent_label is not None and percent_label.winfo_exists():
+            percent_label.configure(text=f"{round(current * 100)}%")
+        if target - current < 0.005:
+            bar.set(target)
+            if percent_label is not None and percent_label.winfo_exists():
+                percent_label.configure(text=f"{percent}%")
+            if percent >= 100:
+                self._glow_bar(bar)
+            else:
+                bar.configure(progress_color=RESUME_ACCENT_COLOR)
+            return
+        bar.set(current)
+        self._animate_after(bar, 20, lambda: self._animate_progress_bar(
+            bar, target, percent_label, percent, current
+        ))
 
-                file_infos += (
-                    f"AI input ({self.input_resize_factor}%) ➜ {input_resized_width}x{input_resized_height} \n"
-                    f"AI output (x{self.upscale_factor}) ➜ {upscaled_width}x{upscaled_height} \n"
-                    f"Video output ({self.output_resize_factor}%) ➜ {output_resized_width}x{output_resized_height}"
+    def _glow_bar(self, bar, step=0, sequence=None):
+        if not bar.winfo_exists():
+            return
+        if sequence is None:
+            peak = "#C4FFDC"
+            up = [lerp_hex(RESUME_ACCENT_COLOR, peak, i / 6) for i in range(7)]
+            down = [lerp_hex(peak, RESUME_ACCENT_COLOR, i / 6) for i in range(1, 7)]
+            sequence = up + down + up + down
+        if step >= len(sequence):
+            bar.configure(progress_color=RESUME_ACCENT_COLOR)
+            return
+        bar.configure(progress_color=sequence[step])
+        self._animate_after(bar, 45, lambda: self._glow_bar(bar, step + 1, sequence))
+
+    def _create_pipeline_table(self, parent, pipeline_rows):
+        table = CTkFrame(parent, fg_color="transparent")
+        table.grid_columnconfigure(0, minsize=96)
+        table.grid_columnconfigure(1, minsize=96)
+        table.grid_columnconfigure(2, weight=1)
+        for row_index, (label, detail, resolution, is_ai) in enumerate(pipeline_rows):
+            colors = (CARD_ACCENT_COLOR,) * 3 if is_ai else (
+                CARD_MUTED_COLOR, CARD_FAINT_COLOR, CARD_VALUE_COLOR
+            )
+            for column, (text, color) in enumerate(zip((label, detail, resolution), colors)):
+                CTkLabel(table, text=text, font=bold12, text_color=color,
+                         anchor="w", height=20).grid(
+                    row=row_index, column=column, sticky="w", pady=0,
+                    padx=(0, 14) if column == 2 else 0,
                 )
+        return table
 
-        else:
-            height, width = get_image_resolution(image_read(file_path))
-            file_icon     = self.extract_file_icon(file_path)
-
-            file_infos = f"{width}x{height}\n"
-
-            if self.input_resize_factor != 0 and self.output_resize_factor != 0 and self.upscale_factor != 0 :
-                input_resized_height = int(height * (self.input_resize_factor/100))
-                input_resized_width  = int(width * (self.input_resize_factor/100))
-
-                upscaled_height = int(input_resized_height * self.upscale_factor)
-                upscaled_width  = int(input_resized_width * self.upscale_factor)
-
-                output_resized_height = int(upscaled_height * (self.output_resize_factor/100))
-                output_resized_width  = int(upscaled_width * (self.output_resize_factor/100))
-
-                file_infos += (
-                    f"AI input ({self.input_resize_factor}%) ➜ {input_resized_width}x{input_resized_height} \n"
-                    f"AI output (x{self.upscale_factor}) ➜ {upscaled_width}x{upscaled_height} \n"
-                    f"Image output ({self.output_resize_factor}%) ➜ {output_resized_width}x{output_resized_height}"
-                )
-
-        return file_infos, file_icon
-
-
-    # EXTERNAL FUNCTIONS
-
-    def clean_file_list(self) -> None:
+    def clean_file_list(self):
+        self._cancel_animations()
         self.index_row = 1
-        for ui_component in self.ui_components:
-            ui_component.destroy()
+        for item in self.ui_components:
+            item["card"].destroy()
         self.ui_components = []
 
-    def get_selected_file_list(self) -> list:
+    def refresh_pipeline(self):
+        self._cancel_animations()
+        for item in self.ui_components:
+            if item["dynamic_section"] is not None:
+                item["dynamic_section"].destroy()
+            item["dynamic_section"] = self._create_dynamic_section(
+                item["content"], item["dynamic_row"], item["is_video"],
+                item["file_path"], item["width"], item["height"],
+            )
+
+    def get_selected_file_list(self):
         return self.file_list
 
-    def set_upscale_factor(self, upscale_factor) -> None:
-        self.upscale_factor = upscale_factor
+    def highlight_active_file(self, file_number):
+        for index, item in enumerate(self.ui_components):
+            if item["card"].winfo_exists():
+                item["card"].configure(
+                    border_color=CARD_ACCENT_COLOR if index == file_number - 1 else CARD_BORDER_COLOR
+                )
 
-    def set_input_resize_factor(self, input_resize_factor) -> None:
-        self.input_resize_factor = input_resize_factor
+    def clear_active_highlight(self):
+        for item in self.ui_components:
+            if item["card"].winfo_exists():
+                item["card"].configure(border_color=CARD_BORDER_COLOR)
 
-    def set_output_resize_factor(self, output_resize_factor) -> None:
-        self.output_resize_factor = output_resize_factor
+    def set_upscale_factor(self, value):
+        self.upscale_factor = value
 
+    def set_input_resize_factor(self, value):
+        self.input_resize_factor = value
 
-
-def get_values_for_file_widget() -> tuple:
-    # Upscale factor
-    upscale_factor = get_upscale_factor()
-
-    # Input resolution %
-    try:
-        input_resize_factor = int(float(str(selected_input_resize_factor.get())))
-    except:
-        input_resize_factor = 0
-
-    # Output resolution %
-    try:
-        output_resize_factor = int(float(str(selected_output_resize_factor.get())))
-    except:
-        output_resize_factor = 0
-
-    return upscale_factor, input_resize_factor, output_resize_factor
-
-def update_file_widget(a, b, c) -> None:
-    if file_widget is None:
-        return
-
-    upscale_factor, input_resize_factor, output_resize_factor = get_values_for_file_widget()
-
-    file_widget.clean_file_list()
-    file_widget.set_upscale_factor(upscale_factor)
-    file_widget.set_input_resize_factor(input_resize_factor)
-    file_widget.set_output_resize_factor(output_resize_factor)
-    file_widget._create_widgets()
-
-def create_option_background():
-    return CTkFrame(
-        master   = window,
-        bg_color = background_color,
-        fg_color = widget_background_color,
-        height   = 46,
-        corner_radius = 10
-    )
-
-def create_info_button(
-        command: Callable,
-        text:    str,
-        width:   int = 200
-        ) -> CTkFrame:
-
-    frame = CTkFrame(master = window, fg_color = widget_background_color, height = 25)
-
-    button = CTkButton(
-        master        = frame,
-        command       = command,
-        font          = bold12,
-        text          = "?",
-        border_color  = "#0096FF",
-        border_width  = 1,
-        fg_color      = widget_background_color,
-        hover_color   = background_color,
-        width         = 23,
-        height        = 15,
-        corner_radius = 1
-    )
-    button.grid(row=0, column=0, padx=(0, 7), pady=2, sticky="w")
-
-    label = CTkLabel(
-        master     = frame,
-        text       = text,
-        width      = width,
-        height     = 22,
-        fg_color   = "transparent",
-        bg_color   = widget_background_color,
-        text_color = text_color,
-        font       = bold13,
-        anchor     = "w"
-    )
-    label.grid(row=0, column=1, sticky="w")
-
-    frame.grid_propagate(False)
-    frame.grid_columnconfigure(1, weight=1)
-
-    return frame
-
-def create_option_menu(
-        command:       Callable,
-        values:        list,
-        default_value: str,
-        border_color:  str = "#404040",
-        border_width:  int = 1,
-        width:         int = 159,
-        height:        int = 26
-    ) -> CTkFrame:
-
-    total_width  = (width + 2 * border_width)
-    total_height = (height + 2 * border_width)
-
-    frame = CTkFrame(
-        master        = window,
-        fg_color      = border_color,
-        width         = total_width,
-        height        = total_height,
-        border_width  = 0,
-        corner_radius = 1,
-    )
-
-    option_menu = CTkOptionMenu(
-        master             = frame,
-        command            = command,
-        values             = values,
-        width              = width,
-        height             = height,
-        corner_radius      = 0,
-        dropdown_font      = bold12,
-        font               = bold11,
-        anchor             = "center",
-        text_color         = text_color,
-        fg_color           = background_color,
-        button_color       = background_color,
-        button_hover_color = background_color,
-        dropdown_fg_color  = background_color
-    )
-
-    option_menu.place(x = (total_width - width) / 2, y = (total_height - height) / 2)
-    option_menu.set(default_value)
-    return frame
-
-def create_text_box(
-        textvariable: StringVar,
-        width:        int,
-        height:       int = 26
-    ) -> CTkEntry:
-
-    return CTkEntry(
-        master        = window,
-        textvariable  = textvariable,
-        corner_radius = 1,
-        width         = width,
-        height        = height,
-        font          = bold11,
-        justify       = "center",
-        text_color    = text_color,
-        fg_color      = "#000000",
-        border_width  = 1,
-        border_color  = "#404040",
-    )
-
-def create_text_box_output_path(
-        textvariable: StringVar,
-        height:       int = 26
-    ) -> CTkEntry:
-
-    return CTkEntry(
-        master        = window,
-        textvariable  = textvariable,
-        corner_radius = 1,
-        width         = 250,
-        height        = height,
-        font          = bold11,
-        justify       = "center",
-        text_color    = text_color,
-        fg_color      = "#000000",
-        border_width  = 1,
-        border_color  = "#404040",
-        state         = DISABLED
-    )
-
-def create_active_button(
-        command: Callable,
-        text: str,
-        icon: CTkImage = None,
-        width: int = 140,
-        height: int = 30,
-        border_color: str = "#0096FF"
-        ) -> CTkButton:
-
-    return CTkButton(
-        master        = window,
-        command       = command,
-        text          = text,
-        image         = icon,
-        width         = width,
-        height        = height,
-        font          = bold11,
-        border_width  = 1,
-        corner_radius = 1,
-        fg_color      = "#282828",
-        text_color    = "#E0E0E0",
-        border_color  = border_color
-    )
+    def set_output_resize_factor(self, value):
+        self.output_resize_factor = value
 
 
+# GUI state, processing contracts, and validation ----------------------------
 
-
-# Core functions ------------------------
-
-def check_upscale_steps() -> None:
-    sleep(1)
-
-    while True:
-        actual_step = process_status_q.get()
-        print(f"[{app_name}] check_upscale_steps - {actual_step}")
-
-        if actual_step == COMPLETED_STATUS:
-            info_message.set(f"All files completed! :)")
-            stop_upscale_process()
-            place_upscale_button()
-            break
-
-        elif actual_step == STOP_STATUS:
-            info_message.set(f"Upscaling stopped")
-            stop_upscale_process()
-            place_upscale_button()
-            break
-
-        elif ERROR_STATUS in actual_step:
-            info_message.set(f"Error while upscaling :(")
-            error_to_show = actual_step.replace(ERROR_STATUS, "")
-            show_error_message(error_to_show.strip())
-            place_upscale_button()
-            break
-
-        else:
-            info_message.set(actual_step)
-
-        sleep(1)
-
-def stop_upscale_process() -> None:
-    """Checkpoint normally first; a hung GPU must not keep the app alive."""
-    event_stop_upscale_process.set()
-    process = globals().get("process_upscale_orchestrator")
-    if process is not None and process.pid is not None:
-        process.join(timeout=10)
-        if process.is_alive():
-            # FFmpeg is a child of the orchestrator. Do not orphan it when a
-            # blocked model requires the hard-stop fallback.
-            try:
-                for child in psutil_Process(process.pid).children(recursive=True):
-                    try:
-                        child.kill()
-                    except (NoSuchProcess, AccessDenied):
-                        pass
-            except (NoSuchProcess, AccessDenied):
-                pass
-            process.kill()
-            process.join()
-    while True:
+def get_values_for_file_widget():
+    factors = []
+    for variable in (app_state.selected_input_resize_factor, app_state.selected_output_resize_factor):
         try:
-            process_status_q.get_nowait()
-        except Empty:
-            break
-    event_stop_upscale_process.clear()
-
-def stop_button_command() -> None:
-    stop_upscale_process()
-    write_process_status(process_status_q, f"{STOP_STATUS}")
-
-# ORCHESTRATOR
-
-def upscale_button_command() -> None:
-    global selected_file_list
-    global selected_AI_model
-    global selected_gpu
-    global selected_keep_frames
-    global selected_AI_multithreading
-    global selected_blending_factor
-    global selected_image_extension
-    global selected_video_extension
-    global selected_video_codec
-    global tiles_resolution
-    global input_resize_factor
-    global output_resize_factor
-
-    global process_upscale_orchestrator
-
-    if user_input_checks():
-        info_message.set("Loading")
-
-        print("=" * 50)
-        print("> Starting upscale:")
-        print(f"    Files to upscale: {len(selected_file_list)}")
-        print(f"    Output path: {(selected_output_path.get())}")
-        print(f"    Selected AI model: {selected_AI_model}")
-        print(f"    Blending factor: {selected_blending_factor}")
-        print(f"    AI multithreading: {selected_AI_multithreading}")
-        print(f"    Selected GPU: {selected_gpu}")
-        print(f"    Tiles resolution for selected GPU VRAM: {tiles_resolution}x{tiles_resolution}px")
-        print(f"    Selected image output extension: {selected_image_extension}")
-        print(f"    Selected video output extension: {selected_video_extension}")
-        print(f"    Selected video output codec: {selected_video_codec}")
-        print(f"    Input resize factor: {int(input_resize_factor * 100)}%")
-        print(f"    Output resize factor: {int(output_resize_factor * 100)}%")
-        print(f"    Save frames: {selected_keep_frames}")
-        print("=" * 50)
-
-        place_stop_button()
-
-        event_stop_upscale_process.clear()
-        while True:
-            try:
-                process_status_q.get_nowait()
-            except Empty:
-                break
-
-        process_upscale_orchestrator = Process(
-            target = upscale_orchestrator,
-            args = (
-                process_status_q,
-                event_stop_upscale_process,
-                selected_file_list,
-                selected_output_path.get(),
-                selected_AI_model,
-                selected_AI_multithreading,
-                input_resize_factor,
-                output_resize_factor,
-                selected_gpu,
-                tiles_resolution,
-                selected_blending_factor,
-                selected_keep_frames,
-                selected_image_extension,
-                selected_video_extension,
-                selected_video_codec,
-            )
-        )
-        process_upscale_orchestrator.start()
-
-        Thread(target = check_upscale_steps).start()
-
-# GUI utils function ---------------------------
-
-def user_input_checks() -> bool:
-    global selected_file_list
-    global selected_AI_model
-    global selected_image_extension
-    global tiles_resolution
-    global input_resize_factor
-    global output_resize_factor
-
-    # Selected files
-    try: selected_file_list = file_widget.get_selected_file_list()
-    except:
-        info_message.set("Please select a file")
-        return False
-
-    if len(selected_file_list) <= 0:
-        info_message.set("Please select a file")
-        return False
+            factors.append(int(float(str(variable.get()))))
+        except (ValueError, TypeError, OverflowError):
+            factors.append(0)
+    return get_upscale_factor(), *factors
 
 
-    # AI model
-    if selected_AI_model == MENU_LIST_SEPARATOR[0]:
-        info_message.set("Please select the AI model")
-        return False
+def update_file_widget(*_args):
+    file_widget = None if app_state is None else app_state.file_widget
+    if file_widget is None or app_state.closing:
+        return
+    upscale_factor, input_factor, output_factor = get_values_for_file_widget()
+    file_widget.set_upscale_factor(upscale_factor)
+    file_widget.set_input_resize_factor(input_factor)
+    file_widget.set_output_resize_factor(output_factor)
+    file_widget.refresh_pipeline()
 
 
-    # Input resize factor
-    try: input_resize_factor = int(float(str(selected_input_resize_factor.get())))
-    except:
-        info_message.set("Input resolution % must be a number")
-        return False
-
-    if input_resize_factor > 0: input_resize_factor = input_resize_factor/100
-    else:
-        info_message.set("Input resolution % must be a value > 0")
-        return False
+def get_current_ai_model():
+    return app_state.preferences.ai_model
 
 
-    # Output resize factor
-    try: output_resize_factor = int(float(str(selected_output_resize_factor.get())))
-    except:
-        info_message.set("Output resolution % must be a number")
-        return False
-
-    if output_resize_factor > 0: output_resize_factor = output_resize_factor/100
-    else:
-        info_message.set("Output resolution % must be a value > 0")
-        return False
+def get_current_ai_multithreading():
+    value = app_state.preferences.ai_multithreading
+    return 1 if value == "OFF" else int(value.split()[0])
 
 
-    # VRAM limiter
-    try: tiles_resolution = 100 * int(float(str(selected_VRAM_limiter.get())))
-    except:
-        info_message.set("GPU VRAM value must be a number")
-        return False
+def get_current_sharpening_amount():
+    return {"OFF": 0, "Low": 0.3, "High": 0.5}.get(app_state.preferences.sharpening, 0)
 
-    if tiles_resolution > 0:
-        vram_multiplier = VRAM_model_usage.get(selected_AI_model)
 
-        selected_vram = (vram_multiplier * int(float(str(selected_VRAM_limiter.get()))))
-        tiles_resolution = int(selected_vram * 100)
-    else:
-        info_message.set("GPU VRAM value must be a value > 0")
-        return False
+def _positive_integer(variable, label):
+    try:
+        value = int(float(str(variable.get())))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{label} must be a number") from None
+    if value <= 0:
+        raise ValueError(f"{label} must be a value > 0")
+    return value
 
-    return True
 
-def show_error_message(exception: str) -> None:
-    messageBox_title    = "Upscale error"
-    messageBox_subtitle = "Please report the error on Github or Telegram"
-    messageBox_text     = f"\n {str(exception)} \n"
-
-    MessageBox(
-        messageType   = "error",
-        title         = messageBox_title,
-        subtitle      = messageBox_subtitle,
-        default_value = None,
-        option_list   = [messageBox_text]
+def _processing_config(selected_files):
+    """One conversion rule for job startup and SQLite resume identity."""
+    preferences = app_state.preferences
+    if preferences.ai_model not in MODEL_NAMES:
+        raise ValueError("Please select the AI model")
+    if preferences.video_codec not in video_codec_list or preferences.video_codec == "----":
+        raise ValueError("Please select the video codec")
+    input_factor = _positive_integer(app_state.selected_input_resize_factor, "Input resolution %") / 100
+    output_factor = _positive_integer(app_state.selected_output_resize_factor, "Output resolution %") / 100
+    vram = _positive_integer(app_state.selected_VRAM_limiter, "GPU VRAM value")
+    return ProcessingConfig(
+        selected_file_list=list(selected_files),
+        selected_output_path=app_state.selected_output_path.get(),
+        selected_AI_model=preferences.ai_model,
+        selected_AI_multithreading=get_current_ai_multithreading(),
+        input_resize_factor=input_factor,
+        output_resize_factor=output_factor,
+        selected_gpu=GPU.device_id_for(preferences.gpu),
+        tiles_resolution=int(VRAM_model_usage[preferences.ai_model] * vram * 100),
+        selected_sharpening_amount=get_current_sharpening_amount(),
+        selected_keep_frames=preferences.keep_frames,
+        selected_image_extension=preferences.image_extension,
+        selected_video_extension=preferences.video_extension,
+        selected_video_codec=preferences.video_codec,
     )
 
-def get_upscale_factor() -> int:
-    global selected_AI_model
-    if MENU_LIST_SEPARATOR[0] in selected_AI_model: upscale_factor = 0
-    elif 'x1' in selected_AI_model: upscale_factor = 1
-    elif 'x2' in selected_AI_model: upscale_factor = 2
-    elif 'x4' in selected_AI_model: upscale_factor = 4
 
-    return upscale_factor
+def get_video_resume_progress(video_path):
+    # The backend owns cache paths, source/settings identity and readonly
+    # SQLite access. Never scan per-frame folders or synthesize stale 100% flags.
+    try:
+        config = _processing_config(())
+        settings = VideoSettings(
+            model=config.selected_AI_model, gpu=config.selected_gpu,
+            input_resize_factor=config.input_resize_factor,
+            output_resize_factor=config.output_resize_factor,
+            tiles_resolution=config.tiles_resolution,
+            workers=config.selected_AI_multithreading,
+            sharpening_amount=config.selected_sharpening_amount,
+            codec=config.selected_video_codec, extension=config.selected_video_extension,
+            keep_frames=config.selected_keep_frames,
+        )
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return get_resume_progress(video_path, config.selected_output_path, settings)
+
+
+def build_processing_config():
+    selected = app_state.file_widget.get_selected_file_list() if app_state.file_widget is not None else []
+    if not selected:
+        app_state.info_message.set("Please select a file")
+        return None
+    try:
+        config = _processing_config(selected)
+    except ValueError as error:
+        app_state.info_message.set(str(error))
+        return None
+    warning = check_disk_space(config.selected_output_path, config.selected_file_list)
+    if warning is not None:
+        app_state.info_message.set("Not enough disk space")
+        show_disk_space_error_message(warning)
+        return None
+    app_state.selected_file_list = list(selected)
+    return config
+
+
+def show_error_message(exception):
+    MessageBox("error", "Upscale error", "Please report the error on Github or Telegram",
+               None, [f"\n {exception} \n"])
+
+
+def show_disk_space_error_message(warning):
+    MessageBox("error", "Not enough disk space",
+               "Free up some space on the output drive and try again", None, [f"\n {warning} \n"])
+
+
+def check_disk_space(output_path, selected_file_list):
+    videos = [path for path in selected_file_list if check_if_file_is_video(path)]
+    if not videos:
+        return None
+    # Inputs can span drives; when output is alongside input, check each one.
+    paths = {os_path_dirname(path) for path in videos} if output_path == OUTPUT_PATH_CODED else {output_path}
+    for path in paths:
+        while path and not os_path_exists(path):
+            parent = os_path_dirname(path)
+            if parent == path:
+                break
+            path = parent
+        if not path or not os_path_exists(path):
+            continue
+        try:
+            free_gb = shutil_disk_usage(path).free / (1024 ** 3)
+        except OSError:
+            continue
+        if free_gb < MIN_FREE_DISK_SPACE_GB:
+            return (
+                f"Not enough free disk space on the output drive ({free_gb:.1f} GB free, "
+                f"at least {MIN_FREE_DISK_SPACE_GB} GB recommended)\n{path}"
+            )
+    return None
+
+
+def get_upscale_factor():
+    model = get_current_ai_model()
+    return get_model_upscale_factor(model) if model in MODEL_NAMES else 0
+
 
 def inputs_are_busy():
-    process = globals().get("process_upscale_orchestrator")
-    return process is not None and process.is_alive()
+    if app_state is None:
+        return False
+    process = app_state.process_upscale_orchestrator
+    return app_state.processing or app_state.stopping or (
+        process is not None and process.is_alive()
+    )
 
 
 def accept_input_drop(event):
-    """The left input pane accepts drops; output/settings controls do not."""
-    if inputs_are_busy():
+    """Only the left input pane accepts drops, and never during a job."""
+    if app_state is None or app_state.closing or inputs_are_busy():
         return False
+    window = app_state.window
     x = event.x_root - window.winfo_rootx()
     y = event.y_root - window.winfo_rooty()
     return 0 <= x < window.winfo_width() / 2 and 0 <= y < window.winfo_height()
 
 
 def select_input_files(paths):
-    """Common picker/drop path: append readable media and preserve selection."""
-    global file_widget, selected_file_list, input_widgets
+    """Shared picker/drop path: append readable media and preserve selection."""
     if inputs_are_busy():
-        info_message.set("Stop the current job before changing input files")
+        app_state.info_message.set("Stop the current job before changing input files")
         return False
     paths = list(paths)
     supported = supported_input_files(paths)
     if not supported:
-        info_message.set("No supported input files (folders and other files are ignored)")
+        app_state.info_message.set("No supported input files (folders and other files are ignored)")
         return False
-    existing = file_widget.get_selected_file_list() if file_widget is not None else []
+    existing = app_state.file_widget.get_selected_file_list() if app_state.file_widget is not None else []
     selected = merge_input_files(existing, supported)
     if selected == existing:
-        info_message.set("These files are already selected")
+        app_state.info_message.set("These files are already selected")
         return True
-
     upscale_factor, input_factor, output_factor = get_values_for_file_widget()
     new_widget = FileWidget(
-        master=window, selected_file_list=selected, upscale_factor=upscale_factor,
+        master=app_state.window, selected_file_list=selected, upscale_factor=upscale_factor,
         input_resize_factor=input_factor, output_resize_factor=output_factor,
         fg_color=background_color, bg_color=background_color,
     )
     readable = new_widget.get_selected_file_list()
     if not any(path in readable for path in supported):
         new_widget.destroy()
-        info_message.set("Unable to read the selected images or videos")
+        app_state.info_message.set("Unable to read the selected images or videos")
         return False
-    if file_widget is not None:
-        file_widget.destroy()
-    for widget in input_widgets:
+    if app_state.file_widget is not None:
+        app_state.file_widget.destroy()
+    for widget in app_state.input_widgets:
         widget.destroy()
-    input_widgets = ()
-    file_widget = new_widget
-    selected_file_list = list(readable)
-    file_widget.place(relx=0.0, rely=0.0, relwidth=0.5, relheight=1.0)
+    app_state.input_widgets = ()
+    app_state.file_widget = new_widget
+    app_state.selected_file_list = list(readable)
+    new_widget.place(relx=0.0, rely=0.0, relwidth=0.5, relheight=1.0)
     skipped = len(paths) - len(supported) + len(new_widget.unreadable_files)
     message = f"Ready — {len(readable)} input file(s)"
     if skipped:
         message += f" ({skipped} skipped)"
-    info_message.set(message)
+    app_state.info_message.set(message)
     return True
 
 
 def clear_input_files():
-    global file_widget, selected_file_list
     if inputs_are_busy():
-        info_message.set("Stop the current job before changing input files")
+        app_state.info_message.set("Stop the current job before changing input files")
         return False
-    if file_widget is not None:
-        file_widget.destroy()
-    file_widget = None
-    selected_file_list = []
-    place_loadFile_section()
-    info_message.set("Drop input files here or use SELECT FILES")
+    if app_state.file_widget is not None:
+        app_state.file_widget.destroy()
+    app_state.file_widget = None
+    app_state.selected_file_list = []
+    App.place_loadFile_section()
+    app_state.info_message.set("Drop input files here or use SELECT FILES")
     return True
 
 
 def open_files_action():
     if inputs_are_busy():
-        info_message.set("Stop the current job before changing input files")
+        app_state.info_message.set("Stop the current job before changing input files")
         return
     paths = filedialog.askopenfilenames()
     if paths:
         select_input_files(paths)
 
+
 def open_output_path_action():
-    asked_selected_output_path = filedialog.askdirectory()
-    if asked_selected_output_path == "":
-        selected_output_path.set(OUTPUT_PATH_CODED)
-    else:
-        selected_output_path.set(asked_selected_output_path)
-
-
-
-
-# GUI select from menus functions ---------------------------
-
-def select_AI_from_menu(selected_option: str) -> None:
-    global selected_AI_model
-    selected_AI_model = selected_option
-    update_file_widget(1, 2, 3)
-
-def select_AI_multithreading_from_menu(selected_option: str) -> None:
-    global selected_AI_multithreading
-    if selected_option == "OFF":
-        selected_AI_multithreading = 1
-    else:
-        selected_AI_multithreading = int(selected_option.split()[0])
-
-def select_blending_from_menu(selected_option: str) -> None:
-    global selected_blending_factor
-
-    match selected_option:
-        case "OFF": selected_blending_factor = 0
-        case "Low":      selected_blending_factor = 0.3
-        case "Medium":   selected_blending_factor = 0.5
-        case "High":     selected_blending_factor = 0.7
-
-def select_gpu_from_menu(selected_option: str) -> None:
-    global selected_gpu
-    selected_gpu = selected_option
-
-def select_save_frame_from_menu(selected_option: str):
-    global selected_keep_frames
-    if   selected_option == "ON":  selected_keep_frames = True
-    elif selected_option == "OFF": selected_keep_frames = False
-
-def select_image_extension_from_menu(selected_option: str) -> None:
-    global selected_image_extension
-    selected_image_extension = selected_option
-
-def select_video_extension_from_menu(selected_option: str) -> None:
-    global selected_video_extension
-    selected_video_extension = selected_option
-
-def select_video_codec_from_menu(selected_option: str) -> None:
-    global selected_video_codec
-    selected_video_codec = selected_option
-
-
-
-
-# GUI place functions ---------------------------
-
-def place_github_button():
-
-    def opengithub() -> None: open_browser(githubme, new=1)
-
-    git_button = CTkButton(
-        master        = window,
-        command       = opengithub,
-        image         = logo_git,
-        width         = 32,
-        height        = 32,
-        border_width  = 1,
-        fg_color      = "transparent",
-        text_color    = text_color,
-        border_color  = "#404040",
-        anchor        = "center",
-        text          = "",
-        font          = bold11,
-        corner_radius = 1
-    )
-
-    git_button.place(relx = column_2 + 0.1, rely = 0.04, anchor = "center")
-
-def place_telegram_button():
-
-    def opentelegram() -> None: open_browser(telegramme, new=1)
-
-    telegram_button = CTkButton(
-        master        = window,
-        command       = opentelegram,
-        image         = logo_telegram,
-        width         = 32,
-        height        = 32,
-        border_width  = 1,
-        fg_color      = "transparent",
-        text_color    = text_color,
-        border_color  = "#404040",
-        anchor        = "center",
-        text          = "",
-        font          = bold11,
-        corner_radius = 1
-    )
-
-    telegram_button.place(relx = column_2 + 0.055, rely = 0.04, anchor = "center")
-
-def place_loadFile_section():
-    global input_widgets
-    for widget in input_widgets:
-        widget.destroy()
-    background = CTkFrame(master = window, fg_color = background_color, corner_radius = 1)
-
-    text_drop = ("DROP IMAGES OR VIDEOS HERE\n\n"
-                 "IMAGES • jpg png tif bmp webp heic\n"
-                 "VIDEOS • mp4 webm mkv flv gif avi mov mpg qt 3gp")
-
-    input_file_text = CTkLabel(
-        master     = window,
-        text       = text_drop,
-        fg_color   = background_color,
-        bg_color   = background_color,
-        text_color = text_color,
-        width      = 300,
-        height     = 150,
-        font       = bold13,
-        anchor     = "center"
-    )
-
-    input_file_button = CTkButton(
-        master       = window,
-        command      = open_files_action,
-        text         = "SELECT FILES",
-        width        = 140,
-        height       = 30,
-        font         = bold12,
-        border_width  = 1,
-        corner_radius = 1,
-        fg_color      = "#282828",
-        text_color    = "#E0E0E0",
-        border_color  = "#0096FF"
-    )
-
-    background.place(relx = 0.0, rely = 0.0, relwidth = 0.5, relheight = 1.0)
-    input_file_text.place(relx = 0.25, rely = 0.39, anchor = "center")
-    input_file_button.place(relx = 0.25, rely = 0.55, anchor = "center")
-    input_widgets = (background, input_file_text, input_file_button)
-
-def place_app_name():
-    background = CTkFrame(master = window, fg_color = background_color, corner_radius = 1)
-    app_name_label = CTkLabel(
-        master     = window,
-        text       = app_name + " " + version,
-        fg_color   = background_color,
-        text_color = app_name_color,
-        font       = bold20,
-        anchor     = "w"
-    )
-    background.place(relx = 0.5, rely = 0.0, relwidth = 0.5, relheight = 1.0)
-    app_name_label.place(relx = column_1 - 0.05, rely = 0.04, anchor = "center")
-
-def place_AI_menu():
-
-    def open_info_AI_model():
-        option_list = [
-            "\n IRCNN_Mx1 | IRCNN_Lx1 \n"
-            "\n • Simple and lightweight AI models\n"
-            " • Year: 2017\n"
-            " • Function: Denoising\n",
-
-            "\n RealESR_Gx4 | RealESR_Animex4 \n"
-            "\n • Fast and lightweight AI models\n"
-            " • Year: 2022\n"
-            " • Function: Upscaling\n",
-
-            "\n BSRGANx2 | BSRGANx4 | RealESRGANx4 \n"
-            "\n • Complex and heavy AI models\n"
-            " • Year: 2020\n"
-            " • Function: High-quality upscaling\n",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "AI model",
-            subtitle      = "This widget allows to choose between different AI models for upscaling",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    widget_row = row1
-    background = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    info_button = create_info_button(open_info_AI_model, "AI model")
-    option_menu = create_option_menu(select_AI_from_menu, AI_models_list, default_AI_model)
-
-    info_button.place(relx = column_info1, rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_3_5,   rely = widget_row, anchor = "center")
-
-def place_AI_blending_menu():
-
-    def open_info_AI_blending():
-        option_list = [
-            " Blending combines the upscaled image produced by AI with the original image",
-
-            " \n BLENDING OPTIONS\n" +
-            "  • [OFF] No blending is applied\n" +
-            "  • [Low] The result favors the upscaled image, with a slight touch of the original\n" +
-            "  • [Medium] A balanced blend of the original and upscaled images\n" +
-            "  • [High] The result favors the original image, with subtle enhancements from the upscaled version\n",
-
-            " \n NOTES\n" +
-            "  • Can enhance the quality of the final result\n" +
-            "  • Especially effective when using the tiling/merging function (useful for low VRAM)\n" +
-            "  • Particularly helpful at low input resolution percentages (<50%)\n",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "AI blending",
-            subtitle      = "This widget allows you to choose the blending between the upscaled and original image/frame",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    widget_row = row2
-
-    background = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    info_button = create_info_button(open_info_AI_blending, "AI blending")
-    option_menu = create_option_menu(select_blending_from_menu, blending_list, default_blending)
-
-    info_button.place(relx = column_info1, rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_3_5,   rely = widget_row, anchor = "center")
-
-def place_AI_multithreading_menu():
-
-    def open_info_AI_multithreading():
-        option_list = [
-            " This option can enhance video upscaling performance, especially on powerful GPUs.",
-
-            " \n AI MULTITHREADING OPTIONS\n"
-            + "  • OFF - Processes one frame at a time.\n"
-            + "  • 2 threads - Processes two frames simultaneously.\n"
-            + "  • 4 threads - Processes four frames simultaneously.\n"
-            + "  • 6 threads - Processes six frames simultaneously.\n"
-            + "  • 8 threads - Processes eight frames simultaneously.\n",
-
-            " \n NOTES\n"
-            + "  • Higher thread counts increase CPU, GPU, and RAM usage.\n"
-            + "  • The GPU may be heavily stressed, potentially reaching high temperatures.\n"
-            + "  • Monitor your system's temperature to prevent overheating.\n"
-            + "  • If the chosen thread count exceeds GPU capacity, the app automatically selects an optimal value.\n",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "AI multithreading (EXPERIMENTAL)",
-            subtitle      = "This widget allows to choose how many video frames are upscaled simultaneously",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    widget_row = row3
-    background = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    info_button = create_info_button(open_info_AI_multithreading, "AI multithreading")
-    option_menu = create_option_menu(select_AI_multithreading_from_menu, AI_multithreading_list, default_AI_multithreading)
-
-    info_button.place(relx = column_info1, rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_3_5,   rely = widget_row, anchor = "center")
-
-def place_input_output_resolution_textboxs():
-
-    def open_info_input_resolution():
-        option_list = [
-            " A high value (>50%) will create high quality photos/videos but will be slower",
-            " While a low value (<50%) will create good quality photos/videos but will much faster",
-
-            " \n For example, for a 1080p (1920x1080) image/video\n" +
-            " • Input scale 25% => input to AI 270p (480x270)\n" +
-            " • Input scale 50% => input to AI 540p (960x540)\n" +
-            " • Input scale 75% => input to AI 810p (1440x810)\n" +
-            " • Input scale 100% => input to AI 1080p (1920x1080) \n",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Input resolution %",
-            subtitle      = "This widget allows to choose the resolution input to the AI",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    def open_info_output_resolution():
-        option_list = [
-            " 100% keeps the exact resolution produced by the AI upscaling",
-            " A lower value (<100%) will downscale the AI result to a smaller resolution, saving space and processing time",
-            " A higher value (>100%) will further upscale the AI output, increasing size but not adding real details",
-
-            "\n For example, if the AI generates a 4K (3840x2160) image/video\n" +
-            " • Output scale 50%  => final output 1920x1080 (downscaled)\n" +
-            " • Output scale 100% => final output 3840x2160 (AI native)\n" +
-            " • Output scale 200% => final output 7680x4320 (8K, interpolated)\n",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Output resolution %",
-            subtitle      = "This widget allows to choose upscaled files resolution",
-            default_value = None,
-            option_list   = option_list
-        )
-
-
-    widget_row = row4
-
-    background = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    # Input scale %
-    info_button = create_info_button(open_info_input_resolution, "Input scale %")
-    option_menu = create_text_box(selected_input_resize_factor, width = little_textbox_width)
-
-    info_button.place(relx = column_info1, rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_1_5,   rely = widget_row, anchor = "center")
-
-    # Output scale %
-    info_button = create_info_button(open_info_output_resolution, "Output scale %")
-    option_menu = create_text_box(selected_output_resize_factor, width = little_textbox_width)
-
-    info_button.place(relx = column_info2, rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_3,     rely = widget_row, anchor = "center")
-
-def place_gpu_gpuVRAM_menus():
-
-    def open_info_gpu():
-        option_list = [
-            "\n It is possible to select up to 4 GPUs for AI processing\n" +
-            "  • Auto (the app will select the most powerful GPU)\n" +
-            "  • GPU 1 (GPU 0 in Task manager)\n" +
-            "  • GPU 2 (GPU 1 in Task manager)\n" +
-            "  • GPU 3 (GPU 2 in Task manager)\n" +
-            "  • GPU 4 (GPU 3 in Task manager)\n",
-
-            "\n NOTES\n" +
-            "  • Keep in mind that the more powerful the chosen gpu is, the faster the upscaling will be\n" +
-            "  • For optimal performance, it is essential to regularly update your GPUs drivers\n" +
-            "  • Selecting a GPU not present in the PC will cause the app to use the CPU for AI processing\n"
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "GPU",
-            subtitle      = "This widget allows to select the GPU for AI upscale",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    def open_info_vram_limiter():
-        option_list = [
-            " Make sure to enter the correct value based on the selected GPU's VRAM",
-            " Setting a value higher than the available VRAM may cause upscale failure",
-            " For integrated GPUs (Intel HD series • Vega 3, 5, 7), select 2 GB to avoid issues",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "GPU VRAM (GB)",
-            subtitle      = "This widget allows to set a limit on the GPU VRAM memory usage",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    widget_row = row5
-
-    background  = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    # GPU
-    info_button = create_info_button(open_info_gpu, "GPU")
-    option_menu = create_option_menu(select_gpu_from_menu, gpus_list, default_gpu, width = little_menu_width)
-
-    info_button.place(relx = column_info1,        rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_1_4, rely = widget_row,  anchor = "center")
-
-    # GPU VRAM
-    info_button = create_info_button(open_info_vram_limiter, "GPU VRAM (GB)")
-    option_menu = create_text_box(selected_VRAM_limiter, width = little_textbox_width)
-
-    info_button.place(relx = column_info2, rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_3,     rely = widget_row, anchor = "center")
-
-def place_image_video_output_menus():
-
-    def open_info_image_output():
-        option_list = [
-            " \n PNG\n"
-            " • Very good quality\n"
-            " • Slow and heavy file\n"
-            " • Supports transparent images\n"
-            " • Lossless compression (no quality loss)\n"
-            " • Ideal for graphics, web images, and screenshots\n",
-
-            " \n JPG\n"
-            " • Good quality\n"
-            " • Fast and lightweight file\n"
-            " • Lossy compression (some quality loss)\n"
-            " • Ideal for photos and web images\n"
-            " • Does not support transparency\n",
-
-            " \n BMP\n"
-            " • Highest quality\n"
-            " • Slow and heavy file\n"
-            " • Uncompressed format (large file size)\n"
-            " • Ideal for raw images and high-detail graphics\n"
-            " • Does not support transparency\n",
-
-            " \n TIFF\n"
-            " • Highest quality\n"
-            " • Very slow and heavy file\n"
-            " • Supports both lossless and lossy compression\n"
-            " • Often used in professional photography and printing\n"
-            " • Supports multiple layers and transparency\n",
-        ]
-
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Image output",
-            subtitle      = "This widget allows to choose the extension of upscaled images",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    def open_info_video_extension():
-        option_list = [
-            " \n MP4\n"
-            " • Most widely supported format\n"
-            " • Good quality with efficient compression\n"
-            " • Fast and lightweight file\n"
-            " • Ideal for streaming and general use\n",
-
-            " \n MKV\n"
-            " • High-quality format with multiple audio and subtitle tracks support\n"
-            " • Larger file size compared to MP4\n"
-            " • Supports almost any codec\n"
-            " • Ideal for high-quality videos and archiving\n",
-
-            " \n AVI\n"
-            " • Older format with high compatibility\n"
-            " • Larger file size due to less efficient compression\n"
-            " • Supports multiple codecs but lacks modern features\n"
-            " • Ideal for older devices and raw video storage\n",
-
-            " \n MOV\n"
-            " • High-quality format developed by Apple\n"
-            " • Large file size due to less compression\n"
-            " • Best suited for editing and high-quality playback\n"
-            " • Compatible mainly with macOS and iOS devices\n",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Video output",
-            subtitle      = "This widget allows to choose the extension of the upscaled video",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    widget_row = row6
-
-    background = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    # Image output
-    info_button = create_info_button(open_info_image_output, "Image output")
-    option_menu = create_option_menu(select_image_extension_from_menu, image_extension_list, default_image_extension, width = little_menu_width)
-    info_button.place(relx = column_info1,        rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_1_4, rely = widget_row, anchor = "center")
-
-    # Video output
-    info_button = create_info_button(open_info_video_extension, "Video output")
-    option_menu = create_option_menu(select_video_extension_from_menu, video_extension_list, default_video_extension, width = little_menu_width)
-    info_button.place(relx = column_info2,      rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_2_9, rely = widget_row, anchor = "center")
-
-def place_video_codec_keep_frames_menus():
-
-    def open_info_video_codec():
-        option_list = [
-            " \n SOFTWARE ENCODING (CPU)\n"
-            " • x264 | H.264 software encoding\n"
-            " • x265 | HEVC (H.265) software encoding\n",
-
-            " \n NVIDIA GPU ENCODING (NVENC - Optimized for NVIDIA GPU)\n"
-            " • h264_nvenc | H.264 hardware encoding\n"
-            " • hevc_nvenc | HEVC (H.265) hardware encoding\n",
-
-            " \n AMD GPU ENCODING (AMF - Optimized for AMD GPU)\n"
-            " • h264_amf | H.264 hardware encoding\n"
-            " • hevc_amf | HEVC (H.265) hardware encoding\n",
-
-            " \n INTEL GPU ENCODING (QSV - Optimized for Intel GPU)\n"
-            " • h264_qsv | H.264 hardware encoding\n"
-            " • hevc_qsv | HEVC (H.265) hardware encoding\n"
-        ]
-
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Video codec",
-            subtitle      = "This widget allows to choose video codec for upscaled video",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    def open_info_keep_frames():
-        option_list = [
-            "\n ON \n" +
-            " Keep the SQLite cache with original/upscaled frames and job settings \n",
-
-            "\n OFF \n" +
-            " Delete the cache only after a successful encode; interrupted jobs can resume \n"
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Keep video frames",
-            subtitle      = "Video frames and resume state are stored in one SQLite file",
-            default_value = None,
-            option_list   = option_list
-        )
-
-
-    widget_row = row7
-
-    background = create_option_background()
-    background.place(relx = 0.75, rely = widget_row, relwidth = 0.48, anchor = "center")
-
-    # Video codec
-    info_button = create_info_button(open_info_video_codec, "Video codec")
-    option_menu = create_option_menu(select_video_codec_from_menu, video_codec_list, default_video_codec, width = little_menu_width)
-    info_button.place(relx = column_info1,        rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_1_4, rely = widget_row, anchor = "center")
-
-    # Keep frames
-    info_button = create_info_button(open_info_keep_frames, "Keep frames")
-    option_menu = create_option_menu(select_save_frame_from_menu, keep_frames_list, default_keep_frames, width = little_menu_width)
-    info_button.place(relx = column_info2,      rely = widget_row, anchor = "center")
-    option_menu.place(relx = column_2_9, rely = widget_row, anchor = "center")
-
-def place_output_path_textbox():
-
-    def open_info_output_path():
-        option_list = [
-              "\n The default path is defined by the input files."
-            + "\n For example: selecting a file from the Download folder,"
-            + "\n the app will save upscaled files in the Download folder \n",
-
-            " Otherwise it is possible to select the desired path using the SELECT button",
-        ]
-
-        MessageBox(
-            messageType   = "info",
-            title         = "Output path",
-            subtitle      = "This widget allows to choose upscaled files path",
-            default_value = None,
-            option_list   = option_list
-        )
-
-    background    = create_option_background()
-    info_button   = create_info_button(open_info_output_path, "Output path")
-    option_menu   = create_text_box_output_path(selected_output_path)
-    active_button = create_active_button(command = open_output_path_action, text = "SELECT", width = 60, height = 25)
-
-    background.place(   relx = 0.75,                 rely = row10, relwidth = 0.48, anchor = "center")
-    info_button.place(  relx = column_info1,         rely = row10 - 0.003,           anchor = "center")
-    active_button.place(relx = column_info1 + 0.052, rely = row10,                   anchor = "center")
-    option_menu.place(  relx = column_2 - 0.008,     rely = row10,                   anchor = "center")
-
-def place_message_label():
-    message_label = CTkLabel(
-        master        = window,
-        textvariable  = info_message,
-        height        = 24,
-        width         = 247,
-        font          = bold11,
-        fg_color      = "#ffbf00",
-        text_color    = "#000000",
-        anchor        = "center",
-        corner_radius = 1
-    )
-    message_label.place(relx = 0.85, rely = 0.9495, anchor = "center")
-
-def place_stop_button():
-    stop_button = create_active_button(
-        command      = stop_button_command,
-        text         = "STOP",
-        icon         = stop_icon,
-        width        = 140,
-        height       = 30,
-        border_color = "#EC1D1D"
-    )
-    stop_button.place(relx = 0.75 - 0.1, rely = 0.95, anchor = "center")
-
-def place_upscale_button():
-    upscale_button = create_active_button(
-        command = upscale_button_command,
-        text    = "UPSCALE",
-        icon    = upscale_icon,
-        width   = 140,
-        height  = 30
-    )
-    upscale_button.place(relx = 0.75 - 0.1, rely = 0.95, anchor = "center")
-
-
-
-
-# Main functions ---------------------------
-
-def check_directml_support() -> bool:
-    providers = onnxruntime_get_available_providers()
-    return "DmlExecutionProvider" in providers
-
-def on_app_close() -> None:
-    window.grab_release()
-    window.destroy()
-
-    global selected_AI_model
-    global selected_AI_multithreading
-    global selected_gpu
-    global selected_blending_factor
-    global selected_image_extension
-    global selected_video_extension
-    global selected_video_codec
-    global tiles_resolution
-    global input_resize_factor
-
-    AI_model_to_save        = f"{selected_AI_model}"
-    gpu_to_save             = selected_gpu
-    image_extension_to_save = selected_image_extension
-    video_extension_to_save = selected_video_extension
-    video_codec_to_save     = selected_video_codec
-    blending_to_save        = {0: "OFF", 0.3: "Low", 0.5: "Medium", 0.7: "High"}.get(selected_blending_factor)
-
-    if selected_keep_frames == True:
-        keep_frames_to_save = "ON"
-    else:
-        keep_frames_to_save = "OFF"
-
-    if selected_AI_multithreading == 1:
-        AI_multithreading_to_save = "OFF"
-    else:
-        AI_multithreading_to_save = f"{selected_AI_multithreading} threads"
-
-    user_preference = {
-        "default_AI_model":             AI_model_to_save,
-        "default_AI_multithreading":    AI_multithreading_to_save,
-        "default_gpu":                  gpu_to_save,
-        "default_keep_frames":          keep_frames_to_save,
-        "default_image_extension":      image_extension_to_save,
-        "default_video_extension":      video_extension_to_save,
-        "default_video_codec":          video_codec_to_save,
-        "default_blending":             blending_to_save,
-        "default_output_path":          selected_output_path.get(),
-        "default_input_resize_factor":  str(selected_input_resize_factor.get()),
-        "default_output_resize_factor": str(selected_output_resize_factor.get()),
-        "default_VRAM_limiter":         str(selected_VRAM_limiter.get()),
-    }
-    user_preference_json = json_dumps(user_preference)
-    with open(USER_PREFERENCE_PATH, "w") as preference_file:
-        preference_file.write(user_preference_json)
-
+    value = filedialog.askdirectory()
+    app_state.preferences.output_path = value or OUTPUT_PATH_CODED
+    app_state.selected_output_path.set(app_state.preferences.output_path)
+
+
+def apply_app_zoom(zoom):
+    set_window_scaling(zoom)
+    set_widget_scaling(zoom)
+
+
+def apply_auto_vram_for_gpu(selected_gpu, fallback=None):
+    detected = GPU.vram_for(selected_gpu)
+    value = str(detected) if detected is not None else fallback
+    if value is not None:
+        app_state.selected_VRAM_limiter.set(value)
+        app_state.preferences.vram_limiter = value
+
+
+def apply_auto_codec_for_gpu(selected_gpu):
+    codec = GPU.codec_for(selected_gpu)
+    if codec is not None and codec in video_codec_list:
+        app_state.preferences.video_codec = codec
+        if app_state.selected_video_codec is not None:
+            app_state.selected_video_codec.set(codec)
+
+
+def open_info_messagebox(title, subtitle, option_list):
+    MessageBox("info", title, subtitle, None, option_list)
+
+
+# Process control: Tk owns UI updates; no GUI callbacks run on worker threads.
+
+def _drain_status_queue():
+    if app_state.process_status_q is None:
+        return
+    while True:
+        try:
+            app_state.process_status_q.get_nowait()
+        except Empty:
+            return
+
+
+def stop_upscale_process():
+    """Give SQLite a checkpoint window, then kill a hung process tree."""
+    app_state.stopping = True
+    event = app_state.event_stop_upscale_process
+    if event is not None:
+        event.set()
+    process = app_state.process_upscale_orchestrator
+    try:
+        if process is not None and process.pid is not None:
+            process.join(timeout=10)
+            if process.is_alive():
+                try:
+                    for child in psutil_Process(process.pid).children(recursive=True):
+                        try:
+                            child.kill()
+                        except (NoSuchProcess, AccessDenied):
+                            pass
+                except (NoSuchProcess, AccessDenied):
+                    pass
+                process.kill()
+                process.join()
+        app_state.process_upscale_orchestrator = None
+        _drain_status_queue()
+    finally:
+        if event is not None:
+            event.clear()
+        app_state.processing = False
+        app_state.stopping = False
+        allow_sleep()
+
+
+def _finish_upscale(status):
     stop_upscale_process()
+    if app_state.closing:
+        return
+    if status == COMPLETED_STATUS:
+        app_state.info_message.set("All files completed! :)")
+        show_completion_notification()
+    elif status == STOP_STATUS:
+        app_state.info_message.set("Upscaling stopped")
+    else:
+        app_state.info_message.set("Error while upscaling :(")
+        show_error_message(status.removeprefix(ERROR_STATUS).strip())
+    App.place_upscale_button()
+    update_file_widget()
+    if app_state.file_widget is not None:
+        app_state.file_widget.clear_active_highlight()
 
-class App():
+
+def check_upscale_steps():
+    _cancel_after(app_state.poll_after_id)
+    app_state.poll_after_id = None
+    if app_state.closing:
+        return
+    try:
+        actual_step = app_state.process_status_q.get_nowait()
+    except Empty:
+        actual_step = None
+    if actual_step == CLOSE_APP_STATUS:
+        return
+    if actual_step in (COMPLETED_STATUS, STOP_STATUS) or (
+        actual_step is not None and str(actual_step).startswith(ERROR_STATUS)
+    ):
+        _finish_upscale(str(actual_step))
+        return
+    if actual_step is not None:
+        app_state.info_message.set(actual_step)
+        try:
+            file_number = int(str(actual_step).split(".")[0])
+        except (ValueError, IndexError):
+            pass
+        else:
+            if app_state.file_widget is not None:
+                app_state.file_widget.highlight_active_file(file_number)
+    process = app_state.process_upscale_orchestrator
+    if app_state.processing and process is not None and not process.is_alive():
+        # Manager queues are synchronous: an exited process has already
+        # delivered its final status. An empty queue here is an abnormal exit.
+        if actual_step is None:
+            _finish_upscale(f"{ERROR_STATUS} Worker exited without a completion status")
+            return
+    if app_state.processing:
+        app_state.poll_after_id = _schedule(250, check_upscale_steps)
+
+
+def stop_button_command():
+    stop_upscale_process()
+    write_process_status(app_state.process_status_q, STOP_STATUS)
+    check_upscale_steps()
+
+
+def upscale_button_command():
+    if inputs_are_busy():
+        return
+    config = build_processing_config()
+    if config is None:
+        return
+    _drain_status_queue()
+    app_state.event_stop_upscale_process.clear()
+    app_state.info_message.set("Loading")
+    app_state.processing = True
+    App.place_stop_button()
+    app_state.process_upscale_orchestrator = Process(
+        target=upscale_orchestrator,
+        args=(
+            app_state.process_status_q,
+            app_state.event_stop_upscale_process,
+            config.selected_file_list,
+            config.selected_output_path,
+            config.selected_AI_model,
+            config.selected_AI_multithreading,
+            config.input_resize_factor,
+            config.output_resize_factor,
+            config.selected_gpu,
+            config.tiles_resolution,
+            config.selected_sharpening_amount,
+            config.selected_keep_frames,
+            config.selected_image_extension,
+            config.selected_video_extension,
+            config.selected_video_codec,
+        ),
+    )
+    try:
+        prevent_sleep()
+        app_state.process_upscale_orchestrator.start()
+    except Exception as error:
+        _finish_upscale(f"{ERROR_STATUS} {error}")
+        return
+    app_state.poll_after_id = _schedule(250, check_upscale_steps)
+
+
+# Preferences and lifecycle --------------------------------------------------
+
+_PREFERENCE_FIELDS = {
+    "app_zoom": "default_app_zoom",
+    "ai_model": "default_AI_model",
+    "ai_multithreading": "default_AI_multithreading",
+    "gpu": "default_gpu",
+    "keep_frames": "default_keep_frames",
+    "image_extension": "default_image_extension",
+    "video_extension": "default_video_extension",
+    "video_codec": "default_video_codec",
+    "sharpening": "default_sharpening",
+    "output_path": "default_output_path",
+    "input_resize_factor": "default_input_resize_factor",
+    "output_resize_factor": "default_output_resize_factor",
+    "vram_limiter": "default_VRAM_limiter",
+}
+
+
+def save_user_choices_in_json():
+    preferences = app_state.preferences
+    preferences.output_path = app_state.selected_output_path.get()
+    preferences.input_resize_factor = str(app_state.selected_input_resize_factor.get())
+    preferences.output_resize_factor = str(app_state.selected_output_resize_factor.get())
+    preferences.vram_limiter = str(app_state.selected_VRAM_limiter.get())
+    values = {key: getattr(preferences, name) for name, key in _PREFERENCE_FIELDS.items()}
+    values["default_keep_frames"] = "ON" if preferences.keep_frames else "OFF"
+    with open(USER_PREFERENCE_PATH, "w", encoding="utf-8") as preference_file:
+        preference_file.write(json_dumps(values))
+
+
+def load_user_preferences():
+    try:
+        with open(USER_PREFERENCE_PATH, "r", encoding="utf-8") as preference_file:
+            values = json_load(preference_file)
+        if not isinstance(values, dict):
+            return UserPreferences()
+    except (OSError, ValueError):
+        return UserPreferences()
+    preferences = UserPreferences()
+    choices = dict(app_zoom=zoom_option_list, ai_model=MODEL_NAMES,
+                   ai_multithreading=AI_multithreading_list, sharpening=sharpening_list,
+                   image_extension=image_extension_list, video_extension=video_extension_list,
+                   video_codec=[codec for codec in video_codec_list if codec != "----"])
+    for name, key in _PREFERENCE_FIELDS.items():
+        value = values.get(key)
+        if name == "keep_frames":
+            if value in ("ON", "OFF"):
+                preferences.keep_frames = value == "ON"
+        elif isinstance(value, str) and (name not in choices or value in choices[name]):
+            setattr(preferences, name, value)
+    return preferences
+
+
+def _destroy_window():
+    for handle in tuple(app_state.after_ids):
+        _cancel_after(handle)
+    app_state.poll_after_id = None
+    for variable, handle in app_state.traces:
+        try:
+            variable.trace_remove("write", handle)
+        except TclError:
+            pass
+    app_state.traces.clear()
+    if app_state.file_widget is not None:
+        widget = app_state.file_widget
+        app_state.file_widget = None
+        try:
+            widget.destroy()
+        except TclError:
+            # Tk can already have destroyed every child when the root was
+            # closed directly by a host, an OS callback, or a smoke test.
+            pass
+    if app_state.window is not None:
+        window = app_state.window
+        app_state.window = None
+        try:
+            window.grab_release()
+        except TclError:
+            pass
+        try:
+            window.destroy()
+        except TclError:
+            pass
+    app_state.input_widgets = ()
+    app_state.action_button = None
+
+
+def on_app_close():
+    if app_state.closing:
+        return
+    try:
+        save_user_choices_in_json()
+    except OSError as error:
+        # A missing/unwritable Documents folder must not prevent shutdown.
+        print(f"[{app_name}] Could not save preferences: {error}")
+    app_state.closing = True
+    try:
+        stop_upscale_process()
+    finally:
+        _destroy_window()
+
+
+def place_option_background(row):
+    background = App.create_option_background()
+    background.place(relx=0.75, rely=row, relwidth=0.48, anchor="center")
+
+
+class App:
     def __init__(self, window):
-        self.toplevel_window = None
         window.protocol("WM_DELETE_WINDOW", on_app_close)
-
-        window.title('')
+        window.title(get_AI_engine_info())
         window.geometry("1000x675")
         window.resizable(False, False)
-        window.iconbitmap(find_by_relative_path("Assets" + os_separator + "logo.ico"))
+        if sys.platform == "win32":
+            window.iconbitmap(find_by_relative_path(f"Assets{os_separator}logo.ico"))
+        self.place_loadFile_section()
+        self.place_app_name()
+        self.place_app_zoom_and_links()
+        self.place_AI_menu()
+        self.place_AI_sharpening_menu()
+        self.place_AI_multithreading_menu()
+        self.place_input_output_resolution_textboxs()
+        self.place_gpu_gpuVRAM_menus()
+        self.place_image_video_output_menus()
+        self.place_video_codec_keep_frames_menus()
+        self.place_output_path_textbox()
+        self.place_message_label()
+        self.place_upscale_button()
 
-        place_loadFile_section()
+    @staticmethod
+    def place_at(widget, relx, rely):
+        widget.place(relx=relx, rely=rely, anchor="center")
 
-        place_app_name()
-        place_output_path_textbox()
-        place_github_button()
-        place_telegram_button()
+    @staticmethod
+    def place_loadFile_section():
+        for widget in app_state.input_widgets:
+            widget.destroy()
+        background = App.create_panel_background()
+        label = CTkLabel(
+            App.get_app_window(),
+            text=("DROP INPUT FILES HERE\n\nSUPPORTED FILES\n\n"
+                  "IMAGES - jpg png tif bmp webp heic\n"
+                  "VIDEOS - mp4 webm mkv flv gif avi mov mpg qt 3gp"),
+            fg_color=background_color, bg_color=background_color,
+            text_color=CARD_MUTED_COLOR, width=300, height=150,
+            font=bold13, anchor="center",
+        )
+        button = CTkButton(
+            App.get_app_window(), command=open_files_action, text="SELECT FILES",
+            width=140, height=30, font=bold12, border_width=2,
+            corner_radius=UI_CORNER_RADIUS, fg_color="#282828",
+            text_color="#E0E0E0", border_color=UI_ACCENT_COLOR,
+        )
+        background.place(relx=0.0, rely=0.0, relwidth=0.5, relheight=1.0)
+        App.place_at(label, 0.25, 0.4)
+        App.place_at(button, 0.25, 0.6)
+        app_state.input_widgets = (background, label, button)
 
-        place_AI_menu()
-        place_AI_blending_menu()
-        place_AI_multithreading_menu()
-        place_input_output_resolution_textboxs()
-        place_gpu_gpuVRAM_menus()
-        place_image_video_output_menus()
-        place_video_codec_keep_frames_menus()
+    @staticmethod
+    def place_app_name():
+        background = App.create_panel_background()
+        label = CTkLabel(
+            App.get_app_window(), text=f"{app_name} {version}",
+            fg_color=background_color, bg_color=background_color,
+            text_color=app_name_color, font=bold18, anchor="w",
+        )
+        background.place(relx=0.5, rely=0.0, relwidth=0.5, relheight=1.0)
+        App.place_at(label, COL_TITLE - 0.055, ROW_HEADER)
 
-        place_message_label()
-        place_upscale_button()
+    @staticmethod
+    def place_app_zoom_and_links():
+        label = CTkLabel(
+            App.get_app_window(), text="App zoom", width=50, height=22,
+            fg_color="transparent", bg_color=background_color,
+            text_color=CARD_TITLE_COLOR, font=bold13, anchor="w",
+        )
+        menu = App.create_option_menu(
+            App.select_app_zoom, zoom_option_list, app_state.preferences.app_zoom, width=71
+        )
+        App.place_at(label, COL_ZOOM - 0.06, ROW_HEADER)
+        App.place_at(menu, COL_ZOOM + 0.0155, ROW_HEADER)
+        telegram = App.create_link_button(lambda: open_browser(telegramme, new=1), logo_telegram)
+        github = App.create_link_button(lambda: open_browser(githubme, new=1), logo_git)
+        App.place_at(telegram, COL_ZOOM + 0.075, ROW_HEADER)
+        App.place_at(github, COL_ZOOM + 0.11, ROW_HEADER)
+
+    @staticmethod
+    def _single_option(row, title, subtitle, help_text, command, choices, value):
+        place_option_background(row)
+        info = App.create_info_button(
+            lambda: open_info_messagebox(title, subtitle, help_text), title
+        )
+        menu = App.create_option_menu(command, choices, value)
+        App.place_at(info, COL_INFO_L, row)
+        App.place_at(menu, COL_MENU_C, row)
+
+    @staticmethod
+    def place_AI_menu():
+        App._single_option(
+            ROW_AI_MODEL, "AI model", "Select the AI model based on your content type",
+            [
+                "\nLVAx2\n - Target: Live-action video upscaling\n - Tips: AI sharpening - OFF/Low\n",
+                "\nRealESR_Gx4 - RealESR_Ax4\n - Target: Animated/degraded live-action video upscaling\n"
+                " - Tips: AI sharpening - Low for animation, High for live-action videos\n",
+                "\nBSRGANx2 - BSRGANx4\n - Target: High-quality image upscaling\n"
+                " - Tips: can be used to upscale videos but will be slow\n",
+                "\nRealESRGANx4\n - Target: High-quality image upscaling\n"
+                " - Tips: can be used to upscale videos but will be slow\n",
+                "\nMSharpx4\n - Target: Image upscaling and sharpening\n"
+                " - Tips: to use on good quality photos (not too much noise)\n",
+                "\nIRCNN_Mx1 - IRCNN_Lx1\n - Target: Video/image denoising\n - Tips: AI sharpening - OFF\n",
+            ], App.select_AI_from_menu, AI_models_list, app_state.preferences.ai_model,
+        )
+
+    @staticmethod
+    def place_AI_sharpening_menu():
+        App._single_option(
+            ROW_AI_SHARPENING, "AI sharpening", "Sharpen the AI output to fine-tune detail",
+            [
+                " Sharpening applies an unsharp mask to the AI result to bring back perceived detail",
+                "\n SHARPENING OPTIONS\n - [OFF] No sharpening is applied\n"
+                " - [Low] Light sharpening\n - [High] Stronger sharpening\n",
+                "\n NOTES\n - Useful when the AI output looks too soft or smooth\n"
+                " - Works only on the AI output, so it can't reintroduce source noise/compression artifacts\n",
+            ], App.select_sharpening_from_menu, sharpening_list, app_state.preferences.sharpening,
+        )
+
+    @staticmethod
+    def place_AI_multithreading_menu():
+        App._single_option(
+            ROW_AI_MULTITHREADING, "AI multithreading",
+            "Process multiple video frames in parallel to speed up upscaling",
+            [
+                " This option can enhance video upscaling performance, especially on powerful GPUs.",
+                "\n AI MULTITHREADING OPTIONS\n - OFF - Processes one frame at a time.\n"
+                " - 2 / 4 / 6 / 8 threads - Processes that many frames simultaneously.\n",
+                "\n NOTES\n - Higher thread counts increase CPU, GPU, and RAM usage.\n"
+                " - Monitor your system's temperature to prevent overheating.\n"
+                " - If the chosen thread count exceeds GPU capacity, the app automatically selects an optimal value.\n",
+            ], App.select_AI_multithreading_from_menu, AI_multithreading_list,
+            app_state.preferences.ai_multithreading,
+        )
+
+    @staticmethod
+    def _paired_option(row, left, title, subtitle, help_text, widget):
+        info = App.create_info_button(
+            lambda: open_info_messagebox(title, subtitle, help_text), title
+        )
+        App.place_at(info, COL_INFO_L if left else COL_INFO_R, row)
+        App.place_at(widget, COL_MENU_L if left else COL_MENU_R, row)
+
+    @staticmethod
+    def place_input_output_resolution_textboxs():
+        place_option_background(ROW_RESOLUTION)
+        for left, title, variable, subtitle, help_text in (
+            (True, "Input scale %", App.get_input_resize_factor_var(),
+             "Controls the resolution fed to the AI — lower is faster, higher is sharper",
+             [" A high value (>50%) creates high quality photos/videos but is slower.",
+              "\n For a 1080p (1920x1080) image/video\n"
+              " - 25% => 480x270\n - 50% => 960x540\n - 75% => 1440x810\n - 100% => 1920x1080\n"]),
+            (False, "Output scale %", App.get_output_resize_factor_var(),
+             "Controls the final output resolution after AI upscaling",
+             [" 100% keeps the exact resolution produced by the AI upscaling.",
+              " A lower value downscales the AI result. A higher value increases size, not real detail.",
+              "\n If the AI generates 4K (3840x2160)\n"
+              " - 50% => 1920x1080\n - 100% => 3840x2160\n - 200% => 7680x4320 (interpolated)\n"]),
+        ):
+            info = App.create_info_button(
+                lambda t=title, s=subtitle, h=help_text: open_info_messagebox(t, s, h), title
+            )
+            entry = App.create_text_box(variable, little_textbox_width)
+            App.place_at(info, COL_INFO_L if left else COL_INFO_R, ROW_RESOLUTION)
+            App.place_at(entry, COL_TEXT_L if left else COL_TEXT_R, ROW_RESOLUTION)
+
+    @staticmethod
+    def place_gpu_gpuVRAM_menus():
+        place_option_background(ROW_GPU)
+        choices = GPU.menu_list()
+        if app_state.preferences.gpu not in choices:
+            app_state.preferences.gpu = GPU.default()
+        App._paired_option(
+            ROW_GPU, True, "GPU", "Select which GPU to use for AI inference",
+            [" The app automatically detects the GPUs installed on your system.",
+             " If no GPU is detected the menu shows \"No GPU found\" and the app may fall back to the CPU.",
+             " Keep GPU drivers up to date. A more powerful GPU speeds up upscaling."],
+            App.create_option_menu(App.select_gpu_from_menu, choices,
+                                   app_state.preferences.gpu, width=little_menu_width),
+        )
+        info = App.create_info_button(
+            lambda: open_info_messagebox(
+                "GPU VRAM (GB)", "Match this value to your GPU's available VRAM to avoid out-of-memory errors",
+                [" Auto-detected from the selected GPU's dedicated VRAM at startup.",
+                 " You can override an incorrect value manually.",
+                 " Setting a value above available VRAM may cause upscale failure.",
+                 " For Intel UHD / Iris Xe or AMD Vega 3/5/7 integrated GPUs, select 2 GB."],
+            ), "GPU VRAM (GB)"
+        )
+        App.place_at(info, COL_INFO_R, ROW_GPU)
+        App.place_at(App.create_text_box(App.get_vram_limiter_var(), little_textbox_width),
+                     COL_TEXT_R, ROW_GPU)
+
+    @staticmethod
+    def place_image_video_output_menus():
+        place_option_background(ROW_OUTPUT_FORMAT)
+        App._paired_option(
+            ROW_OUTPUT_FORMAT, True, "Image ext.", "Choose the output format for upscaled images",
+            ["\n PNG\n - Lossless, very good quality; slow and heavy\n - Supports transparency\n",
+             "\n JPG\n - Lossy, good quality; fast and lightweight\n - No transparency\n",
+             "\n BMP\n - Uncompressed, highest quality; large file size\n - No transparency\n",
+             "\n TIFF\n - Highest quality; very slow and heavy\n - Supports transparency\n"],
+            App.create_option_menu(App.select_image_extension_from_menu, image_extension_list,
+                                   app_state.preferences.image_extension, width=little_menu_width),
+        )
+        App._paired_option(
+            ROW_OUTPUT_FORMAT, False, "Video ext.", "Choose the container format for upscaled videos",
+            ["\n MP4\n - Widely supported, efficient compression; ideal for general use\n",
+             "\n MKV\n - High quality; supports almost any codec and multiple audio/subtitle tracks\n",
+             "\n AVI\n - Older, compatible format; larger files with less efficient compression\n",
+             "\n MOV\n - High quality Apple format; large files, suited for editing\n"],
+            App.create_option_menu(App.select_video_extension_from_menu, video_extension_list,
+                                   app_state.preferences.video_extension, width=little_menu_width),
+        )
+
+    @staticmethod
+    def place_video_codec_keep_frames_menus():
+        place_option_background(ROW_CODEC)
+        App._paired_option(
+            ROW_CODEC, True, "Video codec", "Choose the encoder used to compress the upscaled video",
+            ["\n SOFTWARE ENCODING (CPU)\n - x264 | H.264\n - x265 | HEVC (H.265)\n",
+             "\n NVIDIA GPU (NVENC)\n - h264_nvenc | H.264\n - hevc_nvenc | HEVC\n",
+             "\n AMD GPU (AMF)\n - h264_amf | H.264\n - hevc_amf | HEVC\n",
+             "\n INTEL GPU (QSV)\n - h264_qsv | H.264\n - hevc_qsv | HEVC\n"],
+            App.create_option_menu(
+                App.select_video_codec_from_menu, video_codec_list,
+                app_state.preferences.video_codec, width=little_menu_width,
+                variable=App.get_video_codec_var(),
+            ),
+        )
+        App._paired_option(
+            ROW_CODEC, False, "Keep frames", "Keep the SQLite frame cache after encoding",
+            ["\n ON\n - Keep the video's .qualityscaler/frames.sqlite3 cache after creating the output\n",
+             "\n OFF\n - Remove the frame cache after successful encoding\n"
+             " - Interrupted jobs remain resumable\n"],
+            App.create_option_menu(
+                App.select_save_frame_from_menu, keep_frames_list,
+                "ON" if app_state.preferences.keep_frames else "OFF", width=little_menu_width,
+            ),
+        )
+
+    @staticmethod
+    def place_output_path_textbox():
+        background = App.create_option_background()
+        info = App.create_info_button(
+            lambda: open_info_messagebox(
+                "Output path", "Choose where upscaled files are saved",
+                [" The default is the folder containing each input file.",
+                 " Select another folder using the SELECT button."],
+            ), "Output path"
+        )
+        entry = App.create_text_box(App.get_output_path_var(), 250, state=DISABLED)
+        button = App.create_active_button(open_output_path_action, "SELECT", None, 60, 26)
+        background.place(relx=0.75, rely=ROW_OUTPUT_PATH, relwidth=0.48, anchor="center")
+        App.place_at(info, COL_INFO_L, ROW_OUTPUT_PATH)
+        App.place_at(button, COL_INFO_L + 0.052, ROW_OUTPUT_PATH)
+        App.place_at(entry, COL_ZOOM - 0.008, ROW_OUTPUT_PATH)
+
+    @staticmethod
+    def place_message_label():
+        message_label = CTkLabel(
+            App.get_app_window(), textvariable=App.get_info_message_var(),
+            height=25, width=250, font=bold11, bg_color=background_color,
+            fg_color=UI_ACCENT_COLOR, text_color="#0A0A0A",
+            anchor="center", corner_radius=UI_CORNER_RADIUS,
+        )
+        triangle = CTkCanvas(
+            App.get_app_window(), width=14, height=14, bg=background_color,
+            highlightthickness=0,
+        )
+        triangle_item = triangle.create_polygon(14, 0, 0, 7, 14, 14, fill=UI_ACCENT_COLOR)
+        App.place_at(triangle, 0.716, ROW_ACTIONS)
+        App.place_at(message_label, 0.85, ROW_ACTIONS)
+        App._message_label = message_label
+        App._message_triangle = triangle
+        App._message_triangle_item = triangle_item
+        App._message_color = UI_ACCENT_COLOR
+        variable = App.get_info_message_var()
+        app_state.traces.append((variable, variable.trace_add("write", App._refresh_message_color)))
+
+    @staticmethod
+    def _refresh_message_color(*_args):
+        label = getattr(App, "_message_label", None)
+        if label is None or app_state.closing or not label.winfo_exists():
+            return
+        message = App.get_info_message_var().get().lower()
+        if "error" in message:
+            target = MESSAGE_ERROR_COLOR
+        elif "completed" in message:
+            target = MESSAGE_SUCCESS_COLOR
+        elif "stopped" in message:
+            target = MESSAGE_WARNING_COLOR
+        else:
+            target = UI_ACCENT_COLOR
+        App._animate_message_color(target)
+
+    @staticmethod
+    def _set_message_color(color):
+        label = getattr(App, "_message_label", None)
+        if label is not None and label.winfo_exists():
+            label.configure(fg_color=color)
+        triangle = getattr(App, "_message_triangle", None)
+        item = getattr(App, "_message_triangle_item", None)
+        if triangle is not None and triangle.winfo_exists() and item is not None:
+            triangle.itemconfig(item, fill=color)
+        App._message_color = color
+
+    @staticmethod
+    def _animate_message_color(target):
+        _cancel_after(getattr(App, "_message_after_id", None))
+        App._message_after_id = None
+        start = getattr(App, "_message_color", UI_ACCENT_COLOR)
+        if start == target:
+            App._set_message_color(target)
+            return
+
+        def run(step):
+            if app_state.closing:
+                return
+            App._set_message_color(lerp_hex(start, target, min(1.0, step / 10)))
+            if step < 10:
+                App._message_after_id = _schedule(24, lambda: run(step + 1))
+            else:
+                App._message_after_id = None
+        run(1)
+
+    @staticmethod
+    def _place_action(command, text, icon, border_color=UI_ACCENT_COLOR):
+        if app_state.action_button is not None:
+            app_state.action_button.destroy()
+        button = App.create_active_button(
+            command, text, icon, width=150, height=30, border_color=border_color
+        )
+        App.place_at(button, 0.62, ROW_ACTIONS)
+        app_state.action_button = button
+
+    @staticmethod
+    def place_stop_button():
+        App._place_action(stop_button_command, "STOP", stop_icon, "#EC1D1D")
+
+    @staticmethod
+    def place_upscale_button():
+        App._place_action(upscale_button_command, "UPSCALE", upscale_icon)
+
+    @staticmethod
+    def select_app_zoom(value):
+        app_state.preferences.app_zoom = value
+        apply_app_zoom(float(value.replace("%", "")) / 100)
+
+    @staticmethod
+    def select_AI_from_menu(value):
+        app_state.preferences.ai_model = value
+        update_file_widget()
+
+    @staticmethod
+    def select_AI_multithreading_from_menu(value):
+        app_state.preferences.ai_multithreading = value
+        update_file_widget()
+
+    @staticmethod
+    def select_sharpening_from_menu(value):
+        app_state.preferences.sharpening = value
+        update_file_widget()
+
+    @staticmethod
+    def select_gpu_from_menu(value):
+        app_state.preferences.gpu = value
+        apply_auto_vram_for_gpu(value)
+        apply_auto_codec_for_gpu(value)
+        update_file_widget()
+
+    @staticmethod
+    def select_save_frame_from_menu(value):
+        app_state.preferences.keep_frames = value == "ON"
+        update_file_widget()
+
+    @staticmethod
+    def select_image_extension_from_menu(value):
+        app_state.preferences.image_extension = value
+
+    @staticmethod
+    def select_video_extension_from_menu(value):
+        app_state.preferences.video_extension = value
+        update_file_widget()
+
+    @staticmethod
+    def select_video_codec_from_menu(value):
+        app_state.preferences.video_codec = value
+        update_file_widget()
+
+    @staticmethod
+    def create_option_background():
+        return CTkFrame(
+            App.get_app_window(), bg_color=background_color,
+            fg_color=CARD_BACKGROUND_COLOR, height=46, corner_radius=12,
+            border_width=1, border_color=CARD_BORDER_COLOR,
+        )
+
+    @staticmethod
+    def create_panel_background():
+        return CTkFrame(App.get_app_window(), fg_color=background_color,
+                        corner_radius=0, border_width=0)
+
+    @staticmethod
+    def create_info_button(command, text, width=200):
+        frame = CTkFrame(App.get_app_window(), fg_color=CARD_BACKGROUND_COLOR, height=25)
+        button = CTkButton(
+            frame, command=command, font=bold14, text="?", border_width=0,
+            fg_color=CARD_BACKGROUND_COLOR, hover_color=CARD_BACKGROUND_COLOR,
+            text_color=CARD_MUTED_COLOR, width=20, height=20,
+            corner_radius=UI_CORNER_RADIUS,
+        )
+        button.bind("<Enter>", lambda e: button.configure(text_color=UI_ACCENT_COLOR))
+        button.bind("<Leave>", lambda e: button.configure(text_color=CARD_MUTED_COLOR))
+        button.grid(row=0, column=0, padx=(0, 7), pady=0, sticky="w")
+        CTkLabel(
+            frame, text=text, width=width, height=22, fg_color="transparent",
+            bg_color=CARD_BACKGROUND_COLOR, text_color=CARD_VALUE_COLOR,
+            font=bold13, anchor="w",
+        ).grid(row=0, column=1, pady=0, sticky="w")
+        frame.grid_propagate(False)
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+        return frame
+
+    @staticmethod
+    def create_option_menu(command, values, default_value,
+                           border_color=UI_BORDER_COLOR, border_width=1,
+                           width=159, height=26, variable=None):
+        total_width = width + 2 * border_width
+        total_height = height + 2 * border_width
+        frame = CTkFrame(
+            App.get_app_window(), fg_color=background_color, width=total_width,
+            height=total_height, border_width=0, corner_radius=UI_CORNER_RADIUS,
+        )
+        option_menu = CTkOptionMenu(
+            frame, command=command, values=values, variable=variable,
+            width=width, height=height, corner_radius=UI_CORNER_RADIUS,
+            dropdown_font=bold12, font=bold11, anchor="center",
+            text_color=text_color, fg_color=background_color,
+            button_color=background_color, button_hover_color=background_color,
+            dropdown_fg_color=background_color,
+        )
+        option_menu.place(x=(total_width - width) / 2, y=(total_height - height) / 2)
+        option_menu.set(default_value)
+        return frame
+
+    @staticmethod
+    def create_text_box(textvariable, width, height=26, state="normal"):
+        return CTkEntry(
+            App.get_app_window(), textvariable=textvariable,
+            corner_radius=UI_CORNER_RADIUS, width=width, height=height,
+            font=bold11, justify="center", text_color=text_color,
+            fg_color="#000000", border_width=2, border_color=UI_BORDER_COLOR,
+            state=state,
+        )
+
+    @staticmethod
+    def create_active_button(command, text, icon, width=140, height=30,
+                             border_color=UI_ACCENT_COLOR):
+        button = CTkButton(
+            App.get_app_window(), text=text, image=icon, width=width,
+            height=height, font=bold11, border_width=2,
+            corner_radius=UI_CORNER_RADIUS, fg_color="#282828",
+            text_color="#E0E0E0", border_color=border_color,
+        )
+
+        def press_feedback():
+            if button.winfo_exists():
+                button.configure(fg_color="#1E1E1E")
+                _schedule(120, lambda: button.winfo_exists() and button.configure(fg_color="#282828"))
+            command()
+        button.configure(command=press_feedback)
+        return button
+
+    @staticmethod
+    def create_link_button(command, icon):
+        button = CTkButton(
+            App.get_app_window(), command=command, image=icon,
+            width=30, height=30, border_width=2, corner_radius=UI_CORNER_RADIUS,
+            bg_color=background_color, fg_color=CARD_BACKGROUND_COLOR,
+            hover_color=widget_background_color, text_color=text_color,
+            border_color=CARD_BORDER_COLOR, anchor="center", text="", font=bold11,
+        )
+        button.bind("<Enter>", lambda e: button.configure(border_color=UI_ACCENT_COLOR))
+        button.bind("<Leave>", lambda e: button.configure(border_color=CARD_BORDER_COLOR))
+        return button
+
+    @staticmethod
+    def get_app_window():
+        return app_state.window
+
+    @staticmethod
+    def get_info_message_var():
+        return app_state.info_message
+
+    @staticmethod
+    def get_output_path_var():
+        return app_state.selected_output_path
+
+    @staticmethod
+    def get_input_resize_factor_var():
+        return app_state.selected_input_resize_factor
+
+    @staticmethod
+    def get_output_resize_factor_var():
+        return app_state.selected_output_resize_factor
+
+    @staticmethod
+    def get_vram_limiter_var():
+        return app_state.selected_VRAM_limiter
+
+    @staticmethod
+    def get_video_codec_var():
+        return app_state.selected_video_codec
+
+
+def _load_ui_resources():
+    global bold11, bold12, bold13, bold14, bold17, bold18, bold22
+    global logo_git, logo_telegram, stop_icon, upscale_icon, clear_icon
+    bold11 = CTkFont(family="Segoe UI", size=11, weight="bold")
+    bold12 = CTkFont(family="Segoe UI", size=12, weight="bold")
+    bold13 = CTkFont(family="Segoe UI", size=13, weight="bold")
+    bold14 = CTkFont(family="Segoe UI", size=14, weight="bold")
+    bold17 = CTkFont(family="Segoe UI", size=17, weight="bold")
+    bold18 = CTkFont(family="Segoe UI", size=18, weight="bold")
+    bold22 = CTkFont(family="Segoe UI", size=22, weight="bold")
+
+    def icon(name, size):
+        with pillow_image_open(find_by_relative_path(f"Assets{os_separator}{name}")) as image:
+            return CTkImage(image.copy(), size=size)
+    logo_git = icon("github_logo.png", (18, 18))
+    logo_telegram = icon("telegram_logo.png", (16, 16))
+    stop_icon = icon("stop_icon.png", (15, 15))
+    upscale_icon = icon("upscale_icon.png", (15, 15))
+    clear_icon = icon("clear_icon.png", (15, 15))
+
 
 def main():
-    global default_AI_model, default_AI_multithreading, default_gpu, default_keep_frames
-    global default_image_extension, default_video_extension, default_video_codec
-    global default_blending, default_output_path, default_VRAM_limiter
-    global default_input_resize_factor, default_output_resize_factor
-    global process_status_q, event_stop_upscale_process, window, info_message
-    global selected_output_path, selected_input_resize_factor, selected_output_resize_factor
-    global selected_VRAM_limiter
-    global bold8, bold9, bold10, bold11, bold12, bold13, bold14, bold16
-    global bold17, bold18, bold19, bold20, bold21, bold22, bold23, bold24
-    global logo_git, logo_telegram, stop_icon, upscale_icon, clear_icon, info_icon
-    global file_widget, input_widgets
-
-    if os_path_exists(FFMPEG_EXE_PATH):
-        print(f"[{app_name}] ffmpeg.exe found")
-    else:
-        print(f"[{app_name}] ffmpeg.exe not found, please install ffmpeg.exe following the guide")
-
-    if os_path_exists(USER_PREFERENCE_PATH):
-        print(f"[{app_name}] Preference file exist")
-        with open(USER_PREFERENCE_PATH, "r") as json_file:
-            json_data = json_load(json_file)
-            default_AI_model             = json_data.get("default_AI_model",             AI_models_list[0])
-            default_AI_multithreading    = json_data.get("default_AI_multithreading",    AI_multithreading_list[0])
-            default_gpu                  = json_data.get("default_gpu",                  gpus_list[0])
-            default_keep_frames          = json_data.get("default_keep_frames",          keep_frames_list[1])
-            default_image_extension      = json_data.get("default_image_extension",      image_extension_list[0])
-            default_video_extension      = json_data.get("default_video_extension",      video_extension_list[0])
-            default_video_codec          = json_data.get("default_video_codec",          video_codec_list[0])
-            default_blending             = json_data.get("default_blending",             blending_list[1])
-            default_output_path          = json_data.get("default_output_path",          OUTPUT_PATH_CODED)
-            default_input_resize_factor  = json_data.get("default_input_resize_factor",  str(50))
-            default_output_resize_factor = json_data.get("default_output_resize_factor", str(100))
-            default_VRAM_limiter         = json_data.get("default_VRAM_limiter",         str(4))
-    else:
-        print(f"[{app_name}] Preference file does not exist, using default coded value")
-        default_AI_model             = AI_models_list[0]
-        default_AI_multithreading    = AI_multithreading_list[0]
-        default_gpu                  = gpus_list[0]
-        default_keep_frames          = keep_frames_list[1]
-        default_image_extension      = image_extension_list[0]
-        default_video_extension      = video_extension_list[0]
-        default_video_codec          = video_codec_list[0]
-        default_blending             = blending_list[1]
-        default_output_path          = OUTPUT_PATH_CODED
-        default_input_resize_factor  = str(50)
-        default_output_resize_factor = str(100)
-        default_VRAM_limiter         = str(4)
-
-    multiprocessing_freeze_support()
+    global app_state
+    preferences = load_user_preferences()
+    app_state = AppState(preferences=preferences)
     set_appearance_mode("Dark")
     set_default_color_theme("dark-blue")
-
-    # Multiprocessing utilities
-    multiprocessing_manager    = multiprocessing_Manager()
-    process_status_q           = multiprocessing_manager.Queue(maxsize=1)
-    event_stop_upscale_process = multiprocessing_Event()
-
-    window = FileDropWindow()
-    file_widget = None
-    input_widgets = ()
-    info_message                  = StringVar()
-    selected_output_path          = StringVar()
-    selected_input_resize_factor  = StringVar()
-    selected_output_resize_factor = StringVar()
-    selected_VRAM_limiter         = StringVar()
-
-    global selected_file_list
-    global selected_AI_model
-    global selected_blending_factor
-    global selected_AI_multithreading
-    global selected_gpu
-    global selected_keep_frames
-    global selected_image_extension
-    global selected_video_extension
-    global selected_video_codec
-    global tiles_resolution
-    global input_resize_factor
-
-    selected_file_list = []
-
-    selected_AI_model        = default_AI_model
-    selected_gpu             = default_gpu
-    selected_image_extension = default_image_extension
-    selected_video_extension = default_video_extension
-    selected_video_codec     = default_video_codec
-
-    if default_AI_multithreading == "OFF":
-        selected_AI_multithreading = 1
-    else:
-        selected_AI_multithreading = int(default_AI_multithreading.split()[0])
-
-    if default_keep_frames == "ON":
-        selected_keep_frames = True
-    else:
-        selected_keep_frames = False
-
-    selected_blending_factor = {"OFF": 0, "Low": 0.3, "Medium": 0.5, "High": 0.7}.get(default_blending)
-
-    selected_input_resize_factor.set(default_input_resize_factor)
-    selected_output_resize_factor.set(default_output_resize_factor)
-    selected_VRAM_limiter.set(default_VRAM_limiter)
-    selected_output_path.set(default_output_path)
-
-    info_message.set("Hi :)")
-    selected_input_resize_factor.trace_add('write', update_file_widget)
-    selected_output_resize_factor.trace_add('write', update_file_widget)
-
-    font   = "Segoe UI"
-    bold8  = CTkFont(family = font, size = 8, weight = "bold")
-    bold9  = CTkFont(family = font, size = 9, weight = "bold")
-    bold10 = CTkFont(family = font, size = 10, weight = "bold")
-    bold11 = CTkFont(family = font, size = 11, weight = "bold")
-    bold12 = CTkFont(family = font, size = 12, weight = "bold")
-    bold13 = CTkFont(family = font, size = 13, weight = "bold")
-    bold14 = CTkFont(family = font, size = 14, weight = "bold")
-    bold16 = CTkFont(family = font, size = 16, weight = "bold")
-    bold17 = CTkFont(family = font, size = 17, weight = "bold")
-    bold18 = CTkFont(family = font, size = 18, weight = "bold")
-    bold19 = CTkFont(family = font, size = 19, weight = "bold")
-    bold20 = CTkFont(family = font, size = 20, weight = "bold")
-    bold21 = CTkFont(family = font, size = 21, weight = "bold")
-    bold22 = CTkFont(family = font, size = 22, weight = "bold")
-    bold23 = CTkFont(family = font, size = 23, weight = "bold")
-    bold24 = CTkFont(family = font, size = 24, weight = "bold")
-
-    # Images
-    logo_git      = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}github_logo.png")),    size=(22, 22))
-    logo_telegram = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}telegram_logo.png")),  size=(18, 18))
-    stop_icon     = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}stop_icon.png")),      size=(15, 15))
-    upscale_icon  = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}upscale_icon.png")),   size=(15, 15))
-    clear_icon    = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}clear_icon.png")),     size=(15, 15))
-    info_icon     = CTkImage(pillow_image_open(find_by_relative_path(f"Assets{os_separator}info_icon.png")),      size=(18, 18))
-
-    app = App(window)
-    window.file_drop_target = FileDropTarget(
-        window, select_input_files, accepts=accept_input_drop,
-        on_invalid=lambda: info_message.set("Unable to read the dropped file paths"),
-    )
-    window.update()
-    window.mainloop()
-    multiprocessing_manager.shutdown()
+    apply_app_zoom(float(preferences.app_zoom.replace("%", "")) / 100)
+    manager = multiprocessing_Manager()
+    try:
+        app_state.process_status_q = manager.Queue(maxsize=1)
+        app_state.event_stop_upscale_process = manager.Event()
+        app_state.window = FileDropWindow()
+        for name in (
+            "info_message", "selected_output_path", "selected_input_resize_factor",
+            "selected_output_resize_factor", "selected_VRAM_limiter", "selected_video_codec",
+        ):
+            setattr(app_state, name, StringVar(master=app_state.window))
+        GPU.detect()
+        if preferences.gpu not in GPU.menu_list():
+            preferences.gpu = GPU.default()
+        app_state.selected_input_resize_factor.set(preferences.input_resize_factor)
+        app_state.selected_output_resize_factor.set(preferences.output_resize_factor)
+        app_state.selected_output_path.set(preferences.output_path)
+        apply_auto_vram_for_gpu(preferences.gpu, fallback=preferences.vram_limiter)
+        apply_auto_codec_for_gpu(preferences.gpu)
+        app_state.selected_video_codec.set(preferences.video_codec)
+        app_state.info_message.set("Hi :)")
+        for variable in (
+            app_state.selected_input_resize_factor, app_state.selected_output_resize_factor,
+            app_state.selected_output_path, app_state.selected_VRAM_limiter,
+        ):
+            app_state.traces.append((variable, variable.trace_add("write", update_file_widget)))
+        _load_ui_resources()
+        App(app_state.window)
+        app_state.window.file_drop_target = FileDropTarget(
+            app_state.window, select_input_files, accepts=accept_input_drop,
+            on_invalid=lambda: app_state.info_message.set("Unable to read the dropped file paths"),
+        )
+        app_state.window.update()
+        app_state.window.mainloop()
+    finally:
+        try:
+            if not app_state.closing:
+                app_state.closing = True
+                try:
+                    stop_upscale_process()
+                finally:
+                    _destroy_window()
+        finally:
+            manager.shutdown()

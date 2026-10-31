@@ -129,11 +129,38 @@ class FFmpegIntegrationTests(unittest.TestCase):
         sentinel.write_bytes(b"unrelated file")
         with self.assertRaisesRegex(RuntimeError, "FFmpeg failed"):
             self.ffmpeg.encode(
-                self.source, output, 5, "not_a_video_codec", frames, Event()
+                self.source, output, 5, "not_a_video_codec", [b"not a JPEG"], Event()
             )
         self.assertEqual(output.read_bytes(), b"previous valid output")
         self.assertEqual(sentinel.read_bytes(), b"unrelated file")
         self.assertFalse(any(self.root.glob(".*.partial-*")))
+
+    def test_selected_codec_falls_back_to_x264_with_replayed_cached_frames(self):
+        frames = []
+        self.ffmpeg.extract(self.source, 5, Event(),
+                            lambda index, data: frames.append(data))
+        calls = []
+
+        def replay():
+            calls.append(True)
+            return iter(frames)
+
+        output = self.root / "fallback.mp4"
+        messages = []
+        self.ffmpeg.encode(
+            self.source, output, 5, "not_a_video_codec", replay, Event(),
+            output_size=(64, 48), total_frames=5, status=messages.append,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any("x264 fallback" in message for message in messages))
+        self.assertTrue(any("100%" in message for message in messages))
+        capture = cv2.VideoCapture(str(output))
+        try:
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 64)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 48)
+        finally:
+            capture.release()
 
     def test_precancelled_encoding_never_touches_predictable_partial_file(self):
         output = self.root / "existing.mp4"

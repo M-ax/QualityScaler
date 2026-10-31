@@ -11,8 +11,12 @@ By default, installs requirements.txt into .venv before building. -SkipInstall
 skips all pip operations, so the caller must have already provisioned .venv
 with those requirements. It does not skip resource checks or the build.
 
-Before building, provide Assets\ffmpeg.exe, Assets\exiftool.exe, the app's PNG/ICO
-assets, and all seven standard AI-onnx\*_fp16.onnx models listed in the spec.
+Before building, provide Assets\ffmpeg.exe, the app's PNG/ICO assets, and all nine
+standard AI-onnx\*_fp16.onnx models listed in the spec: LVAx2, RealESR_Gx4,
+RealESR_Ax4, BSRGANx2, BSRGANx4, RealESRGANx4, MSharpx4, IRCNN_Mx1, IRCNN_Lx1.
+The old RealESR_Animex4 file is not a substitute for RealESR_Ax4. ExifTool is
+neither required nor bundled. Requirements pin PyInstaller 6.16.0 and
+onnxruntime-directml 1.24.4.
 Additional local *_fp16.onnx models are also bundled.
 The spec fails if required local resources or DirectML runtime DLLs are absent.
 Produces one windowed executable, without UPX, signing, or an installer.

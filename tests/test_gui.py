@@ -1,4 +1,9 @@
+"""Desktop contracts without mouse automation or inference/GPU execution."""
+
+from dataclasses import fields
 from inspect import signature
+import json
+import os
 from pathlib import Path
 from queue import Queue
 import subprocess
@@ -10,10 +15,41 @@ import unittest
 from unittest.mock import Mock, patch
 
 from qualityscaler import gui
+from qualityscaler.catalog import MODEL_NAMES, VERSION, VRAM_model_usage
+from qualityscaler.config import ProcessingConfig
 from qualityscaler.jobs import upscale_orchestrator
 
 
-class DesktopBackendWiringTests(unittest.TestCase):
+def variable(value):
+    result = Mock()
+    result.get.return_value = value
+    return result
+
+
+def make_state():
+    return gui.AppState(
+        preferences=gui.UserPreferences(),
+        window=Mock(),
+        info_message=Mock(),
+        selected_output_path=variable(gui.OUTPUT_PATH_CODED),
+        selected_input_resize_factor=variable("50"),
+        selected_output_resize_factor=variable("100"),
+        selected_VRAM_limiter=variable("4"),
+        selected_video_codec=variable("x264"),
+        process_status_q=Queue(),
+        event_stop_upscale_process=Event(),
+    )
+
+
+class StateTestCase(unittest.TestCase):
+    def setUp(self):
+        self.state = make_state()
+        patcher = patch.object(gui, "app_state", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class DesktopBackendWiringTests(StateTestCase):
     def test_spawn_bootstrap_does_not_import_gui_or_inference_runtime(self):
         launcher = Path(__file__).resolve().parents[1] / "QualityScaler.py"
         script = """
@@ -30,39 +66,59 @@ runpy.run_path(sys.argv[1], run_name='__mp_main__')
 """
         result = subprocess.run(
             [sys.executable, "-c", script, str(launcher)],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_start_uses_modular_orchestrator_with_current_signature(self):
+    def test_config_and_catalog_import_without_gui_or_runtime(self):
+        script = """
+import builtins
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name.split('.')[0] in {'customtkinter', 'tkinter', 'onnxruntime', 'cv2', 'numpy'}:
+        raise AssertionError('Pure config imported backend: ' + name)
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+from qualityscaler.config import ProcessingConfig
+from qualityscaler.catalog import MODEL_NAMES, VERSION
+assert VERSION == '2026.4'
+assert len(MODEL_NAMES) == 9
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True,
+            check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_start_uses_modular_orchestrator_with_exact_positional_contract(self):
         process = Mock()
-        status = Queue()
-        output = Mock()
-        output.get.return_value = "output directory"
-        event = Event()
-        values = {
-            "process_status_q": status, "event_stop_upscale_process": event,
-            "selected_file_list": ["clip.mp4"], "selected_AI_model": "Testx2",
-            "selected_gpu": "Auto", "selected_keep_frames": True,
-            "selected_AI_multithreading": 2, "selected_blending_factor": 0.5,
-            "selected_image_extension": ".png", "selected_video_extension": ".mp4",
-            "selected_video_codec": "x264", "tiles_resolution": 1024,
-            "input_resize_factor": 1.0, "output_resize_factor": 1.0,
-            "selected_output_path": output, "info_message": Mock(),
-        }
-        with patch.multiple(gui, create=True, **values), \
-                patch.object(gui, "user_input_checks", return_value=True), \
-                patch.object(gui, "place_stop_button"), \
+        config = ProcessingConfig(
+            ["clip.mp4"], "output directory", "LVAx2", 2, 0.5, 1.0,
+            "0", 800, 0.3, True, ".png", ".mp4", "h264_nvenc",
+        )
+        with patch.object(gui, "build_processing_config", return_value=config), \
+                patch.object(gui.App, "place_stop_button"), \
                 patch.object(gui, "Process", return_value=process) as constructor, \
-                patch.object(gui, "Thread"):
+                patch.object(gui, "prevent_sleep") as prevent, \
+                patch.object(gui, "_schedule"):
             gui.upscale_button_command()
         self.assertIs(constructor.call_args.kwargs["target"], upscale_orchestrator)
-        bound = signature(upscale_orchestrator).bind(
-            *constructor.call_args.kwargs["args"]
-        )
-        self.assertIs(bound.arguments["event_stop_upscale_process"], event)
+        args = constructor.call_args.kwargs["args"]
+        self.assertEqual(args, (
+            self.state.process_status_q, self.state.event_stop_upscale_process,
+            ["clip.mp4"], "output directory", "LVAx2", 2, 0.5, 1.0,
+            "0", 800, 0.3, True, ".png", ".mp4", "h264_nvenc",
+        ))
+        bound = signature(upscale_orchestrator).bind(*args)
+        self.assertIs(bound.arguments["event_stop_upscale_process"],
+                      self.state.event_stop_upscale_process)
         self.assertEqual(bound.arguments["selected_file_list"], ["clip.mp4"])
+        self.assertEqual(bound.arguments["selected_sharpening_amount"], 0.3)
+        self.assertNotIn("video_frames_and_info_q", bound.arguments)
+        self.assertNotIn("video_frames_and_info_q", vars(self.state))
+        prevent.assert_called_once()
         process.start.assert_called_once()
+        self.assertTrue(self.state.processing)
 
     def test_desktop_launcher_actually_spawns_gui_free_workers(self):
         root = Path(__file__).resolve().parents[1]
@@ -84,46 +140,95 @@ with patch.dict(sys.modules, {'qualityscaler.gui': SimpleNamespace(main=launch_w
     runpy.run_path(str(root / 'QualityScaler.py'), run_name='__main__')
 """
         result = subprocess.run(
-            [sys.executable, "-c", script, str(root)],
-            capture_output=True, text=True, check=False, timeout=30,
+            [sys.executable, "-c", script, str(root)], capture_output=True,
+            text=True, check=False, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_stop_waits_for_checkpoint_before_hard_kill(self):
         process = Mock(pid=123)
         process.is_alive.return_value = False
-        event = Event()
-        status = Queue()
-        status.put("old progress")
-        with patch.multiple(
-            gui, create=True, process_upscale_orchestrator=process,
-            event_stop_upscale_process=event, process_status_q=status,
-        ):
+        self.state.process_upscale_orchestrator = process
+        self.state.process_status_q.put("old progress")
+        with patch.object(gui, "allow_sleep") as allow:
             gui.stop_upscale_process()
         process.join.assert_called_once_with(timeout=10)
         process.kill.assert_not_called()
-        self.assertTrue(status.empty())
-        self.assertFalse(event.is_set())
+        self.assertTrue(self.state.process_status_q.empty())
+        self.assertFalse(self.state.event_stop_upscale_process.is_set())
+        self.assertIsNone(self.state.process_upscale_orchestrator)
+        allow.assert_called_once()
 
     def test_hung_worker_fallback_kills_ffmpeg_descendants_and_joins(self):
         process = Mock(pid=123)
         process.is_alive.return_value = True
+        self.state.process_upscale_orchestrator = process
         child = Mock()
-        event = Event()
-        with patch.multiple(
-            gui, create=True, process_upscale_orchestrator=process,
-            event_stop_upscale_process=event, process_status_q=Queue(),
-        ), patch.object(gui, "psutil_Process") as lookup:
+        with patch.object(gui, "allow_sleep"), \
+                patch.object(gui, "psutil_Process") as lookup:
             lookup.return_value.children.return_value = [child]
             gui.stop_upscale_process()
+        lookup.return_value.children.assert_called_once_with(recursive=True)
         child.kill.assert_called_once()
         process.kill.assert_called_once()
         self.assertEqual(process.join.call_count, 2)
-        self.assertFalse(event.is_set())
+        self.assertFalse(self.state.event_stop_upscale_process.is_set())
+
+    def test_progress_highlights_card_on_tk_poll(self):
+        self.state.processing = True
+        self.state.process_upscale_orchestrator = Mock()
+        self.state.file_widget = Mock()
+        self.state.process_status_q.put("2. Upscaling video 30%")
+        with patch.object(gui, "_schedule") as schedule:
+            gui.check_upscale_steps()
+        self.state.info_message.set.assert_called_with("2. Upscaling video 30%")
+        self.state.file_widget.highlight_active_file.assert_called_once_with(2)
+        schedule.assert_called_once_with(250, gui.check_upscale_steps)
+
+    def test_completed_status_restores_sleep_and_refreshes_resume_badges(self):
+        self.state.process_status_q.put(gui.COMPLETED_STATUS)
+        self.state.file_widget = Mock()
+        with patch.object(gui, "allow_sleep") as allow, \
+                patch.object(gui, "show_completion_notification") as notify, \
+                patch.object(gui, "update_file_widget") as refresh, \
+                patch.object(gui.App, "place_upscale_button"):
+            gui.check_upscale_steps()
+        self.state.info_message.set.assert_called_with("All files completed! :)")
+        self.state.file_widget.clear_active_highlight.assert_called_once()
+        notify.assert_called_once()
+        allow.assert_called_once()
+        refresh.assert_called_once()
+        self.assertFalse(self.state.processing)
+
+    def test_start_failure_restores_idle_ui_and_sleep(self):
+        config = ProcessingConfig(
+            ["image.png"], gui.OUTPUT_PATH_CODED, "LVAx2", 1, 0.5, 1.0,
+            "0", 800, 0.3, True, ".png", ".mp4", "x264",
+        )
+        process = Mock(pid=None)
+        process.start.side_effect = RuntimeError("spawn failed")
+        with patch.object(gui, "build_processing_config", return_value=config), \
+                patch.object(gui, "Process", return_value=process), \
+                patch.object(gui, "prevent_sleep"), patch.object(gui, "allow_sleep") as allow, \
+                patch.object(gui, "show_error_message") as error, \
+                patch.object(gui.App, "place_stop_button"), \
+                patch.object(gui.App, "place_upscale_button") as idle:
+            gui.upscale_button_command()
+        error.assert_called_once_with("spawn failed")
+        idle.assert_called_once()
+        allow.assert_called_once()
+        self.assertFalse(gui.inputs_are_busy())
+
+    def test_busy_start_cannot_spawn_second_orchestrator(self):
+        self.state.processing = True
+        with patch.object(gui, "Process") as constructor:
+            gui.upscale_button_command()
+        constructor.assert_not_called()
 
 
-class InputSelectionTests(unittest.TestCase):
+class InputSelectionTests(StateTestCase):
     def setUp(self):
+        super().setUp()
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -133,20 +238,13 @@ class InputSelectionTests(unittest.TestCase):
         self.second.write_bytes(b"preview is mocked")
         self.views = []
         self.reject = set()
-        self.status = Mock()
+        self.status = self.state.info_message
         self.placeholder = (Mock(), Mock(), Mock())
-        window = Mock()
-        window.winfo_rootx.return_value = 100
-        window.winfo_rooty.return_value = 200
-        window.winfo_width.return_value = 1000
-        window.winfo_height.return_value = 675
-        patcher = patch.multiple(
-            gui, create=True, file_widget=None, input_widgets=self.placeholder,
-            selected_file_list=[], process_upscale_orchestrator=None,
-            window=window, info_message=self.status,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.state.input_widgets = self.placeholder
+        self.state.window.winfo_rootx.return_value = 100
+        self.state.window.winfo_rooty.return_value = 200
+        self.state.window.winfo_width.return_value = 1000
+        self.state.window.winfo_height.return_value = 675
         patcher = patch.object(gui, "get_values_for_file_widget", return_value=(4, 50, 100))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -170,7 +268,7 @@ class InputSelectionTests(unittest.TestCase):
             gui.open_files_action()
         first_view = self.views[0]
         self.assertTrue(gui.select_input_files((str(self.first), str(self.second))))
-        self.assertEqual(gui.selected_file_list,
+        self.assertEqual(self.state.selected_file_list,
                          [str(self.first.resolve()), str(self.second.resolve())])
         first_view.destroy.assert_called_once()
         for widget in self.placeholder:
@@ -180,60 +278,345 @@ class InputSelectionTests(unittest.TestCase):
 
     def test_picker_cancellation_leaves_selection_and_status_untouched(self):
         gui.select_input_files([self.first])
-        view = gui.file_widget
+        view = self.state.file_widget
         self.status.reset_mock()
         with patch.object(gui.filedialog, "askopenfilenames", return_value=()):
             gui.open_files_action()
-        self.assertIs(gui.file_widget, view)
+        self.assertIs(self.state.file_widget, view)
         view.destroy.assert_not_called()
         self.status.set.assert_not_called()
 
     def test_invalid_drop_leaves_existing_selection_untouched(self):
         gui.select_input_files([self.first])
-        view = gui.file_widget
+        view = self.state.file_widget
         notes = self.root / "notes.txt"
         notes.write_text("ignore")
         self.assertFalse(gui.select_input_files([notes, self.root, "missing.jpg"]))
-        self.assertIs(gui.file_widget, view)
-        self.assertEqual(gui.selected_file_list, [str(self.first.resolve())])
+        self.assertIs(self.state.file_widget, view)
+        self.assertEqual(self.state.selected_file_list, [str(self.first.resolve())])
         view.destroy.assert_not_called()
 
     def test_unreadable_new_media_does_not_replace_a_valid_selection(self):
         gui.select_input_files([self.first])
-        view = gui.file_widget
+        view = self.state.file_widget
         self.reject.add(str(self.second.resolve()))
         self.assertFalse(gui.select_input_files([self.second]))
-        self.assertIs(gui.file_widget, view)
+        self.assertIs(self.state.file_widget, view)
         view.destroy.assert_not_called()
         self.views[-1].destroy.assert_called_once()
 
     def test_active_job_refuses_picker_drop_and_clear(self):
         gui.select_input_files([self.first])
-        view = gui.file_widget
-        gui.process_upscale_orchestrator = SimpleNamespace(is_alive=lambda: True)
+        view = self.state.file_widget
+        self.state.process_upscale_orchestrator = SimpleNamespace(is_alive=lambda: True)
         with patch.object(gui.filedialog, "askopenfilenames") as picker:
             gui.open_files_action()
         picker.assert_not_called()
         self.assertFalse(gui.select_input_files([self.second]))
         self.assertFalse(gui.clear_input_files())
-        self.assertIs(gui.file_widget, view)
+        self.assertIs(self.state.file_widget, view)
         view.destroy.assert_not_called()
+
+    def test_starting_and_stopping_are_busy_even_without_live_process(self):
+        for name in ("processing", "stopping"):
+            with self.subTest(state=name):
+                setattr(self.state, name, True)
+                self.assertFalse(gui.select_input_files([self.first]))
+                self.assertFalse(gui.clear_input_files())
+                setattr(self.state, name, False)
 
     def test_drop_only_accepts_the_left_input_pane(self):
         self.assertTrue(gui.accept_input_drop(SimpleNamespace(x_root=350, y_root=300)))
-        for x, y in ((850, 300), (99, 300), (350, 199), (350, 875)):
+        for x, y in ((600, 300), (850, 300), (99, 300), (350, 199), (350, 875)):
             with self.subTest(x=x, y=y):
                 self.assertFalse(gui.accept_input_drop(SimpleNamespace(x_root=x, y_root=y)))
 
     def test_clear_resets_widget_and_queue_before_showing_placeholder(self):
         gui.select_input_files([self.first])
-        view = gui.file_widget
-        with patch.object(gui, "place_loadFile_section") as placeholder:
+        view = self.state.file_widget
+        with patch.object(gui.App, "place_loadFile_section") as placeholder:
             self.assertTrue(gui.clear_input_files())
-        self.assertIsNone(gui.file_widget)
-        self.assertEqual(gui.selected_file_list, [])
+        self.assertIsNone(self.state.file_widget)
+        self.assertEqual(self.state.selected_file_list, [])
         view.destroy.assert_called_once()
         placeholder.assert_called_once()
+
+
+class PreferencesAndConfigTests(StateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.state.file_widget = Mock()
+        self.state.file_widget.get_selected_file_list.return_value = ["clip.mp4"]
+        patcher = patch.object(gui.GPU, "device_id_for", return_value="1")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(gui, "check_disk_space", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_exact_upstream_config_fields_and_nine_model_catalog(self):
+        self.assertEqual([field.name for field in fields(ProcessingConfig)], [
+            "selected_file_list", "selected_output_path", "selected_AI_model",
+            "selected_AI_multithreading", "input_resize_factor", "output_resize_factor",
+            "selected_gpu", "tiles_resolution", "selected_sharpening_amount",
+            "selected_keep_frames", "selected_image_extension",
+            "selected_video_extension", "selected_video_codec",
+        ])
+        self.assertEqual(VERSION, "2026.4")
+        self.assertEqual(MODEL_NAMES, (
+            "LVAx2", "RealESR_Gx4", "RealESR_Ax4", "BSRGANx2", "BSRGANx4",
+            "RealESRGANx4", "MSharpx4", "IRCNN_Mx1", "IRCNN_Lx1",
+        ))
+        self.assertEqual(set(MODEL_NAMES), set(VRAM_model_usage))
+
+    def test_defaults_match_upstream_and_config_is_plain_values(self):
+        preferences = self.state.preferences
+        self.assertEqual(preferences.ai_model, "LVAx2")
+        self.assertEqual(preferences.sharpening, "Low")
+        self.assertTrue(preferences.keep_frames)
+        config = gui.build_processing_config()
+        self.assertEqual(config.selected_file_list, ["clip.mp4"])
+        self.assertEqual(config.selected_gpu, "1")
+        self.assertEqual(config.tiles_resolution, 800)
+        self.assertEqual(config.input_resize_factor, 0.5)
+        self.assertEqual(config.output_resize_factor, 1.0)
+        self.assertEqual(config.selected_sharpening_amount, 0.3)
+        self.assertEqual(config.selected_AI_multithreading, 1)
+
+    def test_models_use_upstream_vram_multipliers(self):
+        for model, multiplier in VRAM_model_usage.items():
+            with self.subTest(model=model):
+                self.state.preferences.ai_model = model
+                self.assertEqual(gui.build_processing_config().tiles_resolution,
+                                 int(multiplier * 4 * 100))
+
+    def test_bad_numeric_input_is_reported_without_starting(self):
+        for name in ("selected_input_resize_factor", "selected_output_resize_factor",
+                     "selected_VRAM_limiter"):
+            for value in ("bad", "0", "-1", "nan", "inf"):
+                with self.subTest(variable=name, value=value):
+                    original = getattr(self.state, name)
+                    setattr(self.state, name, variable(value))
+                    self.assertIsNone(gui.build_processing_config())
+                    setattr(self.state, name, original)
+
+    def test_resume_uses_current_video_settings_and_readonly_backend_api(self):
+        with patch.object(gui, "get_resume_progress", return_value=42) as resume:
+            self.assertEqual(gui.get_video_resume_progress("clip.mp4"), 42)
+            path, output, settings = resume.call_args.args
+            self.assertEqual(path, "clip.mp4")
+            self.assertEqual(output, gui.OUTPUT_PATH_CODED)
+            self.assertEqual(settings.model, "LVAx2")
+            self.assertEqual(settings.gpu, "1")
+            self.assertEqual(settings.sharpening_amount, 0.3)
+            self.assertEqual(settings.tiles_resolution, 800)
+            self.state.preferences.sharpening = "High"
+            self.state.preferences.ai_multithreading = "4 threads"
+            self.state.selected_output_path.get.return_value = "new output"
+            gui.get_video_resume_progress("clip.mp4")
+            self.assertEqual(resume.call_args.args[1], "new output")
+            self.assertEqual(resume.call_args.args[2].sharpening_amount, 0.5)
+            self.assertEqual(resume.call_args.args[2].workers, 4)
+
+    def test_invalid_settings_suppress_resume_without_status_changes(self):
+        self.state.selected_input_resize_factor.get.return_value = "not a number"
+        with patch.object(gui, "get_resume_progress") as resume:
+            self.assertIsNone(gui.get_video_resume_progress("clip.mp4"))
+        resume.assert_not_called()
+        self.state.info_message.set.assert_not_called()
+
+    def test_gpu_selection_applies_detected_vram_and_vendor_codec(self):
+        with patch.object(gui.GPU, "vram_for", return_value=12), \
+                patch.object(gui.GPU, "codec_for", return_value="hevc_nvenc"), \
+                patch.object(gui, "update_file_widget") as refresh:
+            gui.App.select_gpu_from_menu("NVIDIA GPU")
+        self.assertEqual(self.state.preferences.gpu, "NVIDIA GPU")
+        self.assertEqual(self.state.preferences.vram_limiter, "12")
+        self.state.selected_VRAM_limiter.set.assert_called_with("12")
+        self.state.selected_video_codec.set.assert_called_with("hevc_nvenc")
+        self.assertEqual(self.state.preferences.video_codec, "hevc_nvenc")
+        refresh.assert_called_once()
+
+    def test_no_gpu_detection_preserves_vram_fallback_and_software_codec(self):
+        with patch.object(gui.GPU, "vram_for", return_value=None), \
+                patch.object(gui.GPU, "codec_for", return_value=None):
+            gui.apply_auto_vram_for_gpu("No GPU found", fallback="4")
+            gui.apply_auto_codec_for_gpu("No GPU found")
+        self.state.selected_VRAM_limiter.set.assert_called_with("4")
+        self.assertEqual(self.state.preferences.video_codec, "x264")
+
+    def test_zoom_updates_both_tk_scalings_and_preference(self):
+        with patch.object(gui, "set_window_scaling") as windows, \
+                patch.object(gui, "set_widget_scaling") as widgets:
+            gui.App.select_app_zoom("125%")
+        self.assertEqual(self.state.preferences.app_zoom, "125%")
+        windows.assert_called_once_with(1.25)
+        widgets.assert_called_once_with(1.25)
+
+    def test_preferences_round_trip_upstream_keys_and_tolerate_corruption(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            with patch.object(gui, "USER_PREFERENCE_PATH", str(path)):
+                self.state.preferences.app_zoom = "125%"
+                self.state.preferences.sharpening = "High"
+                gui.save_user_choices_in_json()
+                data = json.loads(path.read_text())
+                self.assertEqual(data["default_keep_frames"], "ON")
+                self.assertNotIn("default_blending", data)
+                loaded = gui.load_user_preferences()
+                self.assertEqual(loaded.app_zoom, "125%")
+                self.assertEqual(loaded.sharpening, "High")
+                for contents in ("{broken", "[]", '{"default_app_zoom": "broken"}'):
+                    path.write_text(contents)
+                    self.assertEqual(gui.load_user_preferences().app_zoom, "100%")
+
+
+class DiskSpaceTests(unittest.TestCase):
+    def test_images_do_not_require_video_disk_space_budget(self):
+        with patch.object(gui, "shutil_disk_usage") as usage:
+            self.assertIsNone(gui.check_disk_space("output", ["image.PNG"]))
+        usage.assert_not_called()
+
+    def test_video_low_disk_blocks_start(self):
+        with TemporaryDirectory() as directory:
+            with patch.object(gui, "shutil_disk_usage",
+                              return_value=SimpleNamespace(free=1024 ** 3)):
+                warning = gui.check_disk_space(directory, ["clip.MP4"])
+        self.assertIn("1.0 GB free", warning)
+
+    def test_each_source_output_drive_is_checked(self):
+        with TemporaryDirectory() as first, TemporaryDirectory() as second:
+            def disk(path):
+                return SimpleNamespace(free=(3 if path == first else 1) * 1024 ** 3)
+            with patch.object(gui, "shutil_disk_usage", side_effect=disk):
+                warning = gui.check_disk_space(
+                    gui.OUTPUT_PATH_CODED,
+                    [str(Path(first) / "one.mp4"), str(Path(second) / "two.mp4")],
+                )
+        self.assertIsNotNone(warning)
+
+
+class CardResourceTests(StateTestCase):
+    def test_unreadable_card_is_omitted_without_hiding_valid_cards(self):
+        view = object.__new__(gui.FileWidget)
+        view.file_list = ["good.png", "bad.mp4", "another.png"]
+        view.unreadable_files = []
+        view.ui_components = []
+        view._create_file_card = Mock(side_effect=[{}, ValueError("unreadable"), {}])
+        view._render_cards()
+        self.assertEqual(view.file_list, ["good.png", "another.png"])
+        self.assertEqual(view.unreadable_files, ["bad.mp4"])
+        self.assertEqual(len(view.ui_components), 2)
+
+    def test_refresh_cancels_progress_animations_before_destroying_sections(self):
+        view = object.__new__(gui.FileWidget)
+        bar, section, content = Mock(), Mock(), Mock()
+        view._animation_ids = {"after#1": bar}
+        view.ui_components = [dict(dynamic_section=section, content=content,
+                                   dynamic_row=2, is_video=True, file_path="clip.mp4",
+                                   width=1920, height=1080)]
+        view._create_dynamic_section = Mock(return_value=Mock())
+        view.refresh_pipeline()
+        bar.after_cancel.assert_called_once_with("after#1")
+        section.destroy.assert_called_once()
+        self.assertFalse(view._animation_ids)
+
+    def test_video_preview_releases_capture_on_decode_failure(self):
+        view = object.__new__(gui.FileWidget)
+        capture = Mock()
+        capture.read.side_effect = ValueError("decode")
+        with patch.object(gui, "opencv_VideoCapture", return_value=capture):
+            with self.assertRaises(ValueError):
+                view.extract_file_icon("clip.mp4")
+        capture.release.assert_called_once()
+
+    def test_active_highlight_matches_one_based_processing_order(self):
+        view = object.__new__(gui.FileWidget)
+        cards = [Mock(), Mock()]
+        view.ui_components = [dict(card=card) for card in cards]
+        view.highlight_active_file(2)
+        cards[0].configure.assert_called_with(border_color=gui.CARD_BORDER_COLOR)
+        cards[1].configure.assert_called_with(border_color=gui.CARD_ACCENT_COLOR)
+        view.clear_active_highlight()
+        cards[1].configure.assert_called_with(border_color=gui.CARD_BORDER_COLOR)
+
+
+class LifecycleTests(StateTestCase):
+    def test_manager_shuts_down_if_window_creation_fails(self):
+        manager = Mock()
+        manager.Queue.return_value = Queue()
+        manager.Event.return_value = Event()
+        with patch.object(gui, "multiprocessing_Manager", return_value=manager), \
+                patch.object(gui, "load_user_preferences", return_value=gui.UserPreferences()), \
+                patch.object(gui, "set_appearance_mode"), \
+                patch.object(gui, "set_default_color_theme"), \
+                patch.object(gui, "apply_app_zoom"), \
+                patch.object(gui, "allow_sleep"), \
+                patch.object(gui, "FileDropWindow", side_effect=RuntimeError("Tk init failed")):
+            with self.assertRaisesRegex(RuntimeError, "Tk init failed"):
+                gui.main()
+        manager.shutdown.assert_called_once()
+
+    def test_close_stops_before_destroy_and_cancels_callbacks_even_if_save_fails(self):
+        calls = []
+        window = self.state.window
+        self.state.after_ids = {"after#1"}
+        self.state.file_widget = Mock()
+        window.destroy.side_effect = lambda: calls.append("destroy")
+        with patch.object(gui, "save_user_choices_in_json", side_effect=OSError("readonly")), \
+                patch.object(gui, "stop_upscale_process", side_effect=lambda: calls.append("stop")):
+            gui.on_app_close()
+        self.assertEqual(calls, ["stop", "destroy"])
+        self.assertTrue(self.state.closing)
+        window.after_cancel.assert_called_once_with("after#1")
+        self.assertFalse(self.state.after_ids)
+
+    def test_destroy_window_is_idempotent_after_tk_already_destroyed_root(self):
+        window = self.state.window
+        widget = Mock()
+        self.state.file_widget = widget
+        widget.destroy.side_effect = gui.TclError("application has been destroyed")
+        window.grab_release.side_effect = gui.TclError("application has been destroyed")
+        window.destroy.side_effect = gui.TclError("application has been destroyed")
+        gui._destroy_window()
+        gui._destroy_window()
+        self.assertIsNone(self.state.window)
+        self.assertIsNone(self.state.file_widget)
+        window.destroy.assert_called_once()
+        widget.destroy.assert_called_once()
+
+    @unittest.skipUnless(sys.platform == "win32" or os.environ.get("DISPLAY"),
+                         "Real Tk smoke requires a desktop display")
+    def test_real_mainloop_monkeypatch_uses_native_drop_root_and_renders_cards(self):
+        from PIL import Image
+        manager = Mock()
+        manager.Queue.return_value = Queue()
+        manager.Event.return_value = Event()
+        with TemporaryDirectory() as directory:
+            image = Path(directory) / "résumé {one}.PNG"
+            Image.new("RGB", (64, 48)).save(image)
+
+            def smoke(window):
+                self.assertIsInstance(window, gui.FileDropWindow)
+                self.assertIsNotNone(window.file_drop_target)
+                self.assertTrue(gui.select_input_files([image]))
+                self.assertEqual(len(gui.app_state.file_widget.ui_components), 1)
+                self.assertEqual(gui.app_state.file_widget.get_selected_file_list(), [str(image.resolve())])
+                window.update()
+                self.assertTrue(gui.clear_input_files())
+                self.assertTrue(gui.app_state.input_widgets)
+
+            with patch.object(gui, "multiprocessing_Manager", return_value=manager), \
+                    patch.object(gui, "load_user_preferences", return_value=gui.UserPreferences()), \
+                    patch.object(gui.GPU, "detect"), \
+                    patch.object(gui.GPU, "menu_list", return_value=["No GPU found"]), \
+                    patch.object(gui.GPU, "vram_for", return_value=None), \
+                    patch.object(gui.GPU, "codec_for", return_value=None), \
+                    patch.object(gui, "get_AI_engine_info", return_value="QualityScaler UI test"), \
+                    patch.object(gui, "allow_sleep"), \
+                    patch("customtkinter.CTk.mainloop", smoke):
+                gui.main()
+        manager.shutdown.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -58,7 +58,8 @@ class RealModelIntegrationTests(unittest.TestCase):
         # Instrument only profiling. The production loader still chooses the
         # model, provider, GPU options, and input/output processing.
         with patch("onnxruntime.InferenceSession", side_effect=profiled_session):
-            engine = AI_upscale(self.model, "Auto", 1.0, 1.0, 512)
+            engine = AI_upscale(self.model, "Auto", 1.0, 512)
+            engine.ensure_session()
         image = np.random.default_rng(42).integers(
             0, 256, (32, 48, 3), dtype=np.uint8
         )

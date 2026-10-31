@@ -1,16 +1,9 @@
 """Image and video helpers that do not import the GUI or inference runtime."""
 
 import math
-import os
-import subprocess
 
 import cv2
 import numpy as np
-
-from .paths import find_by_relative_path
-
-
-EXIFTOOL_EXE_PATH = find_by_relative_path(os.path.join("Assets", "exiftool.exe"))
 
 
 def image_read(file_path: str) -> np.ndarray:
@@ -29,11 +22,21 @@ def image_read(file_path: str) -> np.ndarray:
 
 
 def image_write(
-    file_path: str, file_data: np.ndarray, file_extension: str = ".jpg"
+    file_path: str,
+    file_data: np.ndarray,
+    file_extension: str = ".jpg",
+    jpeg_quality: int = 95,
+    png_compression: int = 1,
 ) -> None:
     """Encode before opening the destination, and reject failed encodes."""
+    encode_params = []
+    extension = file_extension.lower()
+    if extension in (".jpg", ".jpeg"):
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+    elif extension == ".png":
+        encode_params = [cv2.IMWRITE_PNG_COMPRESSION, png_compression]
     try:
-        success, encoded = cv2.imencode(file_extension, file_data)
+        success, encoded = cv2.imencode(file_extension, file_data, encode_params)
     except cv2.error as error:
         raise ValueError(
             f"Unable to encode image as {file_extension}: {file_path}"
@@ -44,34 +47,22 @@ def image_write(
         file.write(encoded.tobytes())
 
 
-def copy_file_metadata(original_file_path: str, upscaled_file_path: str) -> None:
-    """Best-effort tag copy; an unavailable or failing exiftool is optional."""
-    print("[EXIFTOOL] exporting original file tags")
-    command = [
-        EXIFTOOL_EXE_PATH,
-        "-fast",
-        "-TagsFromFile",
-        original_file_path,
-        "-overwrite_original",
-        "-all:all",
-        "-unsafe",
-        "-largetags",
-        upscaled_file_path,
-    ]
+def sanitize_fps(frame_rate: float) -> float:
+    """Use 30 fps when frame-rate metadata is missing, nonfinite, or nonpositive."""
     try:
-        subprocess.run(command, check=True, shell=False)
-    except (OSError, subprocess.CalledProcessError):
-        pass
+        frame_rate = float(frame_rate)
+    except (TypeError, ValueError, OverflowError):
+        return 30.0
+    return frame_rate if math.isfinite(frame_rate) and frame_rate > 0 else 30.0
 
 
 def get_video_fps(video_path: str) -> float:
-    """Read a finite, positive frame rate and always release the capture."""
+    """Reject unreadable videos, sanitize their fps, and always release capture."""
     video_capture = cv2.VideoCapture(video_path)
     try:
-        frame_rate = float(video_capture.get(cv2.CAP_PROP_FPS))
-        if not math.isfinite(frame_rate) or frame_rate <= 0:
-            raise ValueError(f"Invalid video frame rate for {video_path}: {frame_rate}")
-        return frame_rate
+        if not video_capture.isOpened():
+            raise ValueError(f"Unable to open video: {video_path}")
+        return sanitize_fps(video_capture.get(cv2.CAP_PROP_FPS))
     finally:
         video_capture.release()
 
@@ -79,6 +70,66 @@ def get_video_fps(video_path: str) -> float:
 def get_image_resolution(image: np.ndarray) -> tuple[int, int]:
     """Return image dimensions as ``(height, width)``."""
     return image.shape[0], image.shape[1]
+
+
+def get_image_mode(image: np.ndarray) -> str | None:
+    """Describe supported channel layouts without converting the image."""
+    shape = image.shape
+    if len(shape) == 2:
+        return "Grayscale"
+    if len(shape) == 3 and shape[2] == 3:
+        return "RGB"
+    if len(shape) == 3 and shape[2] == 4:
+        return "RGBA"
+    return None
+
+
+def scaled_dimensions(image: np.ndarray, factor: float) -> tuple[int, int]:
+    """Truncate scaled dimensions and round odd values up, even at unit scale."""
+    height, width = get_image_resolution(image)
+    new_width = int(width * factor)
+    new_height = int(height * factor)
+    if new_width % 2:
+        new_width += 1
+    if new_height % 2:
+        new_height += 1
+    return new_width, new_height
+
+
+def resize_with_factor(
+    image: np.ndarray, factor: float, interpolation: int
+) -> np.ndarray:
+    """Resize to even ``(width, height)`` dimensions with the selected filter."""
+    new_width, new_height = scaled_dimensions(image, factor)
+    return cv2.resize(image, (new_width, new_height), interpolation=interpolation)
+
+
+def resize_with_output_factor(
+    image: np.ndarray, output_resize_factor: float
+) -> np.ndarray:
+    """Apply the output scale with linear interpolation and even dimensions."""
+    return resize_with_factor(image, output_resize_factor, cv2.INTER_LINEAR)
+
+
+def sharpen_image(upscaled_image: np.ndarray, amount: float) -> np.ndarray:
+    """Unsharp-mask only AI output, falling back unchanged on OpenCV errors."""
+    try:
+        blurred = cv2.GaussianBlur(upscaled_image, (0, 0), sigmaX=1.2)
+        return cv2.addWeighted(
+            upscaled_image, 1 + amount, blurred, -amount, 0, dtype=cv2.CV_8U
+        )
+    except cv2.error:
+        return upscaled_image
+
+
+def sharpen_and_save(
+    target_path: str,
+    upscaled_image: np.ndarray,
+    amount: float,
+    file_extension: str = ".jpg",
+) -> None:
+    """Save sharpened output; encoding and filesystem errors still propagate."""
+    image_write(target_path, sharpen_image(upscaled_image, amount), file_extension)
 
 
 def _add_alpha_channel(image: np.ndarray) -> np.ndarray:

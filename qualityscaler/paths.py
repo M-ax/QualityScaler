@@ -1,7 +1,7 @@
 """Resource lookup and stable output names, independent of GUI settings.
 
-Processing settings belong in cache metadata, not in filenames. The legacy
-function signatures are retained for callers that still pass those settings.
+Processing settings belong in cache metadata, not in filenames. Legacy positional
+arguments are retained; the final setting is now named selected_sharpening_amount.
 """
 
 import os
@@ -41,7 +41,7 @@ def prepare_output_image_filename(
     input_resize_factor: float,
     output_resize_factor: float,
     selected_image_extension: str,
-    selected_blending_factor: float,
+    selected_sharpening_amount: float,
 ) -> str:
     """Return ``<source stem>_upscaled<extension>``; settings do not affect names."""
     return _output_filename(
@@ -56,7 +56,7 @@ def prepare_output_video_filename(
     input_resize_factor: float,
     output_resize_factor: float,
     selected_video_extension: str,
-    selected_blending_factor: float,
+    selected_sharpening_amount: float,
 ) -> str:
     """Return ``<source stem>_upscaled<extension>``; settings live in the cache."""
     return _output_filename(
@@ -70,7 +70,7 @@ def prepare_output_video_directory_name(
     selected_AI_model: str,
     input_resize_factor: float,
     output_resize_factor: float,
-    selected_blending_factor: float,
+    selected_sharpening_amount: float,
 ) -> str:
     """Return a stable ``<source filename>.qualityscaler`` cache directory.
 

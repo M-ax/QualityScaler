@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
@@ -39,6 +40,36 @@ class ImageIOTests(unittest.TestCase):
             media.image_write(str(target), image)
             self.assertTrue(target.read_bytes().startswith(b"\xff\xd8"))
             np.testing.assert_allclose(media.image_read(str(target)), image, atol=1)
+
+    def test_default_codec_options_are_selected_case_insensitively(self):
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        for extension, options in (
+            (".jpg", [cv2.IMWRITE_JPEG_QUALITY, 95]),
+            (".JPEG", [cv2.IMWRITE_JPEG_QUALITY, 95]),
+            (".png", [cv2.IMWRITE_PNG_COMPRESSION, 1]),
+            (".PNG", [cv2.IMWRITE_PNG_COMPRESSION, 1]),
+            (".bmp", []),
+        ):
+            with self.subTest(extension=extension), TemporaryDirectory() as directory:
+                target = str(Path(directory) / "encoded image")
+                with patch.object(media.cv2, "imencode", wraps=cv2.imencode) as encode:
+                    media.image_write(target, image, extension)
+                encode.assert_called_once_with(extension, image, options)
+
+    def test_codec_options_can_be_configured(self):
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        for extension, options in (
+            (".jpeg", [cv2.IMWRITE_JPEG_QUALITY, 83]),
+            (".PNG", [cv2.IMWRITE_PNG_COMPRESSION, 7]),
+            (".bmp", []),
+        ):
+            with self.subTest(extension=extension), TemporaryDirectory() as directory:
+                target = str(Path(directory) / "encoded image")
+                with patch.object(media.cv2, "imencode", wraps=cv2.imencode) as encode:
+                    media.image_write(
+                        target, image, extension, jpeg_quality=83, png_compression=7
+                    )
+                encode.assert_called_once_with(extension, image, options)
 
     def test_invalid_and_empty_images_raise_decode_errors(self):
         with TemporaryDirectory() as directory:
@@ -89,8 +120,143 @@ class ImageIOTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "image.png"):
                     media.image_read(str(target))
 
+
+class ImageGeometryTests(unittest.TestCase):
     def test_resolution_is_height_then_width(self):
         self.assertEqual(media.get_image_resolution(np.zeros((3, 7, 4))), (3, 7))
+
+    def test_image_modes_do_not_convert_or_mutate_inputs(self):
+        for shape, mode in (
+            ((3, 7), "Grayscale"),
+            ((3, 7, 3), "RGB"),
+            ((3, 7, 4), "RGBA"),
+            ((3, 7, 1), None),
+            ((3, 7, 2), None),
+            ((3,), None),
+        ):
+            with self.subTest(shape=shape):
+                image = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+                original = image.copy()
+                self.assertEqual(media.get_image_mode(image), mode)
+                np.testing.assert_array_equal(image, original)
+
+    def test_resize_truncates_then_rounds_up_to_even_dimensions(self):
+        image = np.arange(7 * 11 * 3, dtype=np.uint8).reshape(7, 11, 3)
+        original = image.copy()
+        for factor, dimensions in (
+            (0.5, (6, 4)),
+            (1, (12, 8)),
+            (1.3, (14, 10)),
+            (2, (22, 14)),
+        ):
+            for interpolation in (cv2.INTER_NEAREST, cv2.INTER_AREA, cv2.INTER_CUBIC):
+                with self.subTest(factor=factor, interpolation=interpolation):
+                    result = media.resize_with_factor(image, factor, interpolation)
+                    self.assertEqual(result.shape[:2], dimensions[::-1])
+                    np.testing.assert_array_equal(
+                        result,
+                        cv2.resize(image, dimensions, interpolation=interpolation),
+                    )
+        np.testing.assert_array_equal(image, original)
+
+    def test_scaled_dimensions_is_pure_and_rounds_even_at_unit_scale(self):
+        image = np.zeros((7, 11, 3), dtype=np.uint8)
+        with patch.object(media.cv2, "resize", side_effect=AssertionError("not pure")):
+            for factor, dimensions in (
+                (0.5, (6, 4)),
+                (1, (12, 8)),
+                (1.3, (14, 10)),
+                (2, (22, 14)),
+            ):
+                with self.subTest(factor=factor):
+                    self.assertEqual(media.scaled_dimensions(image, factor), dimensions)
+
+    def test_unit_resize_still_invokes_opencv_with_even_dimensions(self):
+        image = np.arange(7 * 11 * 3, dtype=np.uint8).reshape(7, 11, 3)
+        with patch.object(media.cv2, "resize", wraps=cv2.resize) as resize:
+            result = media.resize_with_factor(image, 1, cv2.INTER_CUBIC)
+        resize.assert_called_once_with(image, (12, 8), interpolation=cv2.INTER_CUBIC)
+        self.assertEqual(result.shape, (8, 12, 3))
+        self.assertEqual(media.resize_with_output_factor(image, 1).shape, (8, 12, 3))
+
+    def test_output_resize_always_uses_linear_interpolation(self):
+        image = np.arange(36, dtype=np.uint8).reshape(6, 6)
+        for factor, dimensions in ((2 / 3, (4, 4)), (1, (6, 6)), (2, (12, 12))):
+            with self.subTest(factor=factor):
+                result = media.resize_with_output_factor(image, factor)
+                np.testing.assert_array_equal(
+                    result,
+                    cv2.resize(image, dimensions, interpolation=cv2.INTER_LINEAR),
+                )
+        expected = np.zeros((4, 4), dtype=np.uint8)
+        with patch.object(media, "resize_with_factor", return_value=expected) as resize:
+            self.assertIs(media.resize_with_output_factor(image, 0.5), expected)
+        resize.assert_called_once_with(image, 0.5, cv2.INTER_LINEAR)
+
+    def test_resize_preserves_uint16_and_alpha_channels(self):
+        image = np.arange(3 * 5 * 4, dtype=np.uint16).reshape(3, 5, 4)
+        result = media.resize_with_output_factor(image, 2)
+        self.assertEqual(result.shape, (6, 10, 4))
+        self.assertEqual(result.dtype, np.uint16)
+
+
+class SharpeningTests(unittest.TestCase):
+    def test_sharpen_matches_upstream_unsharp_mask_without_mutating_input(self):
+        for shape in ((7, 9), (7, 9, 3), (7, 9, 4)):
+            for dtype in (np.uint8, np.uint16):
+                image = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+                original = image.copy()
+                for amount in (0, 0.3, 0.5):
+                    with self.subTest(shape=shape, dtype=dtype, amount=amount):
+                        blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=1.2)
+                        expected = cv2.addWeighted(
+                            image, 1 + amount, blurred, -amount, 0, dtype=cv2.CV_8U
+                        )
+                        result = media.sharpen_image(image, amount)
+                        np.testing.assert_array_equal(result, expected)
+                        self.assertEqual(result.dtype, np.uint8)
+                        np.testing.assert_array_equal(image, original)
+
+    def test_opencv_errors_fall_back_to_unsharpened_output(self):
+        image = np.full((4, 6, 3), 128, dtype=np.uint8)
+        for operation in ("GaussianBlur", "addWeighted"):
+            with self.subTest(operation=operation):
+                with patch.object(media.cv2, operation, side_effect=cv2.error("bad")):
+                    self.assertIs(media.sharpen_image(image, 0.5), image)
+
+    def test_save_wrapper_uses_pure_sharpen_result(self):
+        image = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+        expected = media.sharpen_image(image, 0.3)
+        with TemporaryDirectory() as directory:
+            target = str(Path(directory) / "鮮明.png")
+            with patch.object(media, "sharpen_image", return_value=expected) as sharpen:
+                media.sharpen_and_save(target, image, 0.3, ".png")
+            sharpen.assert_called_once_with(image, 0.3)
+            np.testing.assert_array_equal(media.image_read(target), expected)
+
+    def test_save_wrapper_defaults_to_jpeg(self):
+        image = np.full((4, 6, 3), 128, dtype=np.uint8)
+        with patch.object(media, "image_write") as write:
+            media.sharpen_and_save("output.jpg", image, 0.3)
+        self.assertEqual(write.call_args.args[0], "output.jpg")
+        self.assertEqual(write.call_args.args[2], ".jpg")
+        np.testing.assert_array_equal(write.call_args.args[1], image)
+
+    def test_save_wrapper_writes_original_after_opencv_error(self):
+        image = np.full((4, 6, 3), 128, dtype=np.uint8)
+        with patch.object(media.cv2, "GaussianBlur", side_effect=cv2.error("bad")):
+            with patch.object(media, "image_write") as write:
+                media.sharpen_and_save("output.png", image, 0.5, ".png")
+        write.assert_called_once_with("output.png", image, ".png")
+
+    def test_save_errors_propagate_without_retry(self):
+        image = np.full((4, 6, 3), 128, dtype=np.uint8)
+        for error in (OSError("disk full"), ValueError("Unable to encode")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(media, "image_write", side_effect=error) as write:
+                    with self.assertRaises(type(error)):
+                        media.sharpen_and_save("output.png", image, 0.5, ".png")
+                write.assert_called_once()
 
 
 class BlendingTests(unittest.TestCase):
@@ -186,54 +352,101 @@ class BlendingTests(unittest.TestCase):
                 media.blend_images_and_save("output.png", image, image, 0.5, ".png")
 
 
-class VideoAndMetadataTests(unittest.TestCase):
+class VideoFPSTests(unittest.TestCase):
+    def test_sanitize_preserves_finite_positive_frame_rates(self):
+        for fps in (0.001, 1, 23.976, 29.97, 60, 240):
+            with self.subTest(fps=fps):
+                self.assertEqual(media.sanitize_fps(fps), fps)
+
+    def test_sanitize_falls_back_for_invalid_frame_rates(self):
+        for fps in (0, -1, float("inf"), float("-inf"), float("nan"), None, "unknown"):
+            with self.subTest(fps=fps):
+                self.assertEqual(media.sanitize_fps(fps), 30.0)
+
     def test_video_fps_is_positive_and_capture_is_released(self):
         capture = Mock()
+        capture.isOpened.return_value = True
         capture.get.return_value = 29.97
         with patch.object(media.cv2, "VideoCapture", return_value=capture) as factory:
             self.assertEqual(media.get_video_fps("input.mp4"), 29.97)
         factory.assert_called_once_with("input.mp4")
+        capture.isOpened.assert_called_once_with()
         capture.get.assert_called_once_with(cv2.CAP_PROP_FPS)
         capture.release.assert_called_once_with()
 
-    def test_invalid_video_fps_always_releases_capture(self):
+    def test_unknown_fps_of_open_video_falls_back_and_releases_capture(self):
         for fps in (0, -1, float("inf"), float("-inf"), float("nan")):
             with self.subTest(fps=fps):
                 capture = Mock()
+                capture.isOpened.return_value = True
                 capture.get.return_value = fps
                 with patch.object(media.cv2, "VideoCapture", return_value=capture):
-                    with self.assertRaisesRegex(ValueError, "Invalid video frame rate"):
-                        media.get_video_fps("broken.mp4")
+                    self.assertEqual(media.get_video_fps("valid.mp4"), 30.0)
+                capture.isOpened.assert_called_once_with()
                 capture.release.assert_called_once_with()
+
+    def test_unopened_video_is_rejected_even_with_plausible_fps(self):
+        capture = Mock()
+        capture.isOpened.return_value = False
+        capture.get.return_value = 30
+        with patch.object(media.cv2, "VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(ValueError, "Unable to open video: broken.mp4"):
+                media.get_video_fps("broken.mp4")
+        capture.get.assert_not_called()
+        capture.release.assert_called_once_with()
+
+    def test_missing_and_unreadable_videos_are_rejected(self):
+        with TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.mp4"
+            invalid = Path(directory) / "invalid.mp4"
+            invalid.write_bytes(b"not a video")
+            for path in (missing, invalid):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(ValueError, "Unable to open video"):
+                        media.get_video_fps(str(path))
 
     def test_capture_is_released_when_reading_fps_raises(self):
         capture = Mock()
+        capture.isOpened.return_value = True
         capture.get.side_effect = RuntimeError("capture failed")
         with patch.object(media.cv2, "VideoCapture", return_value=capture):
             with self.assertRaisesRegex(RuntimeError, "capture failed"):
                 media.get_video_fps("broken.mp4")
         capture.release.assert_called_once_with()
 
-    def test_metadata_copy_uses_resource_path_and_argument_list(self):
-        with patch.object(media.subprocess, "run") as run:
-            media.copy_file_metadata("原本 image.png", "出力 image.png")
-        command = run.call_args.args[0]
-        expected_exiftool = (
-            Path(__file__).resolve().parents[1] / "Assets" / "exiftool.exe"
-        )
-        self.assertEqual(command[0], str(expected_exiftool))
-        self.assertEqual(command[command.index("-TagsFromFile") + 1], "原本 image.png")
-        self.assertEqual(command[-1], "出力 image.png")
-        self.assertEqual(run.call_args.kwargs, {"check": True, "shell": False})
+    def test_capture_is_released_when_checking_open_state_raises(self):
+        capture = Mock()
+        capture.isOpened.side_effect = RuntimeError("capture failed")
+        with patch.object(media.cv2, "VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                media.get_video_fps("broken.mp4")
+        capture.release.assert_called_once_with()
 
-    def test_metadata_tool_is_best_effort(self):
-        for error in (
-            FileNotFoundError("exiftool absent"),
-            subprocess.CalledProcessError(1, ["exiftool"]),
-        ):
-            with self.subTest(error=type(error).__name__):
-                with patch.object(media.subprocess, "run", side_effect=error):
-                    media.copy_file_metadata("original.png", "upscaled.png")
+
+class ImportTests(unittest.TestCase):
+    def test_helpers_do_not_require_gui_inference_or_windows_integrations(self):
+        script = """
+import builtins
+import sys
+original_import = builtins.__import__
+blocked = {'customtkinter', 'tkinter', 'onnxruntime', 'QualityScaler',
+           'winotify', 'win32api', 'win32con', 'pythoncom'}
+def guarded_import(name, *args, **kwargs):
+    if name.split('.')[0] in blocked:
+        raise AssertionError('Unexpected helper dependency: ' + name)
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+import qualityscaler.media
+import qualityscaler.paths
+assert not blocked.intersection(sys.modules)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

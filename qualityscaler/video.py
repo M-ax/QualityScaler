@@ -3,21 +3,41 @@
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
+import hashlib
 import math
-from multiprocessing import get_context
+from multiprocessing import current_process, get_context
 from pathlib import Path
+import sys
 from threading import Event, local
 from time import monotonic
 
 import cv2
 import numpy as np
 
-from .ai import AI_upscale, calculate_optimal_workers
+from .ai import AI_upscale, calculate_optimal_workers, get_model_upscale_factor
 from .ffmpeg import FFmpeg, UpscaleCancelled
 from .frame_store import FrameStore
 from .job_lock import JobLock
-from .media import blend_images, copy_file_metadata, get_video_fps
-from .paths import prepare_output_video_directory_name, prepare_output_video_filename
+from .media import blend_images, get_video_fps, sharpen_image
+from .paths import find_by_relative_path, prepare_output_video_directory_name, prepare_output_video_filename
+
+
+@lru_cache(maxsize=32)
+def _model_digest(path, size, mtime_ns):
+    # Cache by the local file revision, but persist only its content hash: a
+    # onefile executable extracts identical models to a new directory each run.
+    with open(path, "rb") as model:
+        return hashlib.file_digest(model, "sha256").hexdigest()
+
+
+def model_digest(name):
+    path = Path(find_by_relative_path(f"AI-onnx/{name}_fp16.onnx"))
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return _model_digest(str(path), stat.st_size, stat.st_mtime_ns)
 
 
 @dataclass(frozen=True)
@@ -29,6 +49,7 @@ class VideoSettings:
     tiles_resolution: int = 1024
     workers: int = 1
     blending_factor: float = 0.0
+    sharpening_amount: float = 0.0
     codec: str = "x264"
     extension: str = ".mp4"
     keep_frames: bool = False
@@ -41,21 +62,25 @@ class VideoSettings:
             raise ValueError("Worker count and tile resolution must be positive")
         if not 0 <= self.blending_factor <= 1:
             raise ValueError("Blending factor must be between 0 and 1")
+        if not math.isfinite(self.sharpening_amount) or self.sharpening_amount < 0:
+            raise ValueError("Sharpening amount must be finite and nonnegative")
         if self.extension not in (".mp4", ".mkv", ".avi", ".mov"):
             raise ValueError(f"Unsupported video extension: {self.extension}")
 
     def processing_settings(self):
         # Execution and encoding choices can change without invalidating JPEGs.
-        return {key: asdict(self)[key] for key in (
+        result = {key: asdict(self)[key] for key in (
             "model", "input_resize_factor", "output_resize_factor",
-            "tiles_resolution", "blending_factor",
+            "tiles_resolution", "blending_factor", "sharpening_amount",
         )}
+        result["engine"] = "2026.4"
+        result["model_sha256"] = model_digest(self.model)
+        return result
 
 
 def create_engine(settings):
     return AI_upscale(
-        settings.model, settings.gpu, settings.input_resize_factor,
-        settings.output_resize_factor, settings.tiles_resolution,
+        settings.model, settings.gpu, settings.input_resize_factor, settings.tiles_resolution,
     )
 
 
@@ -71,8 +96,16 @@ _worker_state = local()
 
 def initialize_worker(settings, engine_factory):
     """One worker owns one model session for its entire lifetime."""
+    if sys.platform == "win32" and current_process().name != "MainProcess":
+        import psutil
+        try:
+            psutil.Process().nice(psutil.IDLE_PRIORITY_CLASS)
+        except psutil.Error:
+            pass
+    cv2.setNumThreads(1)
     _worker_state.engine = engine_factory(settings)
     _worker_state.blending_factor = settings.blending_factor
+    _worker_state.sharpening_amount = settings.sharpening_amount
 
 
 def process_frame(data):
@@ -81,7 +114,11 @@ def process_frame(data):
     upscaled = _worker_state.engine.AI_orchestration(original)
     if _worker_state.blending_factor:
         upscaled = blend_images(original, upscaled, _worker_state.blending_factor)
-    success, encoded = cv2.imencode(".jpg", upscaled)
+    if _worker_state.sharpening_amount:
+        upscaled = sharpen_image(upscaled, _worker_state.sharpening_amount)
+    # 2026.4 saves native AI frames, then applies output scaling during encode.
+    quality = 95 if _worker_state.sharpening_amount else 90
+    success, encoded = cv2.imencode(".jpg", upscaled, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not success:
         raise ValueError("Could not encode upscaled frame")
     return encoded.tobytes()
@@ -135,8 +172,11 @@ class VideoUpscaler:
         }
         previous_source = store.get_metadata("source")
         if previous_source is not None:
-            if store.get_metadata("job_version") != 1:
-                raise ValueError("Unsupported cached job version")
+            if store.get_metadata("job_version") != 2:
+                raise ValueError(
+                    "This cache was created by a different processing version. "
+                    "Move it aside or choose another output folder to start a 2026.4 job."
+                )
             if previous_source != source:
                 raise ValueError(
                     "The cached job belongs to a different or modified source. "
@@ -144,13 +184,13 @@ class VideoUpscaler:
                 )
             if store.get_metadata("processing_settings") != settings.processing_settings():
                 raise ValueError(
-                    "The cached job has different AI, resize, tile, or blending settings. "
+                    "The cached job has different AI, resize, tile, blending, or sharpening settings. "
                     "Restore its recorded settings or choose another output folder. "
                     "The existing cache has not been changed."
                 )
         elif store.frame_count("source") or store.frame_count("upscaled"):
             raise ValueError("Frame cache is missing its job identity; refusing to mix frames")
-        store.set_metadata("job_version", 1)
+        store.set_metadata("job_version", 2)
         store.set_metadata("source", source)
         store.set_metadata("processing_settings", settings.processing_settings())
         store.set_metadata("settings", asdict(settings))
@@ -164,6 +204,11 @@ class VideoUpscaler:
         self.status("Extracting video frames")
         fps = get_video_fps(str(video_path))
         previous_count = store.frame_count("source")
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            expected = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        finally:
+            capture.release()
 
         def save_frame(index, data):
             self._check_stop()
@@ -173,7 +218,8 @@ class VideoUpscaler:
                 store.put_frame("source", index, data)
             if (index + 1) % self.checkpoint_interval == 0:
                 store.commit()
-                self.status(f"Extracting video frames ({index + 1} saved)")
+                progress = f"{min(100, (index + 1) / expected * 100):.0f}% " if expected > 0 else ""
+                self.status(f"Extracting video frames {progress}({index + 1} saved)")
 
         count = self.ffmpeg.extract(video_path, fps, self.stop_event, save_frame)
         self._check_stop()
@@ -271,12 +317,20 @@ class VideoUpscaler:
                 self._check_stop()
                 self._state(store, "encoding", error=None)
                 self.status("Encoding upscaled video")
+                original = decode_frame(store.get_frame("source", 0))
+                height, width = original.shape[:2]
+                input_width = max(2, round(width * settings.input_resize_factor / 2) * 2)
+                input_height = max(2, round(input_width / (width / height) / 2) * 2)
+                scale = get_model_upscale_factor(settings.model) * settings.output_resize_factor
+                output_width = max(2, round(input_width * scale / 2) * 2)
+                output_height = max(2, round(output_width / (input_width / input_height) / 2) * 2)
                 self.ffmpeg.encode(
                     video_path, output_path, store.get_metadata("fps"),
-                    settings.codec, store.iter_frames("upscaled"), self.stop_event,
+                    settings.codec, lambda: store.iter_frames("upscaled"), self.stop_event,
+                    output_size=(output_width, output_height), total_frames=store.get_metadata("total_frames"),
+                    status=self.status,
                 )
                 self._check_stop()
-                copy_file_metadata(str(video_path), str(output_path))
                 self._state(store, "complete")
             except BaseException as error:
                 try:
@@ -301,7 +355,7 @@ class VideoUpscaler:
 
 def upscale_video(
     process_status_q, event_stop_upscale_process, video_path, file_number,
-    selected_output_path, selected_AI_model, selected_blending_factor,
+    selected_output_path, selected_AI_model, selected_sharpening_amount,
     selected_AI_multithreading, selected_gpu, input_resize_factor,
     output_resize_factor, tiles_resolution, selected_video_extension,
     selected_video_codec, selected_keep_frames,
@@ -313,17 +367,17 @@ def upscale_video(
         model=selected_AI_model, gpu=selected_gpu,
         input_resize_factor=input_resize_factor, output_resize_factor=output_resize_factor,
         tiles_resolution=tiles_resolution, workers=selected_AI_multithreading,
-        blending_factor=selected_blending_factor, codec=selected_video_codec,
+        sharpening_amount=selected_sharpening_amount, codec=selected_video_codec,
         extension=selected_video_extension, keep_frames=selected_keep_frames,
     )
     directory = prepare_output_video_directory_name(
         video_path, selected_output_path, selected_AI_model,
-        input_resize_factor, output_resize_factor, selected_blending_factor,
+        input_resize_factor, output_resize_factor, selected_sharpening_amount,
     )
     output = prepare_output_video_filename(
         video_path, selected_output_path, selected_AI_model,
         input_resize_factor, output_resize_factor, selected_video_extension,
-        selected_blending_factor,
+        selected_sharpening_amount,
     )
     return VideoUpscaler(
         stop_event=event_stop_upscale_process,
@@ -331,3 +385,32 @@ def upscale_video(
             process_status_q, f"{file_number}. {message}"
         ),
     ).run(video_path, output, Path(directory) / "frames.sqlite3", settings)
+
+
+def get_resume_progress(video_path, selected_output_path, settings):
+    """Read the same cache identity used by run(), without creating/changing it."""
+    import sqlite3
+
+    directory = prepare_output_video_directory_name(
+        video_path, selected_output_path, settings.model, settings.input_resize_factor,
+        settings.output_resize_factor, settings.sharpening_amount,
+    )
+    cache = Path(directory) / "frames.sqlite3"
+    if not cache.is_file():
+        return None
+    try:
+        source = Path(video_path).resolve()
+        stat = source.stat()
+        with FrameStore(cache, read_only=True) as store:
+            if store.get_metadata("job_version") != 2:
+                return None
+            if store.get_metadata("source") != {
+                "path": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+            } or store.get_metadata("processing_settings") != settings.processing_settings():
+                return None
+            total = store.get_metadata("total_frames")
+            if not total or not store.get_metadata("extraction_complete"):
+                return 0
+            return min(100, int(store.frame_count("upscaled") * 100 / total))
+    except (OSError, ValueError, sqlite3.Error):
+        return None

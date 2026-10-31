@@ -1,3 +1,4 @@
+import gc
 from tkinter import Tcl
 from types import SimpleNamespace
 import unittest
@@ -19,6 +20,14 @@ class FileDropTests(unittest.TestCase):
         self.target = FileDropTarget(
             self.widget, self.on_files, accepts=self.accepts, on_invalid=self.on_invalid,
         )
+
+    def tearDown(self):
+        # Mock bind histories retain bound callbacks in cycles. Release the Tcl
+        # interpreter here, on its owner thread, not during later worker GC.
+        self.target = None
+        self.widget = None
+        self.interpreter = None
+        gc.collect()
 
     def event(self, *paths):
         data = self.interpreter.tk.call("format", "%s",

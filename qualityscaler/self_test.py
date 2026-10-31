@@ -19,7 +19,7 @@ def verified_engine(settings, *, frozen):
     if bool(getattr(sys, "frozen", False)) != frozen:
         raise RuntimeError("Inference worker did not use the packaged executable")
     engine = create_engine(settings)
-    if "DmlExecutionProvider" not in engine.inferenceSession.get_providers():
+    if "DmlExecutionProvider" not in engine.ensure_session().get_providers():
         raise RuntimeError("Inference worker fell back to CPU instead of DirectML")
     return engine
 
@@ -31,6 +31,7 @@ def _check_gui(report, root):
 
     from . import gui
     from .media import image_write
+    report["app_version"] = gui.version
 
     first = root / "résumé {one}.png"
     second = root / "another image.PNG"
@@ -75,34 +76,34 @@ def _check_gui(report, root):
             expected = [str(first.resolve()), str(second.resolve())]
             if drop([first, notes, folder, broken]) != "copy":
                 raise RuntimeError("Native file drop was not accepted")
-            if gui.file_widget.get_selected_file_list() != expected[:1]:
+            if gui.app_state.file_widget.get_selected_file_list() != expected[:1]:
                 raise RuntimeError("Drop did not filter unsupported/unreadable inputs")
             if drop([first, second]) != "copy":
                 raise RuntimeError("Dropping more files into a populated list failed")
-            if gui.file_widget.get_selected_file_list() != expected:
+            if gui.app_state.file_widget.get_selected_file_list() != expected:
                 raise RuntimeError("Repeated drops replaced or duplicated selected inputs")
             for paths, fraction in (([notes, folder], 0.25), ([broken], 0.25),
                                     ([second], 0.75)):
                 if drop(paths, fraction) != "refuse_drop":
                     raise RuntimeError("Invalid/outside-input drop was accepted")
-                if gui.file_widget.get_selected_file_list() != expected:
+                if gui.app_state.file_widget.get_selected_file_list() != expected:
                     raise RuntimeError("Rejected drop changed the current selection")
-            previous_process = getattr(gui, "process_upscale_orchestrator", None)
-            gui.process_upscale_orchestrator = SimpleNamespace(is_alive=lambda: True)
+            previous_process = gui.app_state.process_upscale_orchestrator
+            gui.app_state.process_upscale_orchestrator = SimpleNamespace(is_alive=lambda: True)
             try:
                 if drop([second]) != "refuse_drop":
                     raise RuntimeError("Drop changed input files during an active job")
             finally:
-                gui.process_upscale_orchestrator = previous_process
+                gui.app_state.process_upscale_orchestrator = previous_process
             gui.clear_input_files()
-            if gui.file_widget is not None or gui.selected_file_list:
+            if gui.app_state.file_widget is not None or gui.app_state.selected_file_list:
                 raise RuntimeError("Clear did not reset the input selection")
-            if drop([second]) != "copy" or gui.file_widget.get_selected_file_list() != expected[1:]:
+            if drop([second]) != "copy" or gui.app_state.file_widget.get_selected_file_list() != expected[1:]:
                 raise RuntimeError("File drops stopped working after clearing the list")
             report["file_drop_verified"] = True
         finally:
             # Do not invoke on_app_close, which persists user preferences.
-            window.destroy()
+            gui._destroy_window()
 
     customtkinter.CTk.mainloop = smoke_window
     try:
@@ -155,7 +156,8 @@ def _check_bundle(root, report):
     # before spawning so workers use the unmodified production inference path.
     ort.InferenceSession = profiled_session
     try:
-        engine = AI_upscale("RealESR_Gx4", "Auto", 1.0, 1.0, 512)
+        engine = AI_upscale("RealESR_Gx4", "Auto", 1.0, 512)
+        engine.ensure_session()
     finally:
         ort.InferenceSession = original_session
     try:

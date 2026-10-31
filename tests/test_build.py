@@ -14,22 +14,25 @@ SPEC_CODE = compile(
     str(ROOT / "QualityScaler.spec"),
     "exec",
 )
+STANDARD_MODELS = (
+    "LVAx2",
+    "RealESR_Gx4",
+    "RealESR_Ax4",
+    "BSRGANx2",
+    "BSRGANx4",
+    "RealESRGANx4",
+    "MSharpx4",
+    "IRCNN_Mx1",
+    "IRCNN_Lx1",
+)
 REQUIRED_FILES = (
     "QualityScaler.py",
     "Assets/logo.ico",
     "Assets/logo.png",
-    "Assets/exiftool.exe",
     "Assets/ffmpeg.exe",
-    "AI-onnx/RealESR_Gx4_fp16.onnx",
-    "AI-onnx/RealESR_Animex4_fp16.onnx",
-    "AI-onnx/BSRGANx2_fp16.onnx",
-    "AI-onnx/BSRGANx4_fp16.onnx",
-    "AI-onnx/RealESRGANx4_fp16.onnx",
-    "AI-onnx/IRCNN_Mx1_fp16.onnx",
-    "AI-onnx/IRCNN_Lx1_fp16.onnx",
     "LICENSE",
     "LICENSE.txt",
-)
+) + tuple(f"AI-onnx/{name}_fp16.onnx" for name in STANDARD_MODELS)
 
 
 class BuildSpecTests(unittest.TestCase):
@@ -103,10 +106,22 @@ class BuildSpecTests(unittest.TestCase):
         exec(SPEC_CODE, namespace)
         return namespace
 
+    def test_standard_model_catalog_contains_all_nine_current_models(self):
+        namespace = self.execute_spec()
+        self.assertEqual(namespace["STANDARD_MODELS"], STANDARD_MODELS)
+        bundled_models = {
+            Path(source).name
+            for source, destination in self.analysis.call_args.kwargs["datas"]
+            if destination == "AI-onnx"
+        }
+        self.assertEqual(
+            bundled_models, {f"{name}_fp16.onnx" for name in STANDARD_MODELS}
+        )
+
     def test_resources_preserve_bundle_paths_and_include_all_fp16_models(self):
         extra_files = [
             "Assets/another_icon.ico", "Assets/upscale_icon.png",
-            "Assets/not_requested.exe", "Assets/readme.txt",
+            "Assets/exiftool.exe", "Assets/not_requested.exe", "Assets/readme.txt",
             "AI-onnx/optional_model_fp16.onnx", "AI-onnx/ignored_fp32.onnx",
             "AI-onnx/download.txt",
         ]
@@ -137,7 +152,6 @@ class BuildSpecTests(unittest.TestCase):
                 ("Assets/logo.png", "Assets"),
                 ("Assets/another_icon.ico", "Assets"),
                 ("Assets/upscale_icon.png", "Assets"),
-                ("Assets/exiftool.exe", "Assets"),
                 ("Assets/ffmpeg.exe", "Assets"),
                 ("LICENSE", "."),
                 ("LICENSE.txt", "."),
@@ -152,6 +166,17 @@ class BuildSpecTests(unittest.TestCase):
             set(options["datas"]), expected_resources | set(self.ctk_data)
         )
         self.assertEqual(len(options["datas"]), len(set(options["datas"])))
+
+    def test_legacy_anime_model_cannot_replace_current_ax4_model(self):
+        (self.root / "AI-onnx/RealESR_Ax4_fp16.onnx").unlink()
+        (self.root / "AI-onnx/RealESR_Animex4_fp16.onnx").write_bytes(b"legacy")
+        with self.assertRaises(SystemExit) as caught:
+            self.execute_spec()
+        self.assertIn(str(Path("AI-onnx/RealESR_Ax4_fp16.onnx")), str(caught.exception))
+        self.hooks.collect_data_files.assert_not_called()
+        self.hooks.collect_dynamic_libs.assert_not_called()
+        self.hooks.get_package_paths.assert_not_called()
+        self.analysis.assert_not_called()
 
     def test_supported_tkdnd_hook_resources_reach_onefile_with_package_paths(self):
         # Hook discovery must not import the GUI package or create a Tk root.

@@ -18,7 +18,10 @@ import numpy as np
 from qualityscaler.ffmpeg import UpscaleCancelled
 from qualityscaler.frame_store import FrameStore
 from qualityscaler.job_lock import JobAlreadyRunning, JobLock
-from qualityscaler.video import VideoSettings, VideoUpscaler, decode_frame
+from qualityscaler.video import (
+    VideoSettings, VideoUpscaler, decode_frame, get_resume_progress,
+    initialize_worker, process_frame,
+)
 
 
 def jpeg(value):
@@ -42,10 +45,13 @@ class FakeFFmpeg:
                 stop.set()
         return len(self.frames)
 
-    def encode(self, source, output, fps, codec, frames, stop):
+    def encode(self, source, output, fps, codec, frames, stop, **options):
         self.encodings += 1
+        self.encoding_options = options
         if self.fail_encoding:
             raise RuntimeError("Test encoder failed")
+        if callable(frames):
+            frames = frames()
         self.encoded_values = [round(float(decode_frame(data).mean())) for data in frames]
         Path(output).write_bytes(b"encoded video")
 
@@ -116,9 +122,6 @@ class VideoUpscalerTests(unittest.TestCase):
         patcher = patch("qualityscaler.video.get_video_fps", return_value=24.0)
         patcher.start()
         self.addCleanup(patcher.stop)
-        patcher = patch("qualityscaler.video.copy_file_metadata")
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def upscaler(self, **kwargs):
         # Deterministic in-process fake engines keep unit tests GPU-free.
@@ -147,6 +150,63 @@ class VideoUpscalerTests(unittest.TestCase):
             self.assertEqual(store.get_metadata("settings")["model"], "Testx2")
             self.assertEqual(store.get_metadata("settings")["codec"], "x264")
             self.assertEqual(store.get_metadata("total_frames"), 5)
+
+    def test_video_geometry_preserves_upstream_aspect_derived_rounding(self):
+        image = np.full((11, 15, 3), 20, np.uint8)
+        self.ffmpeg.frames = [cv2.imencode(".jpg", image)[1].tobytes()]
+        self.run_job(settings=replace(
+            self.settings, input_resize_factor=0.5, output_resize_factor=1.25,
+        ))
+        # Upstream task: input8x6 -> output20x16; independently scaling the
+        # source height would incorrectly produce14 rather than16.
+        self.assertEqual(self.ffmpeg.encoding_options["output_size"], (20, 16))
+
+    def test_video_sharpens_native_frames_before_jpeg_and_defers_output_resize(self):
+        data = jpeg(20)
+        original = decode_frame(data)
+        native = np.full((16, 24, 3), 40, np.uint8)
+        blended = np.full_like(native, 50)
+        sharpened = np.full_like(native, 60)
+        events = []
+        engine = FakeEngine([])
+
+        def infer(image):
+            self.assertEqual(image.shape, original.shape)
+            events.append("AI")
+            return native
+
+        def blend(starting, image, amount):
+            self.assertIs(image, native)
+            self.assertEqual(amount, 0.3)
+            events.append("blend")
+            return blended
+
+        def sharpen(image, amount):
+            self.assertIs(image, blended)
+            self.assertEqual(amount, 0.5)
+            events.append("sharpen")
+            return sharpened
+
+        def encode(extension, image, params):
+            self.assertIs(image, sharpened)
+            self.assertEqual(params, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            events.append("JPEG")
+            return True, np.array([1, 2, 3], np.uint8)
+
+        engine.AI_orchestration = infer
+        settings = replace(self.settings, blending_factor=0.3, sharpening_amount=0.5,
+                           output_resize_factor=0.25)
+        initialize_worker(settings, lambda settings: engine)
+        with patch("qualityscaler.video.blend_images", side_effect=blend), \
+                patch("qualityscaler.video.sharpen_image", side_effect=sharpen), \
+                patch("qualityscaler.video.cv2.imencode", side_effect=encode):
+            self.assertEqual(process_frame(data), b"\x01\x02\x03")
+        self.assertEqual(events, ["AI", "blend", "sharpen", "JPEG"])
+        initialize_worker(self.settings, lambda settings: engine)
+        with patch("qualityscaler.video.cv2.imencode",
+                   return_value=(True, np.array([1], np.uint8))) as encoded:
+            process_frame(data)
+        self.assertEqual(encoded.call_args.args[2], [cv2.IMWRITE_JPEG_QUALITY, 90])
 
     def test_interrupted_upscaling_resumes_only_missing_frames(self):
         def status(message):
@@ -361,6 +421,36 @@ class VideoUpscalerTests(unittest.TestCase):
             self.assertEqual(store.get_metadata("stage"), "complete")
             self.assertEqual(store.get_metadata("settings")["blending_factor"], 0)
             self.assertEqual(store.frame_count("upscaled"), 5)
+
+    def test_sharpening_changes_invalidate_saved_processing_settings(self):
+        self.run_job()
+        with self.assertRaisesRegex(ValueError, "sharpening"):
+            self.run_job(settings=replace(self.settings, sharpening_amount=0.5))
+
+    def test_changed_model_weights_cannot_be_mixed_into_a_resumed_job(self):
+        with patch("qualityscaler.video.model_digest", return_value="original-weights"):
+            self.run_job()
+        with patch("qualityscaler.video.model_digest", return_value="updated-weights"):
+            with self.assertRaisesRegex(ValueError, "different AI"):
+                self.run_job()
+
+    def test_legacy_processing_cache_is_not_silently_reused_by_new_engine(self):
+        self.run_job()
+        with FrameStore(self.cache) as store:
+            store.set_metadata("job_version", 1)
+        with self.assertRaisesRegex(ValueError, "different processing version"):
+            self.run_job()
+
+    def test_resume_badge_uses_sqlite_source_and_processing_identity(self):
+        # The GUI and backend use the same stable directory.
+        self.cache = self.directory / (self.source.name + ".qualityscaler") / "frames.sqlite3"
+        self.run_job()
+        self.assertEqual(get_resume_progress(self.source, str(self.directory), self.settings), 100)
+        self.assertIsNone(get_resume_progress(
+            self.source, str(self.directory), replace(self.settings, sharpening_amount=0.5)
+        ))
+        self.source.write_bytes(b"modified source")
+        self.assertIsNone(get_resume_progress(self.source, str(self.directory), self.settings))
 
     def test_modified_source_is_rejected_without_resetting_cache(self):
         self.run_job()

@@ -9,11 +9,13 @@ ROOT = Path(SPECPATH).resolve()
 ASSETS = ROOT / "Assets"
 MODELS = ROOT / "AI-onnx"
 STANDARD_MODELS = (
+    "LVAx2",
     "RealESR_Gx4",
-    "RealESR_Animex4",
+    "RealESR_Ax4",
     "BSRGANx2",
     "BSRGANx4",
     "RealESRGANx4",
+    "MSharpx4",
     "IRCNN_Mx1",
     "IRCNN_Lx1",
 )
@@ -24,7 +26,6 @@ required_files = (
     ROOT / "QualityScaler.py",
     ASSETS / "logo.ico",
     ASSETS / "logo.png",
-    ASSETS / "exiftool.exe",
     ASSETS / "ffmpeg.exe",
     ROOT / "LICENSE",
     ROOT / "LICENSE.txt",
@@ -45,7 +46,7 @@ datas = [
     for path in sorted(ASSETS.glob(pattern))
     if path.is_file()
 ]
-datas += [(str(ASSETS / name), "Assets") for name in ("exiftool.exe", "ffmpeg.exe")]
+datas += [(str(ASSETS / "ffmpeg.exe"), "Assets")]
 datas += [
     (str(path), "AI-onnx")
     for path in sorted(MODELS.glob("*_fp16.onnx"))

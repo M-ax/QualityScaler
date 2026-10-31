@@ -5,6 +5,7 @@ numpy
 
 #GUI
 customtkinter
+tkinterdnd2==0.7.0
 
 #UTILS
 opencv-python-headless

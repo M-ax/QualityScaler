@@ -1,0 +1,5 @@
+# Preserve whitespace checks without flagging legacy CRLF line endings.
+*.py whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+*.txt whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# Preserve the legacy GUI's line endings when moving it into the package.
+qualityscaler/gui.py -text

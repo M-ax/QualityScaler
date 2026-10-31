@@ -26,6 +26,18 @@
 ## What is QualityScaler?
 Qualityscaler is a Windows app powered by AI to enhance, upscale and de-noise photographs and videos.
 
+### Select input files
+
+Drag images or videos from File Explorer onto the **left input pane**, or use
+**SELECT FILES**. Drop additional files onto the populated list or use **ADD FILES**
+to append them; duplicates are ignored. **CLEAN** clears the selection so you can
+start again.
+
+Multiple files, spaces, Unicode and braces in filenames are supported. Folders,
+unsupported extensions and unreadable media are skipped without clearing existing
+inputs. Input changes are disabled while a job is running. Files are never moved
+by a drop.
+
 ## How to use QualityScaler?
 [movie_max_vp9.webm](https://github.com/user-attachments/assets/4a1984be-c8c8-464b-a3d1-43445635b165)
 
@@ -53,6 +65,47 @@ QualityScaler is completely written in Python, from backend to frontend.
 - [x] moviepy (https://github.com/Zulko/moviepy)
 - [x] pyInstaller (https://github.com/pyinstaller/pyinstaller)
 
+## Portable Windows executable
+
+Double-click `dist/QualityScaler.exe` after building. It is a single portable
+Windows x64 executable: Python, DirectML runtime, FFmpeg, ExifTool, UI assets,
+native file drag-and-drop support, and all seven standard AI models are bundled.
+No Python installation or FFmpeg
+PATH configuration is needed to run it; Windows 10/11 and a compatible DirectX
+12 GPU are still required. First launch briefly extracts its bundled resources
+to the Windows temporary directory.
+
+To rebuild locally, install Python 3.11 x64 and place FFmpeg in `Assets/ffmpeg.exe`
+and the seven standard `*_fp16.onnx` models in `AI-onnx/` as described below.
+Run from PowerShell:
+
+```powershell
+.\build.ps1
+# Reuse an already-provisioned .venv without installing dependencies again:
+.\build.ps1 -SkipInstall
+```
+
+The script creates `.venv` when needed, installs `requirements.txt`, and uses
+`QualityScaler.spec` to build the executable. It prints its path, size, and
+SHA-256. `build/`, `dist/`, model binaries, and FFmpeg are ignored by Git.
+The build is unsigned; no installer, administrator access, or system-wide
+installation is needed.
+
+Verify the **actual executable**, including bundled model/DLL discovery,
+native file-drop dispatch, DirectML kernel execution, spawned GPU workers, SQLite interruption/resume,
+FFmpeg encoding, and preserved audio:
+
+```powershell
+$report = Join-Path $PWD 'build\packaged-self-test.json'
+Start-Process .\dist\QualityScaler.exe -ArgumentList ('--self-test "' + $report + '"') -Wait
+Get-Content $report
+```
+
+This unattended mode writes a JSON result and sibling `.log`, returns nonzero
+on failure, and removes its temporary test media. It briefly constructs and
+closes the desktop UI without changing saved user preferences, then tests GPU
+inference and video resume.
+
 ## Make it work by yourself. 👨‍💻
 Prerequisites.
 - Python installed on your pc (https://www.python.org/downloads/release/python-3119/)
@@ -70,6 +123,104 @@ Getting started.
 - Install dependencies. In VSCode there is the "Terminal" panel, click there and execute the command "pip install -r requirements.txt"
 - Close VSCode and re-open it (this will refresh all the dependecies installed)
 - Click on the "Play button" in the upper right corner of VSCode
+
+## Video frame cache and resume
+
+Video jobs now store original and upscaled JPEG frames in **one SQLite database**,
+not individual frame files. The database also records the full job settings,
+source identity, frame indices, extraction completion, current stage, and errors.
+Output names are simply `clip_upscaled.mp4` (or the chosen extension); settings
+are no longer encoded in image or video filenames.
+
+The cache lives beside the output in `clip.mp4.qualityscaler/frames.sqlite3`.
+Choose **Save frames: ON** to retain it after a successful encode. With this option
+OFF, only a successful job removes the cache. Stopped and failed jobs keep it.
+SQLite may create a temporary rollback journal while a batch is being saved;
+the number of files stays constant regardless of video length.
+
+- Start the same video again with the same AI, resize, tile and blending settings
+  to resume in the GUI. Finished extraction is reused, and only missing upscaled
+  frames are processed.
+- A partial extraction is replayed from the beginning, reusing saved frames.
+  This avoids inaccurate timestamp/keyframe seeking. Upscaling starts after
+  extraction completes successfully.
+- Frame writes are committed in batches of 16. A graceful stop commits the
+  current batch; a forced termination can lose the uncommitted batch, but cannot
+  mark those frames complete. SQLite recovers interrupted transactions on reopen.
+- Already-dispatched inference work must finish before a graceful stop can
+  finish. Previously saved results are committed before waiting. The desktop
+  stop handler has a bounded wait and can force termination if inference hangs.
+- A changed source (path, size or modification time) or changed processing
+  settings is rejected rather than mixed into an existing job. Restore the saved
+  settings, choose a different output folder, or move the old cache aside to
+  start fresh. GPU, worker count and encoding codec can change on resume.
+- Encoding streams cached frames in frame-index order directly to FFmpeg, with
+  optional source audio. Failed encoding retains the frames. The final output
+  is replaced only after FFmpeg succeeds.
+- Only one runner may own a cache at a time. A crash-released OS lock prevents
+  simultaneous GUI/CLI resumes from mixing job state. Its tiny, stable lock file
+  lives in the OS temporary directory, not among the cached frames.
+
+Inspect the saved settings/progress, or resume directly using the recorded
+configuration without re-entering it in the GUI:
+
+```sh
+python -m qualityscaler inspect "path/to/clip.mp4.qualityscaler/frames.sqlite3"
+python -m qualityscaler resume "path/to/clip.mp4.qualityscaler/frames.sqlite3"
+python -m qualityscaler resume "path/to/clip.mp4.qualityscaler/frames.sqlite3" --codec x264
+```
+
+Press Ctrl+C in the resume command to checkpoint and pause at the current
+inference boundary. Resume requires the
+original video and AI model files to remain available. Old per-frame JPEG folders
+and the experimental `framevault.mpeg` are not automatically imported or deleted.
+Existing simple-named outputs are replaced after successful processing, so use a
+different output folder when keeping multiple model/settings variants.
+
+### Backend layout and tests
+
+`QualityScaler.py` is a spawn-safe desktop launcher; desktop layout and controls
+live in `qualityscaler/gui.py`. GUI-independent backend modules are in
+`qualityscaler/`: `frame_store.py` owns SQLite transactions, `jpeg_stream.py`
+parses streamed JPEGs, `ffmpeg.py` handles extraction/encoding and cancellation,
+`video.py` owns resumable jobs and bounded spawned inference workers, `ai.py` owns model
+inference, and `media.py`, `paths.py`, `jobs.py` provide shared helpers/batch jobs.
+
+Each inference process owns one DirectML session; SQLite stays in the parent.
+Process isolation avoids the ONNX Runtime Python DirectML allocator crashes
+seen when independent sessions run concurrently in threads. Only encoded JPEG
+bytes cross process boundaries, with at most twice the worker count in flight.
+
+Run the tests with the same Python environment used for the application:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Storage/parser tests need only Python's standard library. Media and pipeline
+tests use NumPy and OpenCV; FFmpeg integration tests also need `ffmpeg` on PATH
+(otherwise those tests are skipped). Tests use a deterministic resize engine,
+not downloaded ONNX models or DirectML hardware.
+
+### Real-model DirectML checks (opt-in)
+
+Place a model such as `RealESR_Gx4_fp16.onnx` in `AI-onnx/`, using an existing
+local copy or the model download link in the setup guide above. Model binaries
+are ignored by Git and should not be committed.
+
+To run the real-model tests in PowerShell:
+
+```powershell
+$env:QUALITYSCALER_TEST_MODEL = "RealESR_Gx4"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_real_model.py -v
+Remove-Item Env:\QUALITYSCALER_TEST_MODEL
+```
+
+These tests require DirectML hardware/runtime and FFmpeg on PATH. They verify
+actual GPU execution through ONNX profiling, then interrupt and resume a real
+upscaling job through the SQLite cache, checking that only missing frames are
+inferred and that the encoded output retains its frame count, resolution, frame
+rate, and audio. They are skipped unless `QUALITYSCALER_TEST_MODEL` is set.
 
 ## Requirements. 🤓
 - Windows 11 / Windows 10

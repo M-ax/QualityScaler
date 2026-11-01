@@ -52,13 +52,17 @@ def _get_splash():
     return _splash
 
 
-def update_splash(text: str) -> None:
-    """Update the existing native splash, if this process owns a live connection."""
+def update_splash(text: str, *, progress: int | None = None) -> None:
+    """Send status and optional phase progress (0–100) to the owned native splash."""
     splash = _get_splash()
     if splash is None:
         return
     try:
         if splash.is_alive():
+            # Plain text remains supported; the native Tcl extension consumes
+            # this prefix before displaying the status. No second IPC channel.
+            if progress is not None:
+                text = f"QS_PROGRESS:{max(0, min(100, progress))}:{text}"
             splash.update_text(text)
     except (OSError, RuntimeError):
         # Optional feedback must never break startup or mask the real error.

@@ -18,12 +18,12 @@ if __name__ == "__main__":
 
         try:
             _enable_splash()
-            update_splash("Loading QualityScaler...")
+            update_splash("Loading QualityScaler...", progress=72)
             from qualityscaler.gui import main
 
-            update_splash("Preparing desktop...")
+            update_splash("Preparing desktop...", progress=82)
             main()
         finally:
             # Includes import/preparation errors, SystemExit and KeyboardInterrupt.
-            # The desktop closes earlier, after window.update(), on normal startup.
+            # Normally the desktop closes it shortly after its first full repaint.
             close_splash()

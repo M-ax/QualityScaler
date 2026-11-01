@@ -974,8 +974,15 @@ class LifecycleTests(StateTestCase):
                     patch.object(gui.GPU, "codec_for", return_value=None), \
                     patch.object(gui, "get_AI_engine_info", return_value="QualityScaler UI test"), \
                     patch.object(gui, "allow_sleep"), \
+                    patch.object(gui, "update_splash") as update_splash, \
+                    patch.object(gui, "close_splash") as close_splash, \
+                    patch.object(gui, "_schedule", wraps=gui._schedule) as schedule, \
                     patch("customtkinter.CTk.mainloop", smoke):
                 gui.main()
+            update_splash.assert_any_call("Detecting graphics adapters...", progress=88)
+            update_splash.assert_any_call("Preparing interface...", progress=94)
+            update_splash.assert_called_with("Ready", progress=100)
+            schedule.assert_any_call(200, close_splash)
         manager.shutdown.assert_called_once()
 
 

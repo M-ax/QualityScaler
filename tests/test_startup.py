@@ -137,6 +137,17 @@ class SplashHelperTests(unittest.TestCase):
         self.splash.update_text.assert_not_called()
         self.splash.close.assert_called_once_with()
 
+    def test_phase_progress_uses_existing_text_channel_and_is_bounded(self):
+        self.startup._enable_splash()
+        self.startup.update_splash("Loading...", progress=72)
+        self.startup.update_splash("Starting...", progress=-5)
+        self.startup.update_splash("Ready", progress=120)
+        self.assertEqual(
+            [call.args[0] for call in self.splash.update_text.call_args_list],
+            ["QS_PROGRESS:72:Loading...", "QS_PROGRESS:0:Starting...",
+             "QS_PROGRESS:100:Ready"],
+        )
+
     def test_missing_disabled_or_invalid_port_never_imports_pyi_splash(self):
         original_import = builtins.__import__
 
@@ -259,7 +270,7 @@ class LauncherSplashTests(unittest.TestCase):
             side_effect=lambda: self.events.append("enable"),
         )
         self.startup.update_splash = Mock(
-            side_effect=lambda text: self.events.append(text),
+            side_effect=lambda text, **kwargs: self.events.append(text),
         )
         self.startup.close_splash = Mock(
             side_effect=lambda: self.events.append("close"),
@@ -302,6 +313,10 @@ class LauncherSplashTests(unittest.TestCase):
             "Loading QualityScaler...", "qualityscaler.gui",
             "Preparing desktop...", "desktop", "close",
         ])
+        self.assertEqual(
+            [call.kwargs for call in self.startup.update_splash.call_args_list],
+            [{"progress": 72}, {"progress": 82}],
+        )
 
     def test_gui_import_error_closes_splash_and_propagates_original_error(self):
         original_import = builtins.__import__

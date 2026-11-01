@@ -2,8 +2,10 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, replace
 import json
+import math
 import os
 from pathlib import Path
+from queue import Empty, Queue
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
 from time import sleep
@@ -19,7 +21,8 @@ from qualityscaler.ffmpeg import UpscaleCancelled
 from qualityscaler.frame_store import FrameStore
 from qualityscaler.job_lock import JobAlreadyRunning, JobLock
 from qualityscaler.video import (
-    VideoSettings, VideoUpscaler, decode_frame, get_resume_progress,
+    CacheSettingsMismatch, CURRENT_JOB_VERSION, VideoSettings, VideoUpscaler,
+    decode_frame, get_resume_progress,
     initialize_worker, process_frame, SOURCE_LAYOUT_SCALED,
 )
 
@@ -151,9 +154,10 @@ class VideoUpscalerTests(unittest.TestCase):
             checkpoint_interval=1, **kwargs,
         )
 
-    def run_job(self, upscaler=None, settings=None):
+    def run_job(self, upscaler=None, settings=None, *, clear_cache=False):
         return (upscaler or self.upscaler()).run(
-            self.source, self.output, self.cache, settings or self.settings
+            self.source, self.output, self.cache, settings or self.settings,
+            clear_cache=clear_cache,
         )
 
     def prepare_legacy_cache(self, settings, *, extraction_complete):
@@ -260,9 +264,15 @@ class VideoUpscalerTests(unittest.TestCase):
         with FrameStore(self.cache) as store:
             store.set_metadata("source_frame_layout", "unknown-resizer")
         before = self.cache.read_bytes()
-        with self.assertRaisesRegex(ValueError, "source frame layout"):
-            self.run_job()
-        self.assertEqual(self.cache.read_bytes(), before)
+        for clear_cache in (False, True):
+            with self.subTest(clear_cache=clear_cache):
+                with self.assertRaisesRegex(ValueError, "source frame layout") as raised:
+                    self.run_job(
+                        settings=replace(self.settings, blending_factor=0.5),
+                        clear_cache=clear_cache,
+                    )
+                self.assertNotIsInstance(raised.exception, CacheSettingsMismatch)
+                self.assertEqual(self.cache.read_bytes(), before)
         self.assertIsNone(get_resume_progress(
             self.source, str(self.directory), self.settings,
         ))
@@ -275,9 +285,14 @@ class VideoUpscalerTests(unittest.TestCase):
                     store.set_metadata("job_version", version)
                     store.set_metadata("source_frame_layout", layout)
                 before = self.cache.read_bytes()
-                with self.assertRaisesRegex(ValueError, "source frame layout"):
-                    self.run_job()
-                self.assertEqual(self.cache.read_bytes(), before)
+                for clear_cache in (False, True):
+                    with self.assertRaisesRegex(ValueError, "source frame layout") as raised:
+                        self.run_job(
+                            settings=replace(self.settings, blending_factor=0.5),
+                            clear_cache=clear_cache,
+                        )
+                    self.assertNotIsInstance(raised.exception, CacheSettingsMismatch)
+                    self.assertEqual(self.cache.read_bytes(), before)
                 self.assertIsNone(get_resume_progress(
                     self.source, str(self.directory), self.settings,
                 ))
@@ -398,11 +413,12 @@ class VideoUpscalerTests(unittest.TestCase):
             self.assertGreater(len(saved), 0)
             self.assertLess(len(saved), 5)
             self.assertEqual(store.get_metadata("stage"), "paused")
+            extraction_complete = store.get_metadata("extraction_complete", False)
         self.assertFalse(self.output.exists())
         self.stop.clear()
         self.calls.clear()
         self.run_job()
-        self.assertEqual(self.ffmpeg.extractions, 1)
+        self.assertEqual(self.ffmpeg.extractions, 1 if extraction_complete else 2)
         self.assertCountEqual(self.calls, [
             value for index, value in enumerate((20, 40, 60, 80, 100))
             if index not in saved
@@ -410,20 +426,193 @@ class VideoUpscalerTests(unittest.TestCase):
         self.assertEqual(self.ffmpeg.encoded_values, [20, 40, 60, 80, 100])
 
     def test_partial_extraction_replays_and_reuses_committed_frames(self):
-        self.ffmpeg.stop_during_extraction = True
+        def status(message):
+            if message.startswith("Extracting video frames") and "(2 saved)" in message:
+                self.stop.set()
+
         with self.assertRaises(UpscaleCancelled):
-            self.run_job()
+            self.run_job(self.upscaler(status=status))
         with FrameStore(self.cache, read_only=True) as store:
             self.assertEqual(store.frame_count("source"), 2)
             first_frame = store.get_frame("source", 0)
             self.assertFalse(store.get_metadata("extraction_complete", False))
-        self.ffmpeg.stop_during_extraction = False
         self.stop.clear()
         self.run_job()
         with FrameStore(self.cache, read_only=True) as store:
             self.assertEqual(store.get_frame("source", 0), first_frame)
             self.assertTrue(store.get_metadata("extraction_complete"))
         self.assertEqual(self.ffmpeg.extractions, 2)
+
+    def test_upscaled_results_are_saved_while_extraction_waits_for_more_frames(self):
+        first_saved = Event()
+        extraction_finished = Event()
+        snapshots = []
+        original_extract = self.ffmpeg.extract
+
+        def extract(source, fps, stop, save_frame, **options):
+            def publish(index, data):
+                save_frame(index, data)
+                if index == 0:
+                    self.assertTrue(first_saved.wait(5), "AI waited for extraction to finish")
+            count = original_extract(source, fps, stop, publish, **options)
+            extraction_finished.set()
+            return count
+
+        def progress(snapshot):
+            snapshots.append(snapshot)
+            if snapshot.upscaled and not first_saved.is_set():
+                self.assertFalse(extraction_finished.is_set())
+                self.assertFalse(snapshot.extraction_complete)
+                self.assertEqual(snapshot.extracted, 1)
+                with FrameStore(self.cache, read_only=True) as store:
+                    self.assertEqual(store.frame_count("upscaled"), 1)
+                first_saved.set()
+
+        self.ffmpeg.extract = extract
+        self.run_job(self.upscaler(progress=progress))
+        self.assertTrue(first_saved.is_set())
+        self.assertTrue(extraction_finished.is_set())
+        self.assertEqual(self.ffmpeg.encoded_values, [20, 40, 60, 80, 100])
+        self.assertEqual((snapshots[-1].extracted, snapshots[-1].upscaled), (5, 5))
+        self.assertTrue(snapshots[-1].extraction_complete)
+
+    def test_last_frames_published_during_empty_queue_check_are_not_lost(self):
+        timed_out = Event()
+        producer_done = Event()
+        self.ffmpeg.frames = self.ffmpeg.frames[:2]
+        original_extract = self.ffmpeg.extract
+
+        class RacingQueue(Queue):
+            def get(inner, block=True, timeout=None):
+                try:
+                    return super().get(block=block, timeout=timeout)
+                except Empty:
+                    if timeout is not None and not timed_out.is_set():
+                        timed_out.set()
+                        self.assertTrue(producer_done.wait(5))
+                    raise
+
+        class ObservedProducer(ThreadPoolExecutor):
+            def submit(inner, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                future.add_done_callback(lambda result: producer_done.set())
+                return future
+
+        def extract(*args, **kwargs):
+            self.assertTrue(timed_out.wait(5))
+            return original_extract(*args, **kwargs)
+
+        self.ffmpeg.extract = extract
+        with patch("qualityscaler.video.Queue", RacingQueue), \
+                patch("qualityscaler.video.ThreadPoolExecutor", ObservedProducer):
+            self.run_job()
+        self.assertTrue(producer_done.is_set())
+        self.assertEqual(self.ffmpeg.encoded_values, [20, 40])
+
+    def test_decoder_failure_after_saved_inference_never_encodes_and_resumes(self):
+        first_saved = Event()
+        original_extract = self.ffmpeg.extract
+
+        def extract(source, fps, stop, save_frame, **options):
+            save_frame(0, self.ffmpeg.frames[0])
+            self.assertTrue(first_saved.wait(5))
+            raise RuntimeError("Test decoder failed")
+
+        self.ffmpeg.extract = extract
+        with self.assertRaisesRegex(RuntimeError, "decoder failed"):
+            self.run_job(self.upscaler(
+                progress=lambda snapshot: first_saved.set() if snapshot.upscaled else None,
+            ))
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(store.frame_count("source"), 1)
+            self.assertEqual(store.frame_count("upscaled"), 1)
+            self.assertEqual(store.get_metadata("stage"), "failed")
+            self.assertFalse(store.get_metadata("extraction_complete", False))
+        self.assertFalse(self.stop.is_set(), "Internal failure must not become user cancellation")
+        self.assertEqual(self.ffmpeg.encodings, 0)
+        self.ffmpeg.extract = original_extract
+        self.calls.clear()
+        self.run_job()
+        self.assertCountEqual(self.calls, [40, 60, 80, 100])
+        self.assertEqual(self.ffmpeg.encoded_values, [20, 40, 60, 80, 100])
+
+    def test_inference_failure_cancels_a_waiting_decoder_and_preserves_error(self):
+        decoder_stopped = Event()
+
+        def extract(source, fps, stop, save_frame, **options):
+            try:
+                save_frame(0, self.ffmpeg.frames[0])
+                for _ in range(100):
+                    if stop.is_set():
+                        raise UpscaleCancelled()
+                    sleep(0.01)
+                self.fail("Decoder was not cancelled after inference failed")
+            finally:
+                decoder_stopped.set()
+
+        self.ffmpeg.extract = extract
+        pipeline = VideoUpscaler(
+            ffmpeg=self.ffmpeg, stop_event=self.stop,
+            engine_factory=lambda settings: FakeEngine(self.calls, fail_value=20),
+            executor_factory=ThreadPoolExecutor,
+        )
+        with self.assertRaisesRegex(RuntimeError, "inference failed"):
+            self.run_job(pipeline)
+        self.assertTrue(decoder_stopped.is_set())
+        self.assertFalse(self.stop.is_set())
+        self.assertEqual(self.ffmpeg.encodings, 0)
+
+    def test_full_extraction_queue_is_bounded_and_released_on_consumer_failure(self):
+        queue_full = Event()
+        decoder_stopped = Event()
+        published = []
+        capacity = 2 * self.settings.workers
+
+        def extract(source, fps, stop, save_frame, **options):
+            try:
+                for index in range(1000):
+                    if index == capacity + 1:
+                        queue_full.set()
+                    save_frame(index, self.ffmpeg.frames[0])
+                    published.append(index)
+                return 1000
+            finally:
+                decoder_stopped.set()
+
+        def status(message):
+            if "(1 saved)" in message:
+                self.assertTrue(queue_full.wait(5))
+                self.assertEqual(len(published), capacity + 1)
+                raise RuntimeError("Test status consumer failed")
+
+        self.ffmpeg.extract = extract
+        with self.assertRaisesRegex(RuntimeError, "status consumer failed"):
+            self.run_job(self.upscaler(status=status))
+        self.assertTrue(decoder_stopped.is_set())
+        self.assertEqual(len(published), capacity + 1)
+        self.assertFalse(self.stop.is_set())
+        self.assertEqual(self.ffmpeg.encodings, 0)
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(store.frame_count("source"), 1)
+            self.assertEqual(store.get_metadata("stage"), "failed")
+
+    def test_unknown_and_inaccurate_estimates_are_replaced_with_exact_total(self):
+        original_get = self.capture.get.side_effect
+        for expected in (0, float("nan"), 2, 20):
+            with self.subTest(expected=expected):
+                self.capture.get.side_effect = lambda prop: (
+                    expected if prop == cv2.CAP_PROP_FRAME_COUNT else original_get(prop)
+                )
+                self.cache = self.directory / str(expected) / "frames.sqlite3"
+                snapshots = []
+                self.run_job(self.upscaler(progress=snapshots.append))
+                self.assertEqual(
+                    snapshots[0].total,
+                    int(expected) if math.isfinite(expected) and expected > 0 else None,
+                )
+                self.assertEqual(snapshots[-1].total, 5)
+                self.assertEqual(snapshots[-1].upscaled, 5)
+                self.assertTrue(snapshots[-1].extraction_complete)
 
     def test_out_of_order_workers_still_encode_in_frame_order(self):
         finished = []
@@ -593,12 +782,160 @@ class VideoUpscalerTests(unittest.TestCase):
 
     def test_changed_processing_settings_leave_existing_job_untouched(self):
         self.run_job()
-        with self.assertRaisesRegex(ValueError, "different AI"):
+        before = self.cache.read_bytes()
+        with self.assertRaisesRegex(CacheSettingsMismatch, "different AI") as raised:
             self.run_job(settings=replace(self.settings, blending_factor=0.5))
+        self.assertEqual(str(raised.exception), (
+            "The cached job has different AI, resize, tile, blending, or sharpening settings. "
+            "Restore its recorded settings or choose another output folder. "
+            "The existing cache has not been changed."
+        ))
+        self.assertEqual(self.cache.read_bytes(), before)
         with FrameStore(self.cache, read_only=True) as store:
             self.assertEqual(store.get_metadata("stage"), "complete")
             self.assertEqual(store.get_metadata("settings")["blending_factor"], 0)
             self.assertEqual(store.frame_count("upscaled"), 5)
+
+    def test_authorized_reset_regenerates_all_frames_and_metadata_without_deleting_files(self):
+        self.prepare_legacy_cache(self.settings, extraction_complete=True)
+        stale_metadata = {
+            "stage": "failed", "error": "old failure", "interrupted_stage": "encoding",
+            "fps": 99, "total_frames": 100, "extraction_complete": True,
+            "source_size": [99, 99], "input_size": [88, 88], "updated_at": "old time",
+            "unknown_old_metadata": {"must": "also disappear"},
+        }
+        with FrameStore(self.cache) as store:
+            for key, value in stale_metadata.items():
+                store.set_metadata(key, value)
+            store.put_frame("source", 99, jpeg(200))
+            store.put_frame("upscaled", 99, jpeg(200))
+        note = self.cache.parent / "notes.txt"
+        note.write_text("keep cache directory contents")
+        other_output = self.directory / "another_upscaled.mp4"
+        other_output.write_bytes(b"keep other output")
+        self.output.write_bytes(b"previous output")
+        settings = replace(self.settings, input_resize_factor=0.5)
+        self.ffmpeg.frames = [jpeg(value) for value in (30, 50, 70)]
+        pipeline = self.upscaler()
+        extract = pipeline._extract
+        reset = FrameStore.reset
+
+        def checked_reset(store):
+            with self.assertRaises(JobAlreadyRunning):
+                with JobLock(self.cache):
+                    pass
+            return reset(store)
+
+        def checked_extract(store, path, requested_settings):
+            # Preparation must commit one fresh identity, not keep any state
+            # from the old job (including unrecognized future metadata).
+            with FrameStore(self.cache, read_only=True) as reader:
+                self.assertEqual(reader.frame_count("source"), 0)
+                self.assertEqual(reader.frame_count("upscaled"), 0)
+                for key in stale_metadata:
+                    self.assertIsNone(reader.get_metadata(key), key)
+                self.assertEqual(reader.get_metadata("job_version"), CURRENT_JOB_VERSION)
+                self.assertEqual(reader.get_metadata("source_frame_layout"), SOURCE_LAYOUT_SCALED)
+                self.assertEqual(reader.get_metadata("processing_settings"), settings.processing_settings())
+                self.assertEqual(reader.get_metadata("settings"), asdict(settings))
+                self.assertEqual(reader.get_metadata("output_path"), str(self.output.resolve()))
+            self.assertEqual(self.output.read_bytes(), b"previous output")
+            return extract(store, path, requested_settings)
+
+        with patch.object(FrameStore, "reset", autospec=True, side_effect=checked_reset) as reset_call, \
+                patch.object(pipeline, "_extract", side_effect=checked_extract) as extract_call:
+            self.run_job(pipeline, settings, clear_cache=True)
+        reset_call.assert_called_once()
+        extract_call.assert_called_once()
+        self.assertEqual(self.ffmpeg.extractions, 1)
+        self.assertEqual(self.ffmpeg.input_sizes, [(6, 4)])
+        self.assertCountEqual(self.calls, [30, 50, 70])
+        self.assertEqual(self.ffmpeg.encoded_values, [30, 50, 70])
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(store.frame_count("source"), 3)
+            self.assertEqual(store.frame_count("upscaled"), 3)
+            self.assertEqual(decode_frame(store.get_frame("source", 0)).shape, (4, 6, 3))
+            self.assertEqual(store.get_metadata("total_frames"), 3)
+            self.assertEqual(store.get_metadata("fps"), 24)
+            self.assertEqual(store.get_metadata("source_size"), [12, 8])
+            self.assertEqual(store.get_metadata("input_size"), [6, 4])
+            self.assertEqual(store.get_metadata("stage"), "complete")
+            self.assertIsNone(store.get_metadata("unknown_old_metadata"))
+        self.assertEqual(note.read_text(), "keep cache directory contents")
+        self.assertEqual(other_output.read_bytes(), b"keep other output")
+        self.assertEqual(self.output.read_bytes(), b"encoded video")
+
+    def test_clear_cache_with_matching_processing_settings_reuses_cache(self):
+        self.run_job()
+        with FrameStore(self.cache) as store:
+            store.set_metadata("unknown_old_metadata", "keep when settings match")
+            source_frames = list(store.iter_frames("source"))
+            upscaled_frames = list(store.iter_frames("upscaled"))
+        self.calls.clear()
+        with patch.object(FrameStore, "reset", autospec=True) as reset:
+            self.run_job(settings=replace(self.settings, codec="x265"), clear_cache=True)
+        reset.assert_not_called()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.ffmpeg.extractions, 1)
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(list(store.iter_frames("source")), source_frames)
+            self.assertEqual(list(store.iter_frames("upscaled")), upscaled_frames)
+            self.assertEqual(store.get_metadata("unknown_old_metadata"), "keep when settings match")
+            self.assertEqual(store.get_metadata("settings")["codec"], "x265")
+
+    def test_authorized_reset_and_new_identity_roll_back_together_on_preparation_failure(self):
+        self.run_job()
+        before = self.cache.read_bytes()
+        output_before = self.output.read_bytes()
+        settings = replace(self.settings, blending_factor=0.5)
+        set_metadata = FrameStore.set_metadata
+
+        def fail_preparation(store, key, value):
+            set_metadata(store, key, value)
+            if key == "output_path":
+                with FrameStore(self.cache, read_only=True) as reader:
+                    self.assertEqual(reader.frame_count("source"), 5)
+                    self.assertEqual(reader.frame_count("upscaled"), 5)
+                    self.assertEqual(reader.get_metadata("stage"), "complete")
+                    self.assertEqual(reader.get_metadata("processing_settings"),
+                                     self.settings.processing_settings())
+                raise RuntimeError("Test preparation failure after reset")
+
+        with patch.object(FrameStore, "set_metadata", autospec=True, side_effect=fail_preparation):
+            with self.assertRaisesRegex(RuntimeError, "preparation failure"):
+                self.run_job(settings=settings, clear_cache=True)
+        self.assertEqual(self.cache.read_bytes(), before)
+        self.assertEqual(self.output.read_bytes(), output_before)
+        self.assertEqual(self.ffmpeg.extractions, 1)
+        self.assertEqual(self.ffmpeg.encodings, 1)
+        # The failed preparation must also release ownership for a later retry.
+        self.run_job(settings=settings, clear_cache=True)
+        self.assertEqual(self.ffmpeg.extractions, 2)
+
+    def test_cancellation_before_authorized_reset_preserves_the_entire_old_job(self):
+        self.run_job()
+        before = self.cache.read_bytes()
+        output_before = self.output.read_bytes()
+        settings = replace(self.settings, blending_factor=0.5)
+        for cancel_during_preparation in (False, True):
+            with self.subTest(cancel_during_preparation=cancel_during_preparation):
+                self.stop.clear()
+                if not cancel_during_preparation:
+                    self.stop.set()
+
+                def digest(name):
+                    self.stop.set()
+                    return None
+
+                with patch.object(FrameStore, "reset", autospec=True) as reset, \
+                        patch("qualityscaler.video.model_digest", side_effect=digest):
+                    with self.assertRaises(UpscaleCancelled):
+                        self.run_job(settings=settings, clear_cache=True)
+                reset.assert_not_called()
+                self.assertEqual(self.cache.read_bytes(), before)
+                self.assertEqual(self.output.read_bytes(), output_before)
+                self.assertEqual(self.ffmpeg.extractions, 1)
+                self.assertEqual(self.ffmpeg.encodings, 1)
 
     def test_sharpening_changes_invalidate_saved_processing_settings(self):
         self.run_job()
@@ -616,8 +953,14 @@ class VideoUpscalerTests(unittest.TestCase):
         self.run_job()
         with FrameStore(self.cache) as store:
             store.set_metadata("job_version", 1)
-        with self.assertRaisesRegex(ValueError, "different processing version"):
-            self.run_job()
+        before = self.cache.read_bytes()
+        for clear_cache in (False, True):
+            with self.assertRaisesRegex(ValueError, "different processing version") as raised:
+                self.run_job(
+                    settings=replace(self.settings, blending_factor=0.5), clear_cache=clear_cache,
+                )
+            self.assertNotIsInstance(raised.exception, CacheSettingsMismatch)
+            self.assertEqual(self.cache.read_bytes(), before)
 
     def test_resume_badge_uses_sqlite_source_and_processing_identity(self):
         # The GUI and backend use the same stable directory.
@@ -633,18 +976,39 @@ class VideoUpscalerTests(unittest.TestCase):
     def test_modified_source_is_rejected_without_resetting_cache(self):
         self.run_job()
         self.source.write_bytes(b"a modified source")
-        with self.assertRaisesRegex(ValueError, "modified source"):
-            self.run_job()
+        before = self.cache.read_bytes()
+        for clear_cache in (False, True):
+            with self.assertRaisesRegex(ValueError, "modified source") as raised:
+                self.run_job(
+                    settings=replace(self.settings, blending_factor=0.5), clear_cache=clear_cache,
+                )
+            self.assertNotIsInstance(raised.exception, CacheSettingsMismatch)
+            self.assertEqual(self.cache.read_bytes(), before)
         with FrameStore(self.cache, read_only=True) as store:
             self.assertEqual(store.frame_count("source"), 5)
             self.assertEqual(store.get_metadata("stage"), "complete")
+
+    def test_missing_source_identity_is_not_recoverable_by_authorizing_reset(self):
+        self.run_job()
+        with FrameStore(self.cache) as store:
+            store.set_metadata("source", None)
+        before = self.cache.read_bytes()
+        for clear_cache in (False, True):
+            with self.assertRaisesRegex(ValueError, "missing its job identity") as raised:
+                self.run_job(
+                    settings=replace(self.settings, blending_factor=0.5), clear_cache=clear_cache,
+                )
+            self.assertNotIsInstance(raised.exception, CacheSettingsMismatch)
+            self.assertEqual(self.cache.read_bytes(), before)
 
     def test_competing_runner_is_rejected_before_modifying_metadata(self):
         self.run_job()
         before = self.cache.read_bytes()
         with JobLock(self.cache):
             with self.assertRaisesRegex(JobAlreadyRunning, "already running"):
-                self.run_job(settings=replace(self.settings, codec="x265"))
+                self.run_job(
+                    settings=replace(self.settings, blending_factor=0.5), clear_cache=True,
+                )
         self.assertEqual(self.cache.read_bytes(), before)
         self.assertEqual(self.ffmpeg.encodings, 1)
 

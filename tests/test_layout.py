@@ -5,10 +5,12 @@ import os
 from queue import Queue
 import sys
 from threading import Event
+from time import monotonic, sleep
 import unittest
 from unittest.mock import Mock, patch
 
 from qualityscaler import gui
+from qualityscaler.status import VideoProgress
 
 
 @unittest.skipUnless(sys.platform == "win32" or os.environ.get("DISPLAY"),
@@ -143,6 +145,134 @@ class DesktopLayoutTests(unittest.TestCase):
             self.assertEqual(bar.label.get("1.0", "end-1c"), "Hi :)")
             self.assertEqual(bar.label.cget("height"), 24)
             self.assertLessEqual(bar.winfo_height(), 40)
+            self.assertFalse(bar.video_rows.winfo_ismapped())
+        self.run_desktop(check)
+
+    def test_cache_conflict_dialog_shows_explicit_clear_and_cancel_actions(self):
+        def check(window):
+            for use_failed_settings in (False, True):
+                with self.subTest(use_failed_settings=use_failed_settings):
+                    self._check_cache_conflict_dialog(window, use_failed_settings)
+        self.run_desktop(check)
+
+    def _check_cache_conflict_dialog(self, window, use_failed_settings):
+        command = Mock()
+        gui.show_error_message(
+            "Video: C:/videos/a long video name.mp4\n\n"
+            "The cached job has different AI, resize, tile, blending, or sharpening settings.",
+            clear_cache_command=command,
+        )
+        dialog = next(child for child in window.winfo_children()
+                      if isinstance(child, gui.MessageBox))
+        try:
+            # Run delayed construction deterministically on the Tk thread.
+            if dialog._create_after is not None:
+                dialog.after_cancel(dialog._create_after)
+                dialog._create_widgets()
+            window.update()
+            choice = next(child for child in dialog.winfo_children()
+                          if isinstance(child, gui.CTkCheckBox))
+            self.assertEqual(choice.cget("text"), "Use settings from failed run")
+            self.assertFalse(choice.get(), "Reusing failed-run settings must be opt-in")
+            buttons = {
+                child.cget("text"): child
+                for frame in dialog.winfo_children() if isinstance(frame, gui.CTkFrame)
+                for child in frame.winfo_children() if isinstance(child, gui.CTkButton)
+            }
+            self.assertEqual(set(buttons), {"Copy log", "Clear cache and continue", "Cancel"})
+            # CTk briefly withdraws Windows dialogs while applying the
+            # titlebar theme; let its timer finish before checking visibility.
+            deadline = monotonic() + 5
+            while not all(button.winfo_ismapped() for button in buttons.values()):
+                self.assertLess(monotonic(), deadline, "The error dialog did not become visible")
+                window.update()
+                sleep(0.001)
+            command.assert_not_called()
+            for button in buttons.values():
+                self.assertTrue(button.winfo_ismapped())
+                self.assertLessEqual(
+                    button.winfo_rootx() + button.winfo_width(),
+                    dialog.winfo_rootx() + dialog.winfo_width(),
+                )
+            self.assertTrue(choice.winfo_ismapped())
+            if use_failed_settings:
+                choice.select()
+            buttons["Clear cache and continue"].invoke()
+            command.assert_called_once_with(use_failed_settings)
+            self.assertFalse(dialog.winfo_exists())
+        finally:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+    def test_concurrent_video_rows_fit_at_all_zooms_without_hiding_stop(self):
+        message = "2. Upscaling video — " + ("long processing details " * 100)
+
+        def check(window):
+            state = gui.app_state
+            gui.App.place_stop_button()
+            for zoom in gui.zoom_option_list:
+                gui.App.select_app_zoom(zoom)
+                window.geometry("1000x540")
+                gui._display_status(VideoProgress(message, 120, 35, 100, False))
+                window.update()
+                bar = state.status_bar
+                with self.subTest(zoom=zoom):
+                    self.assertEqual(bar.label.get("1.0", "end-1c"), message)
+                    self.assertTrue(bar.video_rows.winfo_ismapped())
+                    self.assertEqual(bar.extraction_bar.get(), 1)
+                    self.assertEqual(bar.upscaling_bar.get(), 0.35)
+                    self.assertIn("120 / ~100 frames", bar.extraction_label.cget("text"))
+                    self.assertIn("35 / ~100 frames", bar.upscaling_label.cget("text"))
+                    self.assertEqual(bar.extraction_bar.winfo_x(), bar.upscaling_bar.winfo_x())
+                    for label, progress in (
+                        (bar.extraction_label, bar.extraction_bar),
+                        (bar.upscaling_label, bar.upscaling_bar),
+                    ):
+                        self.assertLessEqual(label.winfo_x() + label.winfo_width(),
+                                             progress.winfo_x())
+                        self.assertGreater(progress.winfo_width(), 50)
+                        self.assertLessEqual(progress.winfo_x() + progress.winfo_width(),
+                                             bar.video_rows.winfo_width())
+                    self.assertLess(
+                        bar.extraction_label.winfo_y() + bar.extraction_label.winfo_height(),
+                        bar.upscaling_label.winfo_y() + bar.upscaling_label.winfo_height(),
+                    )
+                    self.assertLess(bar.winfo_height(), window.winfo_height() / 4)
+                    self.assertEqual(bar.winfo_y() + bar.winfo_height(), window.winfo_height())
+                    self.assertLessEqual(
+                        state.action_button.winfo_rooty() + state.action_button.winfo_height(),
+                        bar.winfo_rooty(),
+                    )
+                    bar.label.yview_moveto(1)
+                    window.update()
+                    self.assertEqual(bar.label._textbox.yview()[1], 1)
+        self.run_desktop(check)
+
+    def test_video_rows_remain_during_encoding_and_reset_for_images(self):
+        def check(window):
+            state = gui.app_state
+            bar = state.status_bar
+            for snapshot in (
+                VideoProgress("1. Extracting video", 42, 17, None, False),
+                VideoProgress("1. Upscaling video", 100, 90, 100, True),
+                VideoProgress("1. Encoding upscaled video", 100, 100, 100, True),
+            ):
+                gui._display_status(snapshot)
+                window.update()
+                self.assertTrue(bar.video_rows.winfo_ismapped())
+                self.assertEqual(bar.label.get("1.0", "end-1c"), snapshot.message)
+            self.assertTrue(bar.extraction_label.cget("text").endswith("complete"))
+            self.assertTrue(bar.upscaling_label.cget("text").endswith("complete"))
+            self.assertEqual(bar.extraction_bar.get(), 1)
+            self.assertEqual(bar.upscaling_bar.get(), 1)
+            video_height = bar.winfo_height()
+            gui._display_status("2. Upscaling image")
+            window.update()
+            self.assertFalse(bar.video_rows.winfo_ismapped())
+            self.assertLess(bar.winfo_height(), video_height)
+            self.assertLessEqual(bar.winfo_height(), 40)
+            self.assertEqual(bar.extraction_bar.get(), 0)
+            self.assertEqual(bar.upscaling_bar.get(), 0)
         self.run_desktop(check)
 
     def test_extreme_status_remains_scrollable_without_hiding_stop(self):
@@ -165,7 +295,7 @@ class DesktopLayoutTests(unittest.TestCase):
             bar.label.yview_moveto(1)
             window.update()
             self.assertEqual(bar.label._textbox.yview()[1], 1)
-            self.assertEqual(bar.label.cget("state"), "disabled")
+            self.assertEqual(bar.label._textbox.cget("state"), "disabled")
         self.run_desktop(check)
 
 

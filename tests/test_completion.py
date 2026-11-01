@@ -2,13 +2,15 @@
 
 from multiprocessing import get_context
 from queue import Queue
-from threading import Event, current_thread, get_ident
+from threading import Event, Thread, current_thread, get_ident
 from time import monotonic, sleep
 from tkinter import Tcl
 import unittest
 from unittest.mock import Mock, call, patch
 
 from qualityscaler import gui
+from qualityscaler.config import ProcessingConfig
+from qualityscaler.status import CacheSettingsConflict, VideoProgress
 
 
 def terminal_then_wait(status_queue, ready, release):
@@ -37,7 +39,7 @@ class CompletionTests(unittest.TestCase):
         self.process.is_alive.return_value = True
         self.state = gui.AppState(
             preferences=gui.UserPreferences(), window=self.window,
-            info_message=Mock(), file_widget=Mock(),
+            info_message=Mock(), file_widget=Mock(), status_bar=Mock(),
             process_upscale_orchestrator=self.process,
             process_status_q=Queue(), event_stop_upscale_process=Event(),
             processing=True,
@@ -85,6 +87,41 @@ class CompletionTests(unittest.TestCase):
         self.allow_sleep.assert_not_called()
         self.thread.assert_not_called()
         self.idle_button.assert_not_called()
+        self.state.status_bar.set_video_status.assert_called_with("finalizing")
+        self.state.status_bar.set_video_progress.assert_not_called()
+
+    def test_video_snapshots_from_producer_are_rendered_only_on_tcl_thread(self):
+        progress = VideoProgress("2. Upscaling video", 100, 50, None, False)
+        main_thread = get_ident()
+        render_threads = []
+        self.state.info_message.set.side_effect = lambda _: render_threads.append(get_ident())
+        self.state.status_bar.set_video_progress.side_effect = (
+            lambda _: render_threads.append(get_ident())
+        )
+        producer = Thread(target=self.state.process_status_q.put, args=(progress,))
+        producer.start()
+        producer.join(timeout=2)
+        self.assertFalse(producer.is_alive())
+        self.assertEqual(render_threads, [])
+        gui._schedule(0, gui.check_upscale_steps)
+        pump_until(self.window, lambda: len(render_threads) == 2)
+        self.assertEqual(render_threads, [main_thread, main_thread])
+        self.state.info_message.set.assert_called_with(progress.message)
+        self.state.status_bar.set_video_progress.assert_called_once_with(progress)
+        self.state.file_widget.highlight_active_file.assert_called_once_with(2)
+
+    def test_cleanup_retains_video_rows_and_late_snapshots_do_not_overwrite_them(self):
+        progress = VideoProgress("1. Encoding upscaled video", 100, 100, 100, True)
+        self.send(progress)
+        self.send(gui.COMPLETED_STATUS)
+        self.state.status_bar.set_video_progress.reset_mock()
+        self.send(VideoProgress("1. Upscaling video", 20, 10, 100, False))
+        self.state.status_bar.set_video_progress.assert_not_called()
+        self.state.status_bar.set_video_status.assert_called_with("finalizing")
+        self.process.is_alive.return_value = False
+        gui.check_upscale_steps()
+        self.state.status_bar.set_video_status.assert_called_with("job finished")
+        self.state.status_bar.set_video_progress.assert_not_called()
 
     def test_success_only_after_exit_reaps_nonblocking_refreshes_then_notifies(self):
         self.send(gui.COMPLETED_STATUS)
@@ -122,6 +159,7 @@ class CompletionTests(unittest.TestCase):
         self.thread.assert_not_called()
         self.process.join.assert_called_once_with(timeout=0)
         self.assertFalse(gui.inputs_are_busy())
+        self.state.status_bar.set_video_status.assert_called_with("error")
 
     def test_dead_worker_without_terminal_status_never_reports_success(self):
         for exitcode in (0, 9):
@@ -173,6 +211,47 @@ class CompletionTests(unittest.TestCase):
         self.error.assert_called_once_with("cleanup failed")
         self.thread.assert_not_called()
 
+    def test_cache_conflict_waits_for_worker_exit_before_offering_retry(self):
+        config = ProcessingConfig(
+            ["first.png", "second.mp4", "third.mp4"], "output", "LVAx2",
+            2, 0.5, 1.0, "0", 800, 0.3, True, ".png", ".mp4", "x264",
+        )
+        self.state.processing_config = config
+        conflict = CacheSettingsConflict("The cached job has different settings", 2)
+        self.send(conflict)
+        self.assertIs(self.state.pending_upscale_status, conflict)
+        self.assertTrue(self.state.processing)
+        self.error.assert_not_called()
+        self.process.join.assert_not_called()
+        self.process.is_alive.return_value = False
+        gui.check_upscale_steps()
+        self.assertFalse(self.state.processing)
+        self.assertIsNone(self.state.processing_config)
+        self.process.join.assert_called_once_with(timeout=0)
+        self.assertIn("Video: second.mp4", self.error.call_args.args[0])
+        command = self.error.call_args.kwargs["clear_cache_command"]
+        with patch.object(gui, "_retry_after_cache_conflict") as retry:
+            retry.assert_not_called()  # Presenting the dialog does not delete or restart.
+            command(False)
+            command(True)
+        self.assertEqual(retry.call_args_list, [
+            call(config, 2, use_failed_settings=False),
+            call(config, 2, use_failed_settings=True),
+        ])
+        self.thread.assert_not_called()
+
+    def test_cache_conflict_without_captured_batch_does_not_offer_deletion(self):
+        self.process.is_alive.return_value = False
+        self.send(CacheSettingsConflict("Cached settings differ", 1))
+        self.error.assert_called_once_with("Cached settings differ")
+
+    def test_stop_does_not_overwrite_pending_cache_conflict(self):
+        conflict = CacheSettingsConflict("Cached settings differ", 1)
+        self.send(conflict)
+        gui.stop_button_command()
+        self.assertIs(self.state.pending_upscale_status, conflict)
+        self.error.assert_not_called()
+
     def test_closeapp_queue_marker_does_not_abandon_lifecycle_polling(self):
         self.send(gui.CLOSE_APP_STATUS)
         self.assertIsNotNone(self.state.poll_after_id)
@@ -186,6 +265,7 @@ class CompletionTests(unittest.TestCase):
         self.assertTrue(gui.inputs_are_busy())
         self.process.join.assert_not_called()
         self.process.kill.assert_not_called()
+        self.state.status_bar.set_video_status.assert_called_with("stopping")
         self.process.is_alive.return_value = False
         self.send(gui.COMPLETED_STATUS)  # Completion racing a user stop is not success.
         self.state.info_message.set.assert_called_with("Upscaling stopped")
@@ -194,6 +274,8 @@ class CompletionTests(unittest.TestCase):
         self.assertIsNone(self.state.stop_deadline)
         self.assertFalse(gui.inputs_are_busy())
         self.thread.assert_not_called()
+        self.state.status_bar.set_video_status.assert_called_with("stopped")
+        self.state.status_bar.set_video_progress.assert_not_called()
 
     def test_stop_deadline_allows_checkpoint_then_kills_descendants_without_joining(self):
         child = Mock()

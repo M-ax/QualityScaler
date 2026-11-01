@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ import cv2
 
 from qualityscaler.ffmpeg import FFmpeg, UpscaleCancelled
 from qualityscaler.frame_store import FrameStore
-from qualityscaler.video import VideoSettings, VideoUpscaler, decode_frame
+from qualityscaler.video import CacheSettingsMismatch, VideoSettings, VideoUpscaler, decode_frame
 
 
 class FFmpegProcessTests(unittest.TestCase):
@@ -95,6 +96,97 @@ class FFmpegIntegrationTests(unittest.TestCase):
             "-i", str(self.source), "-c:v", "wmv2", "-c:a", "wmav2", str(source),
         ], check=True)
         return source
+
+    def test_real_decoder_and_ai_overlap_before_encoding_with_audio(self):
+        output = self.root / "streamed_upscaled.mp4"
+        cache = self.root / "streamed cache" / "frames.sqlite3"
+        first_saved = Event()
+        extraction_finished = Event()
+        original_extract = self.ffmpeg.extract
+
+        def extract(source, fps, stop, save_frame, **options):
+            def publish(index, data):
+                save_frame(index, data)
+                if index == 0:
+                    self.assertTrue(first_saved.wait(5), "AI waited for the real decoder to finish")
+            count = original_extract(source, fps, stop, publish, **options)
+            extraction_finished.set()
+            return count
+
+        def progress(snapshot):
+            if snapshot.upscaled and not first_saved.is_set():
+                self.assertFalse(extraction_finished.is_set())
+                self.assertFalse(snapshot.extraction_complete)
+                with FrameStore(cache, read_only=True) as store:
+                    self.assertEqual(store.frame_count("source"), 1)
+                    self.assertEqual(store.frame_count("upscaled"), 1)
+                first_saved.set()
+
+        with patch.object(self.ffmpeg, "extract", side_effect=extract):
+            VideoUpscaler(
+                ffmpeg=self.ffmpeg, engine_factory=lambda settings: ResizeEngine(),
+                executor_factory=ThreadPoolExecutor, checkpoint_interval=1, progress=progress,
+            ).run(self.source, output, cache, VideoSettings("FakeTestx2", keep_frames=True))
+        self.assertTrue(first_saved.is_set())
+        self.assertTrue(extraction_finished.is_set())
+        capture = cv2.VideoCapture(str(output))
+        try:
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 64)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 48)
+        finally:
+            capture.release()
+        subprocess.run([
+            self.ffmpeg.executable, "-v", "error", "-i", str(output),
+            "-map", "0:a:0", "-f", "null", "-",
+        ], check=True)
+
+    def test_settings_conflict_can_clear_only_its_cache_and_reencode_with_audio(self):
+        output = self.root / "reset_upscaled.mp4"
+        cache = self.root / "reset cache" / "frames.sqlite3"
+        settings = VideoSettings("FakeTestx2", input_resize_factor=0.5, keep_frames=True)
+        pipeline = VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=lambda settings: ResizeEngine(),
+            executor_factory=ThreadPoolExecutor,
+        )
+        pipeline.run(self.source, output, cache, settings)
+        previous_output = output.read_bytes()
+        previous_cache = cache.read_bytes()
+        changed = replace(settings, input_resize_factor=1.0)
+        with self.assertRaises(CacheSettingsMismatch):
+            pipeline.run(self.source, output, cache, changed)
+        self.assertEqual(output.read_bytes(), previous_output)
+        self.assertEqual(cache.read_bytes(), previous_cache)
+        unrelated = cache.parent / "notes.txt"
+        unrelated.write_text("Keep this file")
+        original_extract = self.ffmpeg.extract
+
+        def extract(*args, **kwargs):
+            # Clearing cached frames must not remove an existing export.
+            self.assertEqual(output.read_bytes(), previous_output)
+            return original_extract(*args, **kwargs)
+
+        with patch.object(self.ffmpeg, "extract", side_effect=extract) as extract:
+            pipeline.run(self.source, output, cache, changed, clear_cache=True)
+        extract.assert_called_once()
+        self.assertEqual(unrelated.read_text(), "Keep this file")
+        with FrameStore(cache, read_only=True) as store:
+            self.assertEqual(store.get_metadata("processing_settings"), changed.processing_settings())
+            self.assertEqual(store.get_metadata("stage"), "complete")
+            self.assertEqual(store.frame_count("source"), 5)
+            self.assertEqual(store.frame_count("upscaled"), 5)
+            self.assertEqual(decode_frame(store.get_frame("source", 0)).shape, (24, 32, 3))
+        capture = cv2.VideoCapture(str(output))
+        try:
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 64)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 48)
+        finally:
+            capture.release()
+        subprocess.run([
+            self.ffmpeg.executable, "-v", "error", "-i", str(output),
+            "-map", "0:a:0", "-f", "null", "-",
+        ], check=True)
 
     def test_scaled_extraction_resumes_without_resampling_inputs_twice(self):
         output = self.root / "scaled_upscaled.mp4"
@@ -219,13 +311,15 @@ class FFmpegIntegrationTests(unittest.TestCase):
             pipeline.run(source, output, cache, settings)
         with FrameStore(cache, read_only=True) as store:
             self.assertEqual(store.get_metadata("stage"), "paused")
-            self.assertEqual(store.frame_count("source"), 5)
+            self.assertGreater(store.frame_count("source"), 0)
+            self.assertLessEqual(store.frame_count("source"), 5)
+            extraction_complete = store.get_metadata("extraction_complete", False)
         stop.clear()
         messages = []
         pipeline.status = messages.append
-        with patch.object(self.ffmpeg, "extract",
-                          side_effect=AssertionError("Resume repeated WMV extraction")):
+        with patch.object(self.ffmpeg, "extract", wraps=self.ffmpeg.extract) as extract:
             pipeline.run(source, output, cache, settings)
+        self.assertEqual(extract.call_count, 0 if extraction_complete else 1)
         self.assertTrue(any("AAC audio fallback" in message for message in messages))
         capture = cv2.VideoCapture(str(output))
         try:

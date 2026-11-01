@@ -752,8 +752,8 @@ def refresh_encoder_controls():
         App.place_video_encoder_menus()
 
 
-def _processing_config(selected_files):
-    """One conversion rule for job startup and SQLite resume identity."""
+def _processing_config(selected_files, *, validate_video_options=True):
+    """Convert shared settings; previews do not consume encoding-only options."""
     preferences = app_state.preferences
     selected_files = list(selected_files)
     if preferences.ai_model not in MODEL_NAMES:
@@ -778,7 +778,8 @@ def _processing_config(selected_files):
         selected_video_extension=preferences.video_extension,
         selected_video_codec=preferences.video_codec,
         selected_video_options=(
-            _video_encoder_options() if any(check_if_file_is_video(path) for path in selected_files)
+            _video_encoder_options()
+            if validate_video_options and any(check_if_file_is_video(path) for path in selected_files)
             else EncoderOptions()
         ),
     )
@@ -998,9 +999,10 @@ def open_upscale_preview():
         app_state.info_message.set("Please select a file to preview")
         return
     try:
-        _processing_config(selected)  # Preview does not need output-drive disk space.
+        _processing_config(selected, validate_video_options=False)
         app_state.upscale_preview = UpscalePreview(
-            app_state.window, selected, lambda: _processing_config(selected),
+            app_state.window, selected,
+            lambda: _processing_config(selected, validate_video_options=False),
             lambda: setattr(app_state, "upscale_preview", None),
         )
     except (ValueError, OSError, RuntimeError, TclError) as error:

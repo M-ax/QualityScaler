@@ -19,6 +19,7 @@ from PIL import Image
 
 from qualityscaler import gui, preview_window, preview_worker
 from qualityscaler.config import ProcessingConfig
+from qualityscaler.encoders import EncoderOptions
 from qualityscaler.preview_window import ImageViewport, UpscalePreview, ZoomView
 from qualityscaler.preview_worker import PreviewRequest, PreviewResult
 
@@ -222,12 +223,43 @@ class PreviewWiringTests(unittest.TestCase):
             self.assertEqual(args[:2], (self.state.window, ["clip.mp4", "photo.png"]))
             self.assertEqual(args[2](), config())
             self.assertEqual(build.call_count, 2)
+            build.assert_called_with(["clip.mp4", "photo.png"], validate_video_options=False)
             gui.open_upscale_preview()
             constructor.assert_called_once()
             constructor.return_value.lift.assert_called_once()
             disk.assert_not_called()
             args[3]()
             self.assertIsNone(self.state.upscale_preview)
+
+    def test_preview_ignores_invalid_encoding_fields_but_jobs_still_validate_them(self):
+        self.state.preferences.video_codec = "x264"
+        for name, value in (
+            ("selected_input_resize_factor", "50"),
+            ("selected_output_resize_factor", "100"),
+            ("selected_VRAM_limiter", "4"),
+            ("selected_output_path", "unused"),
+            ("selected_video_crf", "invalid"),
+            ("selected_video_bitrate", ""),
+        ):
+            setattr(self.state, name, Mock(**{"get.return_value": value}))
+        for selected in (["clip.mp4"], ["clip.mp4", "photo.png"]):
+            self.state.file_widget.get_selected_file_list.return_value = selected
+            for mode in ("Bitrate", "CRF"):
+                with self.subTest(selected=selected, mode=mode), \
+                        patch.object(gui, "UpscalePreview") as constructor, \
+                        patch.object(gui, "check_disk_space") as disk:
+                    self.state.preferences.video_rate_control = mode
+                    self.state.info_message.reset_mock()
+                    gui.open_upscale_preview()
+                    constructor.assert_called_once()
+                    get_config = constructor.call_args.args[2]
+                    self.assertEqual(get_config().selected_video_options, EncoderOptions())
+                    self.assertEqual(get_config().selected_file_list, selected)
+                    self.state.info_message.set.assert_not_called()
+                    self.assertIsNone(gui.build_processing_config())
+                    self.state.info_message.set.assert_called_once()
+                    disk.assert_not_called()
+                    constructor.call_args.args[3]()
 
     def test_busy_or_empty_inputs_do_not_open_preview(self):
         with patch.object(gui, "UpscalePreview") as constructor:

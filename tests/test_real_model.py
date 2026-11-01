@@ -97,15 +97,16 @@ class RealModelIntegrationTests(unittest.TestCase):
                                  tiles_resolution=512, keep_frames=True)
         stop = Event()
 
-        def pause_after_saving(message):
-            if message.startswith("Upscaling video"):
+        def pause_after_saving(progress):
+            if progress.upscaled > 0:
                 stop.set()
 
         # Use the production engine factory, actual DirectML sessions, the
-        # default checkpoint interval, and real FFmpeg extraction.
+        # default checkpoint interval, and real FFmpeg extraction. Pause from
+        # saved-frame counts, not text that also retains earlier stage messages.
         with self.assertRaises(UpscaleCancelled):
             VideoUpscaler(
-                ffmpeg=ffmpeg, stop_event=stop, status=pause_after_saving,
+                ffmpeg=ffmpeg, stop_event=stop, progress=pause_after_saving,
             ).run(source, output, cache, settings)
         with FrameStore(cache, read_only=True) as store:
             total = 8  # The generated source, even if extraction was interrupted.

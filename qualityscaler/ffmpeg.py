@@ -179,7 +179,7 @@ class FFmpeg:
 
         Replayable frames allow video-codec and AAC audio fallbacks. Publish only
         a successful encode; never replace an existing output with a failed video.
-        A shared PipelineStatus keeps encoding alongside other active stages;
+        A shared PipelineStatus keeps encoding alongside other completed stages;
         status remains a string callback for standalone encoding callers.
         """
         if stop_event.is_set():
@@ -225,6 +225,8 @@ class FFmpeg:
                 f"{min(100, int(count * 100 / total_frames))}%"
                 if total_frames and total_frames > 0 else f"({count} frames)"
             )
+            if total_frames and count >= total_frames:
+                detail += " (finalizing)"
             reporter.update("encoding", f"{message} {detail}", completed=count)
 
         try:
@@ -263,11 +265,22 @@ class FFmpeg:
                     if stop_event.is_set():
                         raise UpscaleCancelled()
                     os.replace(partial, output)
-                    return
                 except RuntimeError:
                     if index == len(attempts) - 1:
                         raise
+                else:
+                    if reporter is not None:
+                        reporter.finish(
+                            "encoding", f"{message} 100%" if total_frames else None,
+                            completed=total_frames, total=total_frames,
+                        )
+                    return
+        except BaseException as error:
+            if reporter is not None:
+                reporter.interrupt(
+                    "stopped" if isinstance(error, UpscaleCancelled) else "error",
+                    stage="encoding",
+                )
+            raise
         finally:
             partial.unlink(missing_ok=True)
-            if reporter is not None:
-                reporter.finish("encoding")

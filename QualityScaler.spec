@@ -24,6 +24,7 @@ STANDARD_MODELS = (
 # Every model offered by the normal menu must work in the portable executable.
 required_files = (
     ROOT / "QualityScaler.py",
+    ROOT / "QualityScaler.manifest",
     ASSETS / "logo.ico",
     ASSETS / "logo.png",
     ASSETS / "ffmpeg.exe",
@@ -118,6 +119,8 @@ exe = EXE(
     name="QualityScaler",
     console=False,
     icon=str(ASSETS / "logo.ico"),
+    # A runtime opt-in is too late for the bootloader's native Tk splash.
+    manifest=str(ROOT / "QualityScaler.manifest"),
     debug=False,
     strip=False,
     upx=False,

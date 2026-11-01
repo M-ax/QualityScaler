@@ -216,9 +216,10 @@ class VideoUpscalerTests(unittest.TestCase):
         ]
         self.assertTrue(any("estimating..." not in line for line in upscale))
         self.assertIs(self.ffmpeg.encoding_options["progress"], runner.task_status)
-        self.assertEqual(messages[-1], "")
+        self.assertEqual([stage.state for stage in runner.task_status.stages], ["complete"] * 3)
+        self.assertEqual(messages[-1].count("Complete"), 3)
 
-    def test_interrupted_video_clears_its_latest_status(self):
+    def test_interrupted_video_retains_latest_status_without_false_completion(self):
         messages = []
 
         def status(message):
@@ -226,9 +227,163 @@ class VideoUpscalerTests(unittest.TestCase):
             if any(line.startswith("Upscaling video") for line in message.splitlines()):
                 self.stop.set()
 
+        runner = self.upscaler(status=status)
         with self.assertRaises(UpscaleCancelled):
-            self.run_job(self.upscaler(status=status))
-        self.assertEqual(messages[-1], "")
+            self.run_job(runner)
+        self.assertIn("Stopped", messages[-1])
+        self.assertEqual(runner.task_status.stages[1].state, "stopped")
+        self.assertEqual(runner.task_status.stages[2].state, "waiting")
+
+    def test_completed_extraction_and_upscaling_remain_visible_during_encoding(self):
+        snapshots = []
+        runner = self.upscaler(progress=snapshots.append)
+        original_encode = self.ffmpeg.encode
+
+        def encode(*args, **kwargs):
+            extracted, upscaled, encoding = snapshots[-1].stages
+            self.assertEqual(extracted.state, "complete")
+            self.assertEqual(upscaled.state, "complete")
+            self.assertEqual(encoding.state, "running")
+            self.assertEqual((extracted.completed, extracted.total), (5, 5))
+            self.assertEqual((upscaled.completed, upscaled.total), (5, 5))
+            self.assertEqual((extracted.remaining_seconds, upscaled.remaining_seconds), (0, 0))
+            self.assertTrue(extracted.eta)
+            self.assertTrue(upscaled.eta)
+            finished = (extracted, upscaled)
+            kwargs["progress"].update("encoding", "Encoding 100% (finalizing)", completed=5)
+            self.assertEqual(snapshots[-1].stages[:2], finished)
+            self.assertEqual(snapshots[-1].stages[2].state, "running")
+            original_encode(*args, **kwargs)
+
+        with patch.object(self.ffmpeg, "encode", side_effect=encode):
+            self.run_job(runner)
+        self.assertEqual([stage.state for stage in snapshots[-1].stages], ["complete"] * 3)
+        self.assertEqual(snapshots[-1].stages[:2], snapshots[-2].stages[:2])
+
+    def test_encoding_interruption_preserves_prior_success_but_not_encoding_success(self):
+        for error in (RuntimeError("Encoder failed"), UpscaleCancelled()):
+            with self.subTest(error=type(error).__name__):
+                self.cache = self.directory / type(error).__name__ / "frames.sqlite3"
+                snapshots = []
+                runner = self.upscaler(progress=snapshots.append)
+
+                def encode(*args, **kwargs):
+                    kwargs["progress"].update("encoding", "Encoding 100% (finalizing)", completed=5)
+                    raise error
+
+                with patch.object(self.ffmpeg, "encode", side_effect=encode):
+                    with self.assertRaises(type(error)):
+                        self.run_job(runner)
+                extracted, upscaled, encoding = snapshots[-1].stages
+                self.assertEqual(extracted.state, "complete")
+                self.assertEqual(upscaled.state, "complete")
+                self.assertEqual(encoding.state, "stopped" if isinstance(error, UpscaleCancelled) else "error")
+                self.assertEqual(encoding.completed, 5)
+                self.assertIn("finalizing", encoding.message)
+
+    def test_resumed_cache_restores_completed_stages_without_repeating_work(self):
+        self.run_job()
+        self.calls.clear()
+        snapshots = []
+        runner = self.upscaler(progress=snapshots.append)
+
+        def encode(*args, **kwargs):
+            extracted, upscaled, encoding = snapshots[-1].stages
+            self.assertEqual(extracted.state, "complete")
+            self.assertEqual(upscaled.state, "complete")
+            self.assertIn("cached", extracted.message)
+            self.assertEqual((extracted.completed, upscaled.completed), (5, 5))
+            self.assertEqual(encoding.state, "running")
+
+        with patch.object(self.ffmpeg, "encode", side_effect=encode):
+            self.run_job(runner)
+        self.assertEqual(self.ffmpeg.extractions, 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual([stage.state for stage in snapshots[-1].stages], ["complete"] * 3)
+
+    def test_reused_runner_resets_all_stage_rows_and_counters_for_the_next_job(self):
+        snapshots = []
+        runner = self.upscaler(progress=snapshots.append)
+        self.run_job(runner)
+        snapshots.clear()
+        self.cache = self.directory / "next-job" / "frames.sqlite3"
+        self.run_job(runner)
+        initial = snapshots[0]
+        self.assertEqual((initial.extracted, initial.upscaled, initial.total), (0, 0, None))
+        self.assertFalse(initial.extraction_complete)
+        self.assertEqual([stage.state for stage in initial.stages], ["waiting"] * 3)
+        self.assertTrue(all(stage.completed == 0 for stage in initial.stages))
+
+    def test_decoder_failure_at_100_percent_does_not_complete_extraction(self):
+        original_extract = self.ffmpeg.extract
+
+        def extract(*args, **kwargs):
+            original_extract(*args, **kwargs)
+            raise RuntimeError("Decoder finalization failed")
+
+        runner = self.upscaler()
+        with patch.object(self.ffmpeg, "extract", side_effect=extract):
+            with self.assertRaisesRegex(RuntimeError, "Decoder finalization failed"):
+                self.run_job(runner)
+        extraction = runner.task_status.stages[0]
+        self.assertEqual(extraction.completed, 5)
+        self.assertEqual(extraction.state, "error")
+        self.assertTrue(extraction.estimated_total)
+        self.assertEqual(self.ffmpeg.encodings, 0)
+
+    def test_decoder_count_validation_failure_does_not_complete_extraction(self):
+        original_extract = self.ffmpeg.extract
+
+        def extract(*args, **kwargs):
+            return original_extract(*args, **kwargs) + 1
+
+        runner = self.upscaler()
+        with patch.object(self.ffmpeg, "extract", side_effect=extract):
+            with self.assertRaisesRegex(ValueError, "Extracted frame count does not match"):
+                self.run_job(runner)
+        self.assertEqual(runner.task_status.stages[0].state, "error")
+        self.assertEqual(self.ffmpeg.encodings, 0)
+
+    def test_upscaling_cleanup_failure_after_all_frames_never_completes_upscaling(self):
+        class FailingShutdownExecutor(ThreadPoolExecutor):
+            def shutdown(self, **kwargs):
+                super().shutdown(**kwargs)
+                raise RuntimeError("Worker cleanup failed")
+
+        runner = self.upscaler(executor_factory=FailingShutdownExecutor)
+        with self.assertRaisesRegex(RuntimeError, "Worker cleanup failed"):
+            self.run_job(runner)
+        extracted, upscaled, encoding = runner.task_status.stages
+        self.assertEqual(extracted.state, "complete")
+        self.assertEqual(upscaled.completed, 5)
+        self.assertEqual(upscaled.state, "error")
+        self.assertEqual(encoding.state, "waiting")
+        self.assertEqual(self.ffmpeg.encodings, 0)
+
+    def test_final_upscaling_commit_failure_does_not_complete_upscaling(self):
+        cleaned_up = Event()
+        original_commit = FrameStore.commit
+
+        class ObservedExecutor(ThreadPoolExecutor):
+            def shutdown(self, **kwargs):
+                super().shutdown(**kwargs)
+                cleaned_up.set()
+
+        def commit(store):
+            if cleaned_up.is_set():
+                raise RuntimeError("Final commit failed")
+            original_commit(store)
+
+        runner = self.upscaler(executor_factory=ObservedExecutor)
+        with patch.object(FrameStore, "commit", commit):
+            with self.assertRaisesRegex(RuntimeError, "Final commit failed"):
+                self.run_job(runner)
+        extracted, upscaled, encoding = runner.task_status.stages
+        self.assertEqual(extracted.state, "complete")
+        self.assertEqual(upscaled.completed, 5)
+        self.assertEqual(upscaled.state, "error")
+        self.assertEqual(encoding.state, "waiting")
+        self.assertEqual(self.ffmpeg.encodings, 0)
 
     def test_new_jobs_cache_input_scaled_frames_and_normalize_worker_factor(self):
         seen = []
@@ -644,8 +799,12 @@ class VideoUpscalerTests(unittest.TestCase):
                 self.cache = self.directory / str(expected) / "frames.sqlite3"
                 snapshots = []
                 self.run_job(self.upscaler(progress=snapshots.append))
+                extracting = next(
+                    snapshot for snapshot in snapshots
+                    if snapshot.stages[0].state == "running"
+                )
                 self.assertEqual(
-                    snapshots[0].total,
+                    extracting.total,
                     int(expected) if math.isfinite(expected) and expected > 0 else None,
                 )
                 self.assertEqual(snapshots[-1].total, 5)

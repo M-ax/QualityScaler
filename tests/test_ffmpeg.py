@@ -98,7 +98,8 @@ class FFmpegStatusTests(unittest.TestCase):
         self.assertTrue(lines[1].startswith("Encoding upscaled video 50% | Remaining: 2s"))
         self.assertNotIn("Upscaling video 0%", message)
         self.assertEqual(message.count("ETA (local):"), 2)
-        self.assertNotIn("Encoding", self.messages[-1])
+        self.assertIn("Encoding upscaled video 100%", self.messages[-1])
+        self.assertEqual(self.progress.stages[2].state, "complete")
         self.assertTrue(self.messages[-1].startswith("Upscaling video 20%"))
 
     def test_codec_retry_resets_timing_and_keeps_fallback_in_latest_status(self):
@@ -122,9 +123,10 @@ class FFmpegStatusTests(unittest.TestCase):
                           total_frames=100, progress=self.progress)
         self.assertEqual(len(attempts), 2)
         fallback = [message for message in self.messages if "x264 fallback" in message]
-        self.assertEqual(len(fallback), 2)
+        self.assertEqual(len(fallback), 3)
         self.assertIn("ETA (local): estimating...", fallback[0])
         self.assertIn("Encoding upscaled video (x264 fallback) 20% | Remaining: 8s", fallback[1])
+        self.assertEqual(self.progress.stages[2].state, "complete")
 
     def test_unknown_encoding_total_reports_frames_without_a_fake_percentage(self):
         @contextmanager
@@ -141,15 +143,22 @@ class FFmpegStatusTests(unittest.TestCase):
         self.assertIn("Encoding upscaled video (5 frames)", message)
         self.assertIn("ETA (local): estimating...", message)
         self.assertNotIn("%", message)
-        self.assertEqual(self.messages[-1], "")
+        self.assertEqual(self.progress.stages[2].completed, 5)
+        self.assertEqual(self.progress.stages[2].state, "complete")
 
-    def test_failed_or_cancelled_encoding_clears_its_latest_status(self):
+    def test_failed_or_cancelled_encoding_never_completes_at_100_percent(self):
         for error in (RuntimeError("Encoder failed"), UpscaleCancelled()):
             with self.subTest(error=type(error).__name__):
+                self.progress.clear()
+                self.progress.finish("extracting", "Extraction saved", completed=10, total=10)
+                self.progress.finish("upscaling", "Upscaling saved", completed=10, total=10)
+                finished = self.progress.stages[:2]
+
                 @contextmanager
                 def pipe(arguments, stop, *, writing, progress):
                     self.time += 10
-                    progress(5)
+                    progress(10)
+                    self.assertEqual(self.progress.stages[2].state, "running")
                     yield BytesIO()
                     raise error
 
@@ -159,7 +168,94 @@ class FFmpegStatusTests(unittest.TestCase):
                         ffmpeg.encode("source.mp4", self.output, 24, "x264",
                                       iter([b"jpeg"]), Event(), total_frames=10,
                                       progress=self.progress)
-                self.assertEqual(self.messages[-1], "")
+                self.assertEqual(self.progress.stages[:2], finished)
+                encoding = self.progress.stages[2]
+                self.assertEqual(encoding.state, "stopped" if isinstance(error, UpscaleCancelled) else "error")
+                self.assertEqual(encoding.completed, 10)
+                self.assertIn("100% (finalizing)", encoding.message)
+                self.assertFalse(self.output.exists())
+
+    def test_encoding_success_waits_for_finalization_and_output_replace(self):
+        self.progress.finish("extracting", "Extraction saved", completed=10, total=10)
+        self.progress.finish("upscaling", "Upscaling saved", completed=10, total=10)
+        finished = self.progress.stages[:2]
+        events = []
+
+        @contextmanager
+        def pipe(arguments, stop, *, writing, progress):
+            progress(10)
+            self.assertEqual(self.progress.stages[2].state, "running")
+            self.assertIn("finalizing", self.progress.stages[2].message)
+            yield BytesIO()
+            self.assertEqual(self.progress.stages[2].state, "running")
+            self.assertEqual(self.progress.stages[:2], finished)
+            events.append("finalized")
+
+        def replace(partial, output):
+            self.assertEqual(events, ["finalized"])
+            self.assertEqual(self.progress.stages[2].state, "running")
+            self.assertEqual(self.progress.stages[:2], finished)
+            events.append("replaced")
+
+        ffmpeg = FFmpeg()
+        with patch.object(ffmpeg, "_pipe", side_effect=pipe), \
+                patch("qualityscaler.ffmpeg.os.replace", side_effect=replace):
+            ffmpeg.encode("source.mp4", self.output, 24, "x264", [b"jpeg"], Event(),
+                          total_frames=10, progress=self.progress)
+        self.assertEqual(events, ["finalized", "replaced"])
+        self.assertEqual(self.progress.stages[:2], finished)
+        self.assertEqual(self.progress.stages[2].state, "complete")
+        self.assertNotIn("finalizing", self.progress.stages[2].message)
+        self.assertFalse(any(self.output.parent.glob(".*.partial-*")))
+
+    def test_output_replace_failure_does_not_complete_encoding(self):
+        self.output.write_bytes(b"previous output")
+
+        @contextmanager
+        def pipe(arguments, stop, *, writing, progress):
+            progress(10)
+            yield BytesIO()
+
+        ffmpeg = FFmpeg()
+        with patch.object(ffmpeg, "_pipe", side_effect=pipe), \
+                patch("qualityscaler.ffmpeg.os.replace", side_effect=PermissionError("Output is locked")):
+            with self.assertRaisesRegex(PermissionError, "Output is locked"):
+                ffmpeg.encode("source.mp4", self.output, 24, "x264", [b"jpeg"], Event(),
+                              total_frames=10, progress=self.progress)
+        self.assertEqual(self.progress.stages[2].state, "error")
+        self.assertEqual(self.output.read_bytes(), b"previous output")
+        self.assertFalse(any(self.output.parent.glob(".*.partial-*")))
+
+    def test_audio_and_codec_retries_reset_only_encoding(self):
+        self.progress.finish("extracting", "Extraction saved", completed=100, total=100)
+        self.progress.finish("upscaling", "Upscaling saved", completed=100, total=100)
+        finished = self.progress.stages[:2]
+        starts = []
+
+        @contextmanager
+        def pipe(arguments, stop, *, writing, progress):
+            encoding = self.progress.stages[2]
+            starts.append(encoding)
+            self.assertEqual(encoding.state, "running")
+            self.assertEqual(encoding.completed, 0)
+            self.assertIsNone(encoding.remaining_seconds)
+            self.assertIsNone(encoding.eta)
+            self.assertEqual(self.progress.stages[:2], finished)
+            self.time += 10
+            progress(100)
+            yield BytesIO()
+            if len(starts) < 4:
+                raise RuntimeError("Retry with another codec/audio combination")
+
+        ffmpeg = FFmpeg()
+        with patch.object(ffmpeg, "_pipe", side_effect=pipe):
+            ffmpeg.encode("source.mp4", self.output, 24, "h264_nvenc", [b"jpeg"], Event(),
+                          total_frames=100, progress=self.progress)
+        self.assertEqual(len(starts), 4)
+        self.assertIn("x264 fallback", starts[1].message)
+        self.assertIn("AAC audio fallback", starts[2].message)
+        self.assertEqual(self.progress.stages[:2], finished)
+        self.assertEqual(self.progress.stages[2].state, "complete")
 
 
 class ResizeEngine:

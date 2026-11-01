@@ -44,7 +44,6 @@ from customtkinter import (
     CTk, CTkFrame, CTkButton, CTkCheckBox, CTkEntry, CTkFont, CTkImage, CTkLabel,
     CTkOptionMenu, CTkProgressBar, CTkScrollableFrame, CTkToplevel,
     filedialog, set_appearance_mode, set_default_color_theme,
-    set_widget_scaling, set_window_scaling,
 )
 
 from .ai import get_model_upscale_factor
@@ -53,6 +52,7 @@ from .catalog import (
     MODEL_NAMES, VRAM_model_usage,
 )
 from .config import ProcessingConfig
+from .dpi import configure_high_dpi
 from .drag_drop import FileDropTarget, FileDropWindow
 from .formats import VIDEO_EXTENSIONS
 from .gpu import GPU, get_AI_engine_info
@@ -90,7 +90,6 @@ UI_ACCENT_COLOR = CARD_ACCENT_COLOR
 UI_BORDER_COLOR = CARD_BORDER_COLOR
 UI_CORNER_RADIUS = 6
 
-zoom_option_list = ["50%", "75%", "100%", "125%", "150%", "175%"]
 AI_multithreading_list = ["OFF", "2 threads", "4 threads", "6 threads", "8 threads"]
 sharpening_list = ["OFF", "Low", "High"]
 gpus_list = ["No GPU found"]
@@ -116,7 +115,6 @@ CLOSE_APP_STATUS = "CloseApp"
 
 @dataclass
 class UserPreferences:
-    app_zoom: str = "100%"
     ai_model: str = AI_models_list[0]
     ai_multithreading: str = AI_multithreading_list[0]
     gpu: str = gpus_list[0]
@@ -952,11 +950,6 @@ def open_upscale_preview():
         app_state.info_message.set(f"Cannot open preview: {error}")
 
 
-def apply_app_zoom(zoom):
-    set_window_scaling(zoom)
-    set_widget_scaling(zoom)
-
-
 def apply_auto_vram_for_gpu(selected_gpu, fallback=None):
     detected = GPU.vram_for(selected_gpu)
     value = str(detected) if detected is not None else fallback
@@ -980,9 +973,11 @@ def open_info_messagebox(title, subtitle, option_list):
 # Process control: Tk owns UI updates; no GUI callbacks run on worker threads.
 
 def _display_status(status: str | VideoProgress):
-    """Keep the general message and both video rows in sync on Tk's thread."""
+    """Keep the header and dedicated video stage rows in sync on Tk's thread."""
     progress = status if isinstance(status, VideoProgress) else None
     message = progress.message if progress is not None else status
+    if getattr(progress, "stages", ()):
+        message = "Processing video"
     app_state.info_message.set(message)
     if app_state.status_bar is not None:
         app_state.status_bar.set_video_progress(progress)
@@ -1274,7 +1269,6 @@ def _start_upscale(config, *, retry_from=None, clear_cache=False):
 # Preferences and lifecycle --------------------------------------------------
 
 _PREFERENCE_FIELDS = {
-    "app_zoom": "default_app_zoom",
     "ai_model": "default_AI_model",
     "ai_multithreading": "default_AI_multithreading",
     "gpu": "default_gpu",
@@ -1311,7 +1305,7 @@ def load_user_preferences():
     except (OSError, ValueError):
         return UserPreferences()
     preferences = UserPreferences()
-    choices = dict(app_zoom=zoom_option_list, ai_model=MODEL_NAMES,
+    choices = dict(ai_model=MODEL_NAMES,
                    ai_multithreading=AI_multithreading_list, sharpening=sharpening_list,
                    image_extension=image_extension_list, video_extension=video_extension_list,
                    video_codec=[codec for codec in video_codec_list if codec != "----"])
@@ -1440,7 +1434,7 @@ class App:
         app_state.action_panel.grid_columnconfigure(0, weight=1)
         self.place_loadFile_section()
         self.place_app_name()
-        self.place_app_zoom_and_links()
+        self.place_links()
         self.place_preview_link()
         self.place_AI_menu()
         self.place_AI_sharpening_menu()
@@ -1486,26 +1480,15 @@ class App:
         label.grid(row=0, column=0, sticky="w")
 
     @staticmethod
-    def place_app_zoom_and_links():
-        label = CTkLabel(
-            app_state.header, text="Zoom", width=35, height=22,
-            fg_color="transparent", bg_color=background_color,
-            text_color=CARD_TITLE_COLOR, font=bold13, anchor="w",
-        )
-        menu = App.create_option_menu(
-            App.select_app_zoom, zoom_option_list, app_state.preferences.app_zoom,
-            width=71, master=app_state.header,
-        )
-        label.grid(row=0, column=1, padx=(8, 4))
-        menu.grid(row=0, column=2, padx=(0, 8))
+    def place_links():
         telegram = App.create_link_button(
             lambda: open_browser(telegramme, new=1), logo_telegram, master=app_state.header,
         )
         github = App.create_link_button(
             lambda: open_browser(githubme, new=1), logo_git, master=app_state.header,
         )
-        telegram.grid(row=0, column=3, padx=(0, 6))
-        github.grid(row=0, column=4)
+        telegram.grid(row=0, column=1, padx=(8, 6))
+        github.grid(row=0, column=2)
 
     @staticmethod
     def place_preview_link():
@@ -1515,7 +1498,7 @@ class App:
             text_color=UI_ACCENT_COLOR, font=bold13, anchor="w",
             width=150, height=28,
         )
-        link.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        link.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     @staticmethod
     def _single_option(row, title, subtitle, help_text, command, choices, value):
@@ -1783,11 +1766,6 @@ class App:
         App._place_action(upscale_button_command, "UPSCALE", upscale_icon)
 
     @staticmethod
-    def select_app_zoom(value):
-        app_state.preferences.app_zoom = value
-        apply_app_zoom(float(value.replace("%", "")) / 100)
-
-    @staticmethod
     def select_AI_from_menu(value):
         app_state.preferences.ai_model = value
         update_file_widget()
@@ -1946,7 +1924,7 @@ def _load_ui_resources():
 
     def icon(name, size):
         with pillow_image_open(find_by_relative_path(f"Assets{os_separator}{name}")) as image:
-            # Keep enough pixels for high-DPI/175% zoom without retaining the
+            # Keep enough pixels for high-DPI displays without retaining the
             # original 1280–2048px artwork for a 15–18px toolbar icon.
             image.thumbnail((size[0] * 4, size[1] * 4))
             return CTkImage(image.copy(), size=size)
@@ -1959,11 +1937,11 @@ def _load_ui_resources():
 
 def main():
     global app_state
+    configure_high_dpi()
     preferences = load_user_preferences()
     app_state = AppState(preferences=preferences)
     set_appearance_mode("Dark")
     set_default_color_theme("dark-blue")
-    apply_app_zoom(float(preferences.app_zoom.replace("%", "")) / 100)
     manager = multiprocessing_Manager()
     try:
         app_state.process_status_q = manager.Queue(maxsize=1)

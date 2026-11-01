@@ -27,6 +27,7 @@ STANDARD_MODELS = (
 )
 REQUIRED_FILES = (
     "QualityScaler.py",
+    "QualityScaler.manifest",
     "Assets/logo.ico",
     "Assets/logo.png",
     "Assets/ffmpeg.exe",
@@ -231,6 +232,27 @@ class BuildSpecTests(unittest.TestCase):
         self.assertIs(options["console"], False)
         self.assertIs(options["upx"], False)
         self.assertNotIn("exclude_binaries", options)
+
+    def test_manifest_establishes_per_monitor_dpi_before_native_splash(self):
+        from xml.etree import ElementTree
+
+        self.execute_spec()
+        self.assertEqual(
+            self.exe.call_args.kwargs["manifest"], str(self.root / "QualityScaler.manifest"),
+        )
+        manifest = ElementTree.parse(ROOT / "QualityScaler.manifest")
+        ns = {
+            "asm": "urn:schemas-microsoft-com:asm.v3",
+            "dpi2005": "http://schemas.microsoft.com/SMI/2005/WindowsSettings",
+            "dpi2016": "http://schemas.microsoft.com/SMI/2016/WindowsSettings",
+        }
+        settings = manifest.find("asm:application/asm:windowsSettings", ns)
+        self.assertIsNotNone(settings)
+        self.assertEqual(settings.find("dpi2005:dpiAware", ns).text, "true/pm")
+        self.assertEqual(settings.find("dpi2016:dpiAwareness", ns).text, "PerMonitor")
+        self.assertEqual(settings.find("dpi2016:longPathAware", ns).text, "true")
+        execution = manifest.find(".//asm:requestedExecutionLevel", ns)
+        self.assertEqual(execution.attrib, {"level": "asInvoker", "uiAccess": "false"})
 
     def test_each_required_local_file_fails_before_collection_or_analysis(self):
         for name in REQUIRED_FILES:

@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from qualityscaler import gui
-from qualityscaler.status import VideoProgress
+from qualityscaler.status import PipelineStatus, VideoProgress
 
 
 @unittest.skipUnless(sys.platform == "win32" or os.environ.get("DISPLAY"),
@@ -246,6 +246,36 @@ class DesktopLayoutTests(unittest.TestCase):
                     bar.label.yview_moveto(1)
                     window.update()
                     self.assertEqual(bar.label._textbox.yview()[1], 1)
+        self.run_desktop(check)
+
+    def test_both_task_timings_are_visible_at_minimum_width_and_all_zooms(self):
+        time = 0
+        messages = []
+        reporter = PipelineStatus(messages.append, clock=lambda: time)
+        reporter.start("extract", "Extracting video frames", total=100)
+        reporter.start("upscale", "Upscaling video", total=100)
+        time = 93784
+        reporter.update("extract", "Extracting video frames 50% (50 saved)", completed=50)
+        reporter.update("upscale", "Upscaling video 25% (25/100 saved)", completed=25)
+        message = f"2. {messages[-1]}"
+
+        def check(window):
+            state = gui.app_state
+            gui.App.place_stop_button()
+            for zoom in gui.zoom_option_list:
+                gui.App.select_app_zoom(zoom)
+                window.geometry("1000x540")
+                gui._display_status(VideoProgress(message, 50, 25, 100, False))
+                window.update()
+                bar = state.status_bar
+                with self.subTest(zoom=zoom):
+                    self.assertEqual(bar.label.get("1.0", "end-1c"), message)
+                    self.assertEqual(bar.label._textbox.yview(), (0.0, 1.0))
+                    self.assertTrue(bar.video_rows.winfo_ismapped())
+                    self.assertLessEqual(
+                        state.action_button.winfo_rooty() + state.action_button.winfo_height(),
+                        bar.winfo_rooty(),
+                    )
         self.run_desktop(check)
 
     def test_video_rows_remain_during_encoding_and_reset_for_images(self):

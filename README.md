@@ -348,6 +348,13 @@ cache conversion.
 - Only one runner may own a cache at a time. A crash-released OS lock prevents
   simultaneous GUI/CLI resumes from mixing job state. Its tiny, stable lock file
   lives in the OS temporary directory, not among the cached frames.
+- The status bar keeps only the latest status for each active task, on separate
+  lines. Each task has its own remaining time (for example, `1d 2h 3m 4s`) and ETA
+  in the system's local date/time and timezone; estimates are not combined.
+  A task shows `estimating...` until it has a known total and measured progress.
+  These are stage estimates, not predictions for unstarted stages or later files
+  in the batch. Resumed inference measures only newly processed frames, and
+  encoding retries reset their estimate.
 
 Inspect the saved settings/progress, or resume directly using the recorded
 configuration without re-entering it in the GUI:

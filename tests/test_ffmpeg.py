@@ -88,6 +88,81 @@ class FFmpegIntegrationTests(unittest.TestCase):
             "-c:v", "libx264", "-c:a", "aac", "-shortest", str(self.source),
         ], check=True)
 
+    def make_wmv(self):
+        source = self.root / "old family's vidéo.WMV"
+        subprocess.run([
+            self.ffmpeg.executable, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(self.source), "-c:v", "wmv2", "-c:a", "wmav2", str(source),
+        ], check=True)
+        return source
+
+    def test_wmv_with_wma_audio_pauses_resumes_and_exports_mp4_with_aac(self):
+        source = self.make_wmv()
+        output = self.root / "wmv_upscaled.mp4"
+        cache = self.root / "wmv cache" / "frames.sqlite3"
+        settings = VideoSettings("FakeTestx2", workers=2, keep_frames=True)
+        stop = Event()
+
+        def pause(message):
+            if message.startswith("Upscaling video"):
+                stop.set()
+
+        pipeline = VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=lambda settings: ResizeEngine(),
+            executor_factory=ThreadPoolExecutor, stop_event=stop, status=pause,
+        )
+        with self.assertRaises(UpscaleCancelled):
+            pipeline.run(source, output, cache, settings)
+        with FrameStore(cache, read_only=True) as store:
+            self.assertEqual(store.get_metadata("stage"), "paused")
+            self.assertEqual(store.frame_count("source"), 5)
+        stop.clear()
+        messages = []
+        pipeline.status = messages.append
+        with patch.object(self.ffmpeg, "extract",
+                          side_effect=AssertionError("Resume repeated WMV extraction")):
+            pipeline.run(source, output, cache, settings)
+        self.assertTrue(any("AAC audio fallback" in message for message in messages))
+        capture = cv2.VideoCapture(str(output))
+        try:
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FPS), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 64)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 48)
+            self.assertTrue(capture.read()[0])
+        finally:
+            capture.release()
+        # ADTS accepts AAC, not WMA: this checks a real container-compatible
+        # audio conversion, not merely the existence of an output stream.
+        audio = subprocess.run([
+            self.ffmpeg.executable, "-v", "error", "-i", str(output),
+            "-map", "0:a:0", "-c:a", "copy", "-f", "adts", "-",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+        self.assertGreater(len(audio), 7)
+        self.assertEqual(audio[0], 0xFF)
+        self.assertEqual(audio[1] & 0xF0, 0xF0)
+        with FrameStore(cache, read_only=True) as store:
+            self.assertEqual(store.get_metadata("stage"), "complete")
+            self.assertEqual(store.frame_count("upscaled"), 5)
+
+    def test_wmv_audio_still_passes_through_when_container_supports_wma(self):
+        source = self.make_wmv()
+        frames = []
+        self.ffmpeg.extract(source, 5, Event(), lambda index, data: frames.append(data))
+        output = self.root / "wmv_upscaled.mkv"
+        messages = []
+        with patch.object(self.ffmpeg, "_pipe", wraps=self.ffmpeg._pipe) as pipe:
+            self.ffmpeg.encode(source, output, 5, "x264", frames, Event(),
+                               total_frames=5, status=messages.append)
+        self.assertEqual(pipe.call_count, 1)
+        arguments = pipe.call_args.args[0]
+        self.assertEqual(arguments[arguments.index("-c:a") + 1], "copy")
+        self.assertFalse(any("AAC audio fallback" in message for message in messages))
+        subprocess.run([
+            self.ffmpeg.executable, "-v", "error", "-i", str(output),
+            "-map", "0:a:0", "-f", "null", "-",
+        ], check=True)
+
     def test_real_extract_cached_upscale_encode_and_resume_with_audio(self):
         cache = self.root / "cache" / "frames.sqlite3"
         output = self.root / "upscaled ünicode.mp4"

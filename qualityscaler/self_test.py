@@ -35,6 +35,7 @@ def _check_gui(report, root):
 
     first = root / "résumé {one}.png"
     second = root / "another image.PNG"
+    wmv = root / "input.wmv"
     notes = root / "notes.txt"
     broken = root / "broken.png"
     folder = root / "folder.mp4"
@@ -73,12 +74,12 @@ def _check_gui(report, root):
                 finally:
                     window.tk.call("tkdnd::olednd::HandleDragLeave", target._w)
 
-            expected = [str(first.resolve()), str(second.resolve())]
+            expected = [str(first.resolve()), str(second.resolve()), str(wmv.resolve())]
             if drop([first, notes, folder, broken]) != "copy":
                 raise RuntimeError("Native file drop was not accepted")
             if gui.app_state.file_widget.get_selected_file_list() != expected[:1]:
                 raise RuntimeError("Drop did not filter unsupported/unreadable inputs")
-            if drop([first, second]) != "copy":
+            if drop([first, second, wmv]) != "copy":
                 raise RuntimeError("Dropping more files into a populated list failed")
             if gui.app_state.file_widget.get_selected_file_list() != expected:
                 raise RuntimeError("Repeated drops replaced or duplicated selected inputs")
@@ -98,9 +99,10 @@ def _check_gui(report, root):
             gui.clear_input_files()
             if gui.app_state.file_widget is not None or gui.app_state.selected_file_list:
                 raise RuntimeError("Clear did not reset the input selection")
-            if drop([second]) != "copy" or gui.app_state.file_widget.get_selected_file_list() != expected[1:]:
+            if drop([wmv]) != "copy" or gui.app_state.file_widget.get_selected_file_list() != expected[2:]:
                 raise RuntimeError("File drops stopped working after clearing the list")
             report["file_drop_verified"] = True
+            report["wmv_file_drop_verified"] = True
         finally:
             # Do not invoke on_app_close, which persists user preferences.
             gui._destroy_window()
@@ -126,7 +128,6 @@ def _check_bundle(root, report):
     from .paths import find_by_relative_path
     from .video import VideoSettings, VideoUpscaler
 
-    _check_gui(report, root)
     model = Path(find_by_relative_path("AI-onnx/RealESR_Gx4_fp16.onnx"))
     bundled_ffmpeg = Path(find_by_relative_path("Assets/ffmpeg.exe"))
     ffmpeg = FFmpeg()
@@ -176,16 +177,17 @@ def _check_bundle(root, report):
         raise RuntimeError(f"No DirectML kernels executed: {executed}")
     report["executed_providers"] = executed
 
-    source = root / "input.mp4"
+    source = root / "input.wmv"
     output = root / "input_upscaled.mp4"
-    cache = root / "input.mp4.qualityscaler" / "frames.sqlite3"
+    cache = root / "input.wmv.qualityscaler" / "frames.sqlite3"
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     subprocess.run([
         ffmpeg.executable, "-y", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", "testsrc2=size=48x32:rate=4:duration=2",
         "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-        "-c:v", "libx264", "-c:a", "aac", "-shortest", str(source),
+        "-c:v", "wmv2", "-c:a", "wmav2", "-shortest", str(source),
     ], check=True, creationflags=flags)
+    _check_gui(report, root)
     settings = VideoSettings("RealESR_Gx4", workers=2, tiles_resolution=512, keep_frames=True)
     factory = partial(verified_engine, frozen=report["frozen"])
     stop = Event()
@@ -250,10 +252,18 @@ def _check_bundle(root, report):
         ffmpeg.executable, "-v", "error", "-i", str(output),
         "-map", "0:a:0", "-f", "null", "-",
     ], check=True, creationflags=flags)
+    audio = subprocess.run([
+        ffmpeg.executable, "-v", "error", "-i", str(output),
+        "-map", "0:a:0", "-c:a", "copy", "-f", "adts", "-",
+    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=flags).stdout
+    if len(audio) < 8 or audio[0] != 0xFF or audio[1] & 0xF0 != 0xF0:
+        raise RuntimeError("WMV audio was not converted to valid AAC")
     report.update({
         "frames": decoded, "fps": fps, "width": 192, "height": 128,
         "frames_before_pause": saved, "frames_resumed": len(submitted),
         "audio_preserved": True, "workers": settings.workers,
+        "input_format": "wmv", "audio_codec": "aac",
         "cache_files": sorted(path.name for path in cache.parent.iterdir()),
     })
 

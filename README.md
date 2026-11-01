@@ -59,7 +59,7 @@ native file drag-and-drop.
 - Automatic GPU detection by name, with dedicated VRAM information
 - DirectML inference when available, with CPU fallback when DirectML is unavailable
 - Compatible images - jpg, png, tif, bmp, webp, heic
-- Compatible video - mp4, webm, mkv, flv, gif, avi, mov, mpg, qt, 3gp
+- Compatible video - mp4, wmv, webm, mkv, flv, gif, avi, mov, mpg, qt, 3gp
 - Automatic overlapping, feathered image tiling to reduce seams and limit VRAM use
 - Resize image/video before upscaling and scale the output resolution
 - AI sharpening: OFF, Low, or High (the 2026 control replaces the old blending UI)
@@ -260,6 +260,10 @@ cache conversion.
 - Encoding streams cached frames in frame-index order directly to FFmpeg, with
   optional source audio and supported video metadata. Failed encoding retains
   the frames. The final output is replaced only after FFmpeg succeeds.
+- WMV inputs (including uppercase `.WMV`) use the same picker, drag-and-drop,
+  upscaling and resume pipeline. Exports remain MP4/MKV/AVI/MOV. Audio is copied
+  when the output container supports it; incompatible source audio, such as
+  WMA in MP4, is retried as AAC rather than discarded.
 - Only one runner may own a cache at a time. A crash-released OS lock prevents
   simultaneous GUI/CLI resumes from mixing job state. Its tiny, stable lock file
   lives in the OS temporary directory, not among the cached frames.

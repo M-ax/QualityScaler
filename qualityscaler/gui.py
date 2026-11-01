@@ -1163,7 +1163,7 @@ class App:
             App.get_app_window(),
             text=("DROP INPUT FILES HERE\n\nSUPPORTED FILES\n\n"
                   "IMAGES - jpg png tif bmp webp heic\n"
-                  "VIDEOS - mp4 webm mkv flv gif avi mov mpg qt 3gp"),
+                  "VIDEOS - mp4 wmv webm mkv flv gif avi mov mpg qt 3gp"),
             fg_color=background_color, bg_color=background_color,
             text_color=CARD_MUTED_COLOR, width=300, height=150,
             font=bold13, anchor="center",

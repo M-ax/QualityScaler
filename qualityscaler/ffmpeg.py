@@ -157,10 +157,10 @@ class FFmpeg:
 
     def encode(self, video_path, output_path, fps, codec, frames, stop_event, *,
                output_size=None, total_frames=None, status=None):
-        """Encode ordered cached JPEGs and copy optional audio in one invocation.
+        """Encode ordered cached JPEGs, preferring passthrough for optional audio.
 
-        Publish only a successful encode; an existing output is never replaced
-        with a partial or failed video.
+        Replayable frames allow video-codec and AAC audio fallbacks. Publish only
+        a successful encode; never replace an existing output with a failed video.
         """
         if stop_event.is_set():
             raise UpscaleCancelled()
@@ -181,32 +181,45 @@ class FFmpeg:
         # Sequences are naturally replayable; a bare iterator is single-use.
         if callable(frames):
             frame_factory = frames
+            replayable = True
         elif iter(frames) is frames:
             frame_factory = lambda: frames
             codecs = codecs[:1]
+            replayable = False
         else:
             frame_factory = lambda: iter(frames)
+            replayable = True
+        attempts = [(video_codec, "copy") for video_codec in codecs]
+        if replayable:
+            # WMV commonly contains WMA audio, which cannot be copied into MP4
+            # or MOV. Preserve passthrough when possible; retry with AAC rather
+            # than dropping audio or failing a valid video after upscaling.
+            attempts += [(video_codec, "aac") for video_codec in codecs]
 
         def progress(count):
             percent = min(100, int(count * 100 / total_frames)) if total_frames else 0
             status(f"Encoding upscaled video {percent}%")
 
         try:
-            for index, current_codec in enumerate(codecs):
+            for index, (current_codec, audio_codec) in enumerate(attempts):
                 arguments = [
                     "-y", "-f", "image2pipe", "-framerate", str(fps),
                     "-c:v", "mjpeg", "-i", "pipe:0", "-i", str(video_path),
                     "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1",
-                    "-c:v", current_codec, "-c:a", "copy", "-g", str(max(1, round(fps))),
+                    "-c:v", current_codec, "-c:a", audio_codec, "-g", str(max(1, round(fps))),
                     "-vf", filters, "-color_range", "tv", "-b:v", "50000k",
                 ]
+                if audio_codec == "aac":
+                    arguments += ["-b:a", "192k"]
                 if output.suffix.lower() in (".mp4", ".mov", ".m4v"):
                     arguments += ["-movflags", "+faststart"]
                 if status:
                     arguments += ["-progress", "pipe:1", "-nostats"]
                 arguments.append(str(partial))
-                if index and status:
+                if index and current_codec != codec and status:
                     status("Encoding upscaled video (x264 fallback)")
+                if audio_codec == "aac" and status:
+                    status("Encoding upscaled video (AAC audio fallback)")
                 try:
                     with self._pipe(arguments, stop_event, writing=True,
                                     progress=progress if status else None) as pipe:
@@ -219,7 +232,7 @@ class FFmpeg:
                     os.replace(partial, output)
                     return
                 except RuntimeError:
-                    if index == len(codecs) - 1:
+                    if index == len(attempts) - 1:
                         raise
         finally:
             partial.unlink(missing_ok=True)

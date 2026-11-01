@@ -22,6 +22,11 @@ class InputFileTests(unittest.TestCase):
         paths = [self.file("input" + suffix.upper()) for suffix in sorted(INPUT_EXTENSIONS)]
         self.assertEqual(supported_input_files(paths), paths)
 
+    def test_wmv_inputs_are_accepted_without_matching_disguised_extensions(self):
+        paths = [self.file("old family video.wmv"), self.file("another video.WMV")]
+        disguised = self.file("not video.wmv.txt")
+        self.assertEqual(supported_input_files([*paths, disguised]), paths)
+
     def test_only_final_extension_counts(self):
         valid = self.file("photo.PNG")
         invalid = self.file("movie.mp4.exe")

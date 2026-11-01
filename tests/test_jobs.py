@@ -50,6 +50,9 @@ class BatchJobTests(unittest.TestCase):
     def test_video_extensions_are_case_insensitive(self):
         self.assertTrue(check_if_file_is_video("movie.M4V"))
         self.assertTrue(check_if_file_is_video("movie.MP4"))
+        self.assertTrue(check_if_file_is_video("old movie.wmv"))
+        self.assertTrue(check_if_file_is_video("old movie.WMV"))
+        self.assertFalse(check_if_file_is_video("movie.wmv.txt"))
         self.assertFalse(check_if_file_is_video("photo.png"))
 
     def test_image_output_is_resized_before_sharpening(self):

@@ -94,6 +94,8 @@ class BuildSpecTests(unittest.TestCase):
 
         self.analysis = Mock(side_effect=analyze)
         self.pyz = Mock(return_value=sentinel.pyz)
+        self.splash_target = SimpleNamespace(binaries=sentinel.splash_binaries)
+        self.splash = Mock(return_value=self.splash_target)
         self.exe = Mock()
 
     def execute_spec(self):
@@ -101,6 +103,7 @@ class BuildSpecTests(unittest.TestCase):
             "SPECPATH": str(self.root),
             "Analysis": self.analysis,
             "PYZ": self.pyz,
+            "Splash": self.splash,
             "EXE": self.exe,
         }
         exec(SPEC_CODE, namespace)
@@ -192,6 +195,24 @@ class BuildSpecTests(unittest.TestCase):
                 self.assertIn(resource, bundled_data)
                 self.assertEqual(bundled_data.count(resource), 1)
 
+    def test_native_splash_uses_analyzed_tk_resources_and_existing_logo(self):
+        self.execute_spec()
+        args, options = self.splash.call_args
+        self.assertEqual(args, (str(self.root / "Assets/logo.png"),))
+        self.assertIs(options["binaries"], self.exe.call_args.args[2])
+        self.assertIs(options["datas"], self.exe.call_args.args[3])
+        self.assertEqual(options["text_default"], "Starting QualityScaler...")
+        self.assertEqual(options["max_img_size"], (480, 480))
+        x, y = options["text_pos"]
+        self.assertTrue(0 < x < 480 and 0 < y < 480)
+        self.assertEqual(options["text_size"], -14)
+        self.assertEqual(options["text_font"], "TkDefaultFont")
+        self.assertEqual(options["text_color"], "#151515")
+        self.assertIs(options["full_tk"], False)
+        self.assertIs(options["always_on_top"], False)
+        self.assertIs(self.exe.call_args.args[4], self.splash_target)
+        self.assertIs(self.exe.call_args.args[5], sentinel.splash_binaries)
+
     def test_build_is_single_file_windowed_with_icon_and_no_upx(self):
         self.execute_spec()
         self.pyz.assert_called_once_with(sentinel.pure)
@@ -201,6 +222,8 @@ class BuildSpecTests(unittest.TestCase):
             sentinel.scripts,
             sorted(self.ort_binaries),
             self.analysis.call_args.kwargs["datas"] + self.tkdnd_data,
+            self.splash_target,
+            sentinel.splash_binaries,
             [],
         ))
         self.assertEqual(options["name"], "QualityScaler")

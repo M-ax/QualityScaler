@@ -19,6 +19,8 @@ from pathlib import Path
 from queue import Empty
 from shutil import disk_usage as shutil_disk_usage
 import sys
+from threading import Thread
+from time import monotonic
 from tkinter import DISABLED, StringVar, TclError
 from typing import Any, Callable, Optional
 from webbrowser import open as open_browser
@@ -40,7 +42,7 @@ from PIL.Image import open as pillow_image_open, fromarray as pillow_image_froma
 from psutil import Process as psutil_Process, NoSuchProcess, AccessDenied
 from customtkinter import (
     CTk, CTkFrame, CTkButton, CTkEntry, CTkFont, CTkImage, CTkLabel,
-    CTkOptionMenu, CTkProgressBar, CTkScrollableFrame, CTkToplevel, CTkCanvas,
+    CTkOptionMenu, CTkProgressBar, CTkScrollableFrame, CTkToplevel,
     filedialog, set_appearance_mode, set_default_color_theme,
     set_widget_scaling, set_window_scaling,
 )
@@ -59,8 +61,9 @@ from .jobs import upscale_orchestrator
 from .media import get_image_resolution, image_read
 from .paths import OUTPUT_PATH_CODED, find_by_relative_path
 from .platform_support import prevent_sleep, allow_sleep, show_completion_notification
-from .status import write_process_status
+from .startup import close_splash, update_splash
 from .video import VideoSettings, get_resume_progress
+from .widgets import StatusBar
 
 githubme = "https://github.com/Djdefrag/QualityScaler/releases"
 telegramme = "https://linktr.ee/j3ngystudio"
@@ -130,6 +133,13 @@ class UserPreferences:
 class AppState:
     preferences: UserPreferences
     window: Optional[CTk] = None
+    input_panel: Optional[Any] = None
+    settings_panel: Optional[Any] = None
+    settings_content: Optional[Any] = None
+    header: Optional[Any] = None
+    action_panel: Optional[Any] = None
+    status_bar: Optional[StatusBar] = None
+    option_rows: dict = field(default_factory=dict)
     info_message: Optional[StringVar] = None
     selected_output_path: Optional[StringVar] = None
     selected_input_resize_factor: Optional[StringVar] = None
@@ -146,38 +156,23 @@ class AppState:
     processing: bool = False
     stopping: bool = False
     closing: bool = False
+    pending_upscale_status: Optional[str] = None
+    stop_deadline: Optional[float] = None
     poll_after_id: Optional[str] = None
+    preview_after_id: Optional[str] = None
     after_ids: set = field(default_factory=set)
     traces: list = field(default_factory=list)
 
 
 app_state: Optional[AppState] = None
-ROW_STEP = 0.0825
-ROW_HEADER = 0.05
-
-
-def _row(index: int) -> float:
-    return 0.125 + index * ROW_STEP
-
-
-ROW_AI_MODEL = _row(0)
-ROW_AI_SHARPENING = _row(1)
-ROW_AI_MULTITHREADING = _row(2)
-ROW_RESOLUTION = _row(3)
-ROW_GPU = _row(4)
-ROW_OUTPUT_FORMAT = _row(5)
-ROW_CODEC = _row(6)
-ROW_OUTPUT_PATH = _row(9)
-ROW_ACTIONS = _row(10)
-COL_INFO_L = 0.625
-COL_INFO_R = 0.858
-COL_TEXT_L = COL_INFO_L + 0.08
-COL_TEXT_R = COL_INFO_R + 0.08
-COL_MENU_L = COL_TEXT_L - 0.0127
-COL_MENU_R = COL_TEXT_R - 0.0127
-COL_TITLE = 0.66
-COL_ZOOM = COL_TITLE + 0.2
-COL_MENU_C = COL_ZOOM + 0.0355
+ROW_AI_MODEL = 0
+ROW_AI_SHARPENING = 1
+ROW_AI_MULTITHREADING = 2
+ROW_RESOLUTION = 3
+ROW_GPU = 4
+ROW_OUTPUT_FORMAT = 5
+ROW_CODEC = 6
+ROW_OUTPUT_PATH = 7
 little_textbox_width = 74
 little_menu_width = 98
 
@@ -193,15 +188,15 @@ def lerp_hex(color_a: str, color_b: str, t: float) -> str:
     return f"#{r:02X}{g:02X}{blue:02X}"
 
 
-def _schedule(delay: int, callback: Callable) -> Optional[str]:
+def _schedule(delay: int, callback: Callable, *, during_close: bool = False) -> Optional[str]:
     """Schedule on Tk's thread and retain handles for deterministic shutdown."""
     state = app_state
-    if state is None or state.closing:
+    if state is None or (state.closing and not during_close):
         return None
 
     def run():
         state.after_ids.discard(handle)
-        if not state.closing:
+        if not state.closing or during_close:
             callback()
 
     handle = state.window.after(delay, run)
@@ -623,7 +618,11 @@ def get_values_for_file_widget():
 
 
 def update_file_widget(*_args):
-    file_widget = None if app_state is None else app_state.file_widget
+    if app_state is None:
+        return
+    _cancel_after(app_state.preview_after_id)
+    app_state.preview_after_id = None
+    file_widget = app_state.file_widget
     if file_widget is None or app_state.closing:
         return
     upscale_factor, input_factor, output_factor = get_values_for_file_widget()
@@ -631,6 +630,14 @@ def update_file_widget(*_args):
     file_widget.set_input_resize_factor(input_factor)
     file_widget.set_output_resize_factor(output_factor)
     file_widget.refresh_pipeline()
+
+
+def schedule_file_widget_update(*_args):
+    """Coalesce typing into one preview rebuild, rather than one per key."""
+    if app_state is None or app_state.closing or app_state.file_widget is None:
+        return
+    _cancel_after(app_state.preview_after_id)
+    app_state.preview_after_id = _schedule(200, update_file_widget)
 
 
 def get_current_ai_model():
@@ -776,10 +783,12 @@ def accept_input_drop(event):
     """Only the left input pane accepts drops, and never during a job."""
     if app_state is None or app_state.closing or inputs_are_busy():
         return False
-    window = app_state.window
-    x = event.x_root - window.winfo_rootx()
-    y = event.y_root - window.winfo_rooty()
-    return 0 <= x < window.winfo_width() / 2 and 0 <= y < window.winfo_height()
+    panel = app_state.input_panel
+    if panel is None:
+        return False
+    x = event.x_root - panel.winfo_rootx()
+    y = event.y_root - panel.winfo_rooty()
+    return 0 <= x < panel.winfo_width() and 0 <= y < panel.winfo_height()
 
 
 def select_input_files(paths):
@@ -799,7 +808,7 @@ def select_input_files(paths):
         return True
     upscale_factor, input_factor, output_factor = get_values_for_file_widget()
     new_widget = FileWidget(
-        master=app_state.window, selected_file_list=selected, upscale_factor=upscale_factor,
+        master=app_state.input_panel, selected_file_list=selected, upscale_factor=upscale_factor,
         input_resize_factor=input_factor, output_resize_factor=output_factor,
         fg_color=background_color, bg_color=background_color,
     )
@@ -815,7 +824,7 @@ def select_input_files(paths):
     app_state.input_widgets = ()
     app_state.file_widget = new_widget
     app_state.selected_file_list = list(readable)
-    new_widget.place(relx=0.0, rely=0.0, relwidth=0.5, relheight=1.0)
+    new_widget.grid(row=0, column=0, rowspan=2, sticky="nsew")
     skipped = len(paths) - len(supported) + len(new_widget.unreadable_files)
     message = f"Ready — {len(readable)} input file(s)"
     if skipped:
@@ -889,8 +898,24 @@ def _drain_status_queue():
             return
 
 
+def _kill_upscale_process_tree(process):
+    """Hard-stop fallback after the worker's checkpoint grace period."""
+    try:
+        for child in psutil_Process(process.pid).children(recursive=True):
+            try:
+                child.kill()
+            except (NoSuchProcess, AccessDenied):
+                pass
+    except (NoSuchProcess, AccessDenied):
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass  # It exited between the liveness check and kill.
+
+
 def stop_upscale_process():
-    """Give SQLite a checkpoint window, then kill a hung process tree."""
+    """Blocking safety cleanup, used only after Tk's event loop has ended."""
     app_state.stopping = True
     event = app_state.event_stop_upscale_process
     if event is not None:
@@ -898,17 +923,12 @@ def stop_upscale_process():
     process = app_state.process_upscale_orchestrator
     try:
         if process is not None and process.pid is not None:
-            process.join(timeout=10)
+            timeout = 10 if app_state.stop_deadline is None else max(
+                0, app_state.stop_deadline - monotonic()
+            )
+            process.join(timeout=timeout)
             if process.is_alive():
-                try:
-                    for child in psutil_Process(process.pid).children(recursive=True):
-                        try:
-                            child.kill()
-                        except (NoSuchProcess, AccessDenied):
-                            pass
-                except (NoSuchProcess, AccessDenied):
-                    pass
-                process.kill()
+                _kill_upscale_process_tree(process)
                 process.join()
         app_state.process_upscale_orchestrator = None
         _drain_status_queue()
@@ -917,44 +937,82 @@ def stop_upscale_process():
             event.clear()
         app_state.processing = False
         app_state.stopping = False
+        app_state.pending_upscale_status = None
+        app_state.stop_deadline = None
         allow_sleep()
 
 
-def _finish_upscale(status):
-    stop_upscale_process()
-    if app_state.closing:
-        return
-    if status == COMPLETED_STATUS:
-        app_state.info_message.set("All files completed! :)")
-        show_completion_notification()
-    elif status == STOP_STATUS:
-        app_state.info_message.set("Upscaling stopped")
-    else:
-        app_state.info_message.set("Error while upscaling :(")
-        show_error_message(status.removeprefix(ERROR_STATUS).strip())
-    App.place_upscale_button()
+def _finish_upscale(status: str) -> bool:
+    """Record a terminal result, but settle the UI only after the worker exits."""
+    state = app_state
+    process = state.process_upscale_orchestrator
+    if not state.processing and process is None:
+        return True  # A stale/duplicate completion must not notify twice.
+    if state.pending_upscale_status is None or status.startswith(ERROR_STATUS):
+        state.pending_upscale_status = status
+    if process is not None and process.pid is not None:
+        if process.is_alive():
+            if not state.stopping:
+                state.info_message.set("Finalizing — waiting for worker cleanup...")
+            return False
+        process.join(timeout=0)
+    status = state.pending_upscale_status
+    if status == COMPLETED_STATUS and (process is None or process.exitcode != 0):
+        exitcode = None if process is None else process.exitcode
+        status = f"{ERROR_STATUS} Worker exited with code {exitcode} after completion"
+    state.process_upscale_orchestrator = None
+    _drain_status_queue()
+    if state.event_stop_upscale_process is not None:
+        state.event_stop_upscale_process.clear()
+    state.pending_upscale_status = None
+    state.stop_deadline = None
+    allow_sleep()
+    if state.closing:
+        state.processing = False
+        state.stopping = False
+        _destroy_window()
+        return True
     update_file_widget()
-    if app_state.file_widget is not None:
-        app_state.file_widget.clear_active_highlight()
+    if state.file_widget is not None:
+        state.file_widget.clear_active_highlight()
+    state.processing = False
+    state.stopping = False
+    App.place_upscale_button()
+    if status == COMPLETED_STATUS:
+        state.info_message.set("All files completed! :)")
+        # Provider imports and PowerShell/toast delivery may block. This worker
+        # never touches Tk or AppState and must not hold up window shutdown.
+        Thread(
+            target=show_completion_notification,
+            name="QualityScaler-completion-notification", daemon=True,
+        ).start()
+    elif status == STOP_STATUS:
+        state.info_message.set("Upscaling stopped")
+    else:
+        state.info_message.set("Error while upscaling :(")
+        show_error_message(status.removeprefix(ERROR_STATUS).strip())
+    return True
 
 
 def check_upscale_steps():
     _cancel_after(app_state.poll_after_id)
     app_state.poll_after_id = None
-    if app_state.closing:
+    if not app_state.processing:
         return
+    process = app_state.process_upscale_orchestrator
+    worker_alive = process is not None and process.pid is not None and process.is_alive()
     try:
         actual_step = app_state.process_status_q.get_nowait()
     except Empty:
         actual_step = None
-    if actual_step == CLOSE_APP_STATUS:
-        return
     if actual_step in (COMPLETED_STATUS, STOP_STATUS) or (
         actual_step is not None and str(actual_step).startswith(ERROR_STATUS)
     ):
-        _finish_upscale(str(actual_step))
-        return
-    if actual_step is not None:
+        if _finish_upscale(str(actual_step)):
+            return
+    elif (actual_step is not None and actual_step != CLOSE_APP_STATUS
+          and app_state.pending_upscale_status is None
+          and not app_state.stopping and not app_state.closing):
         app_state.info_message.set(actual_step)
         try:
             file_number = int(str(actual_step).split(".")[0])
@@ -963,20 +1021,40 @@ def check_upscale_steps():
         else:
             if app_state.file_widget is not None:
                 app_state.file_widget.highlight_active_file(file_number)
-    process = app_state.process_upscale_orchestrator
-    if app_state.processing and process is not None and not process.is_alive():
+    if not worker_alive:
         # Manager queues are synchronous: an exited process has already
-        # delivered its final status. An empty queue here is an abnormal exit.
-        if actual_step is None:
-            _finish_upscale(f"{ERROR_STATUS} Worker exited without a completion status")
+        # delivered its final status. Observe exit BEFORE reading the queue so
+        # a worker finishing between those checks cannot look like a crash.
+        if app_state.pending_upscale_status is not None or actual_step is None:
+            status = app_state.pending_upscale_status or (
+                STOP_STATUS if app_state.stopping else
+                f"{ERROR_STATUS} Worker exited without a completion status"
+            )
+            _finish_upscale(status)
             return
-    if app_state.processing:
+    elif app_state.stop_deadline is not None and monotonic() >= app_state.stop_deadline:
+        _kill_upscale_process_tree(process)
+        app_state.stop_deadline = None
+    if app_state.closing:
+        app_state.poll_after_id = _schedule(250, check_upscale_steps, during_close=True)
+    else:
         app_state.poll_after_id = _schedule(250, check_upscale_steps)
 
 
 def stop_button_command():
-    stop_upscale_process()
-    write_process_status(app_state.process_status_q, STOP_STATUS)
+    """Request a checkpoint, then poll instead of joining on the Tk thread."""
+    if not app_state.processing and app_state.process_upscale_orchestrator is None:
+        return
+    app_state.processing = True
+    if not app_state.stopping:
+        app_state.stopping = True
+        app_state.stop_deadline = monotonic() + 10
+        if app_state.event_stop_upscale_process is not None:
+            app_state.event_stop_upscale_process.set()
+    if not (app_state.pending_upscale_status or "").startswith(ERROR_STATUS):
+        app_state.pending_upscale_status = STOP_STATUS
+    if not app_state.closing:
+        app_state.info_message.set("Stopping — saving progress and cleaning up...")
     check_upscale_steps()
 
 
@@ -988,6 +1066,9 @@ def upscale_button_command():
         return
     _drain_status_queue()
     app_state.event_stop_upscale_process.clear()
+    app_state.pending_upscale_status = None
+    app_state.stop_deadline = None
+    app_state.stopping = False
     app_state.info_message.set("Loading")
     app_state.processing = True
     App.place_stop_button()
@@ -1078,6 +1159,7 @@ def _destroy_window():
     for handle in tuple(app_state.after_ids):
         _cancel_after(handle)
     app_state.poll_after_id = None
+    app_state.preview_after_id = None
     for variable, handle in app_state.traces:
         try:
             variable.trace_remove("write", handle)
@@ -1097,6 +1179,14 @@ def _destroy_window():
         window = app_state.window
         app_state.window = None
         try:
+            # CTk also schedules appearance, DPI and textbox-scrollbar timers
+            # outside our registry. Cancel this interpreter's remaining timers,
+            # leaving command deletion to each owning widget's destroy method.
+            for handle in window.tk.splitlist(window.tk.call("after", "info")):
+                window.tk.call("after", "cancel", handle)
+        except TclError:
+            pass
+        try:
             window.grab_release()
         except TclError:
             pass
@@ -1106,6 +1196,15 @@ def _destroy_window():
             pass
     app_state.input_widgets = ()
     app_state.action_button = None
+    app_state.input_panel = None
+    app_state.settings_panel = None
+    app_state.settings_content = None
+    app_state.header = None
+    app_state.action_panel = None
+    app_state.status_bar = None
+    app_state.option_rows.clear()
+    App._message_label = None
+    App._message_after_id = None
 
 
 def on_app_close():
@@ -1117,25 +1216,53 @@ def on_app_close():
         # A missing/unwritable Documents folder must not prevent shutdown.
         print(f"[{app_name}] Could not save preferences: {error}")
     app_state.closing = True
-    try:
-        stop_upscale_process()
-    finally:
+    stop_button_command()
+    if not app_state.processing and app_state.window is not None:
         _destroy_window()
 
 
 def place_option_background(row):
-    background = App.create_option_background()
-    background.place(relx=0.75, rely=row, relwidth=0.48, anchor="center")
+    if row not in app_state.option_rows:
+        background = CTkFrame(
+            app_state.settings_content, fg_color=CARD_BACKGROUND_COLOR,
+            corner_radius=12, border_width=1, border_color=CARD_BORDER_COLOR,
+        )
+        background.grid(row=row, column=0, sticky="ew", padx=8, pady=(0, 8))
+        background.grid_columnconfigure((0, 1), weight=1, uniform="options")
+        app_state.option_rows[row] = background
+    return app_state.option_rows[row]
 
 
 class App:
     def __init__(self, window):
         window.protocol("WM_DELETE_WINDOW", on_app_close)
         window.title(get_AI_engine_info())
-        window.geometry("1000x675")
-        window.resizable(False, False)
+        window.geometry("1100x760")
+        window.minsize(1000, 540)
+        window.resizable(True, True)
         if sys.platform == "win32":
             window.iconbitmap(find_by_relative_path(f"Assets{os_separator}logo.ico"))
+        window.grid_columnconfigure((0, 1), weight=1, uniform="panes")
+        window.grid_rowconfigure(0, weight=1)
+        app_state.input_panel = CTkFrame(window, fg_color=background_color, corner_radius=0)
+        app_state.input_panel.grid(row=0, column=0, sticky="nsew")
+        app_state.input_panel.grid_columnconfigure(0, weight=1)
+        app_state.input_panel.grid_rowconfigure((0, 1), weight=1)
+        app_state.settings_panel = CTkFrame(window, fg_color=background_color, corner_radius=0)
+        app_state.settings_panel.grid(row=0, column=1, sticky="nsew")
+        app_state.settings_panel.grid_columnconfigure(0, weight=1)
+        app_state.settings_panel.grid_rowconfigure(1, weight=1)
+        app_state.header = CTkFrame(app_state.settings_panel, fg_color=background_color)
+        app_state.header.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        app_state.header.grid_columnconfigure(0, weight=1)
+        app_state.settings_content = CTkScrollableFrame(
+            app_state.settings_panel, fg_color=background_color, corner_radius=0, width=1,
+        )
+        app_state.settings_content.grid(row=1, column=0, sticky="nsew")
+        app_state.settings_content.grid_columnconfigure(0, weight=1)
+        app_state.action_panel = CTkFrame(app_state.settings_panel, fg_color=background_color)
+        app_state.action_panel.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
+        app_state.action_panel.grid_columnconfigure(0, weight=1)
         self.place_loadFile_section()
         self.place_app_name()
         self.place_app_zoom_and_links()
@@ -1151,16 +1278,11 @@ class App:
         self.place_upscale_button()
 
     @staticmethod
-    def place_at(widget, relx, rely):
-        widget.place(relx=relx, rely=rely, anchor="center")
-
-    @staticmethod
     def place_loadFile_section():
         for widget in app_state.input_widgets:
             widget.destroy()
-        background = App.create_panel_background()
         label = CTkLabel(
-            App.get_app_window(),
+            app_state.input_panel,
             text=("DROP INPUT FILES HERE\n\nSUPPORTED FILES\n\n"
                   "IMAGES - jpg png tif bmp webp heic\n"
                   "VIDEOS - mp4 wmv webm mkv flv gif avi mov mpg qt 3gp"),
@@ -1169,53 +1291,55 @@ class App:
             font=bold13, anchor="center",
         )
         button = CTkButton(
-            App.get_app_window(), command=open_files_action, text="SELECT FILES",
+            app_state.input_panel, command=open_files_action, text="SELECT FILES",
             width=140, height=30, font=bold12, border_width=2,
             corner_radius=UI_CORNER_RADIUS, fg_color="#282828",
             text_color="#E0E0E0", border_color=UI_ACCENT_COLOR,
         )
-        background.place(relx=0.0, rely=0.0, relwidth=0.5, relheight=1.0)
-        App.place_at(label, 0.25, 0.4)
-        App.place_at(button, 0.25, 0.6)
-        app_state.input_widgets = (background, label, button)
+        label.grid(row=0, column=0, sticky="s", padx=12, pady=20)
+        button.grid(row=1, column=0, sticky="n", pady=20)
+        app_state.input_widgets = (label, button)
 
     @staticmethod
     def place_app_name():
-        background = App.create_panel_background()
         label = CTkLabel(
-            App.get_app_window(), text=f"{app_name} {version}",
+            app_state.header, text=f"{app_name} {version}",
             fg_color=background_color, bg_color=background_color,
             text_color=app_name_color, font=bold18, anchor="w",
         )
-        background.place(relx=0.5, rely=0.0, relwidth=0.5, relheight=1.0)
-        App.place_at(label, COL_TITLE - 0.055, ROW_HEADER)
+        label.grid(row=0, column=0, sticky="w")
 
     @staticmethod
     def place_app_zoom_and_links():
         label = CTkLabel(
-            App.get_app_window(), text="App zoom", width=50, height=22,
+            app_state.header, text="Zoom", width=35, height=22,
             fg_color="transparent", bg_color=background_color,
             text_color=CARD_TITLE_COLOR, font=bold13, anchor="w",
         )
         menu = App.create_option_menu(
-            App.select_app_zoom, zoom_option_list, app_state.preferences.app_zoom, width=71
+            App.select_app_zoom, zoom_option_list, app_state.preferences.app_zoom,
+            width=71, master=app_state.header,
         )
-        App.place_at(label, COL_ZOOM - 0.06, ROW_HEADER)
-        App.place_at(menu, COL_ZOOM + 0.0155, ROW_HEADER)
-        telegram = App.create_link_button(lambda: open_browser(telegramme, new=1), logo_telegram)
-        github = App.create_link_button(lambda: open_browser(githubme, new=1), logo_git)
-        App.place_at(telegram, COL_ZOOM + 0.075, ROW_HEADER)
-        App.place_at(github, COL_ZOOM + 0.11, ROW_HEADER)
+        label.grid(row=0, column=1, padx=(8, 4))
+        menu.grid(row=0, column=2, padx=(0, 8))
+        telegram = App.create_link_button(
+            lambda: open_browser(telegramme, new=1), logo_telegram, master=app_state.header,
+        )
+        github = App.create_link_button(
+            lambda: open_browser(githubme, new=1), logo_git, master=app_state.header,
+        )
+        telegram.grid(row=0, column=3, padx=(0, 6))
+        github.grid(row=0, column=4)
 
     @staticmethod
     def _single_option(row, title, subtitle, help_text, command, choices, value):
-        place_option_background(row)
+        background = place_option_background(row)
         info = App.create_info_button(
-            lambda: open_info_messagebox(title, subtitle, help_text), title
+            lambda: open_info_messagebox(title, subtitle, help_text), title, master=background,
         )
-        menu = App.create_option_menu(command, choices, value)
-        App.place_at(info, COL_INFO_L, row)
-        App.place_at(menu, COL_MENU_C, row)
+        menu = App.create_option_menu(command, choices, value, master=background)
+        info.grid(row=0, column=0, sticky="w", padx=12, pady=10)
+        menu.grid(row=0, column=1, sticky="ew", padx=(8, 12), pady=10)
 
     @staticmethod
     def place_AI_menu():
@@ -1265,16 +1389,19 @@ class App:
         )
 
     @staticmethod
-    def _paired_option(row, left, title, subtitle, help_text, widget):
+    def _paired_option(row, left, title, subtitle, help_text, create_widget):
+        background = place_option_background(row)
+        slot = CTkFrame(background, fg_color="transparent", width=1)
+        slot.grid(row=0, column=0 if left else 1, sticky="ew", padx=10, pady=10)
+        slot.grid_columnconfigure(1, weight=1)
         info = App.create_info_button(
-            lambda: open_info_messagebox(title, subtitle, help_text), title
+            lambda: open_info_messagebox(title, subtitle, help_text), title, master=slot,
         )
-        App.place_at(info, COL_INFO_L if left else COL_INFO_R, row)
-        App.place_at(widget, COL_MENU_L if left else COL_MENU_R, row)
+        info.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        create_widget(slot).grid(row=0, column=1, sticky="ew")
 
     @staticmethod
     def place_input_output_resolution_textboxs():
-        place_option_background(ROW_RESOLUTION)
         for left, title, variable, subtitle, help_text in (
             (True, "Input scale %", App.get_input_resize_factor_var(),
              "Controls the resolution fed to the AI — lower is faster, higher is sharper",
@@ -1288,16 +1415,15 @@ class App:
               "\n If the AI generates 4K (3840x2160)\n"
               " - 50% => 1920x1080\n - 100% => 3840x2160\n - 200% => 7680x4320 (interpolated)\n"]),
         ):
-            info = App.create_info_button(
-                lambda t=title, s=subtitle, h=help_text: open_info_messagebox(t, s, h), title
+            App._paired_option(
+                ROW_RESOLUTION, left, title, subtitle, help_text,
+                lambda master, var=variable: App.create_text_box(
+                    var, little_textbox_width, master=master,
+                ),
             )
-            entry = App.create_text_box(variable, little_textbox_width)
-            App.place_at(info, COL_INFO_L if left else COL_INFO_R, ROW_RESOLUTION)
-            App.place_at(entry, COL_TEXT_L if left else COL_TEXT_R, ROW_RESOLUTION)
 
     @staticmethod
     def place_gpu_gpuVRAM_menus():
-        place_option_background(ROW_GPU)
         choices = GPU.menu_list()
         if app_state.preferences.gpu not in choices:
             app_state.preferences.gpu = GPU.default()
@@ -1306,33 +1432,35 @@ class App:
             [" The app automatically detects the GPUs installed on your system.",
              " If no GPU is detected the menu shows \"No GPU found\" and the app may fall back to the CPU.",
              " Keep GPU drivers up to date. A more powerful GPU speeds up upscaling."],
-            App.create_option_menu(App.select_gpu_from_menu, choices,
-                                   app_state.preferences.gpu, width=little_menu_width),
+            lambda master: App.create_option_menu(
+                App.select_gpu_from_menu, choices, app_state.preferences.gpu,
+                width=little_menu_width, master=master,
+            ),
         )
-        info = App.create_info_button(
-            lambda: open_info_messagebox(
-                "GPU VRAM (GB)", "Match this value to your GPU's available VRAM to avoid out-of-memory errors",
-                [" Auto-detected from the selected GPU's dedicated VRAM at startup.",
-                 " You can override an incorrect value manually.",
-                 " Setting a value above available VRAM may cause upscale failure.",
-                 " For Intel UHD / Iris Xe or AMD Vega 3/5/7 integrated GPUs, select 2 GB."],
-            ), "GPU VRAM (GB)"
+        App._paired_option(
+            ROW_GPU, False, "GPU VRAM (GB)",
+            "Match this value to your GPU's available VRAM to avoid out-of-memory errors",
+            [" Auto-detected from the selected GPU's dedicated VRAM at startup.",
+             " You can override an incorrect value manually.",
+             " Setting a value above available VRAM may cause upscale failure.",
+             " For Intel UHD / Iris Xe or AMD Vega 3/5/7 integrated GPUs, select 2 GB."],
+            lambda master: App.create_text_box(
+                App.get_vram_limiter_var(), little_textbox_width, master=master,
+            ),
         )
-        App.place_at(info, COL_INFO_R, ROW_GPU)
-        App.place_at(App.create_text_box(App.get_vram_limiter_var(), little_textbox_width),
-                     COL_TEXT_R, ROW_GPU)
 
     @staticmethod
     def place_image_video_output_menus():
-        place_option_background(ROW_OUTPUT_FORMAT)
         App._paired_option(
             ROW_OUTPUT_FORMAT, True, "Image ext.", "Choose the output format for upscaled images",
             ["\n PNG\n - Lossless, very good quality; slow and heavy\n - Supports transparency\n",
              "\n JPG\n - Lossy, good quality; fast and lightweight\n - No transparency\n",
              "\n BMP\n - Uncompressed, highest quality; large file size\n - No transparency\n",
              "\n TIFF\n - Highest quality; very slow and heavy\n - Supports transparency\n"],
-            App.create_option_menu(App.select_image_extension_from_menu, image_extension_list,
-                                   app_state.preferences.image_extension, width=little_menu_width),
+            lambda master: App.create_option_menu(
+                App.select_image_extension_from_menu, image_extension_list,
+                app_state.preferences.image_extension, width=little_menu_width, master=master,
+            ),
         )
         App._paired_option(
             ROW_OUTPUT_FORMAT, False, "Video ext.", "Choose the container format for upscaled videos",
@@ -1340,23 +1468,24 @@ class App:
              "\n MKV\n - High quality; supports almost any codec and multiple audio/subtitle tracks\n",
              "\n AVI\n - Older, compatible format; larger files with less efficient compression\n",
              "\n MOV\n - High quality Apple format; large files, suited for editing\n"],
-            App.create_option_menu(App.select_video_extension_from_menu, video_extension_list,
-                                   app_state.preferences.video_extension, width=little_menu_width),
+            lambda master: App.create_option_menu(
+                App.select_video_extension_from_menu, video_extension_list,
+                app_state.preferences.video_extension, width=little_menu_width, master=master,
+            ),
         )
 
     @staticmethod
     def place_video_codec_keep_frames_menus():
-        place_option_background(ROW_CODEC)
         App._paired_option(
             ROW_CODEC, True, "Video codec", "Choose the encoder used to compress the upscaled video",
             ["\n SOFTWARE ENCODING (CPU)\n - x264 | H.264\n - x265 | HEVC (H.265)\n",
              "\n NVIDIA GPU (NVENC)\n - h264_nvenc | H.264\n - hevc_nvenc | HEVC\n",
              "\n AMD GPU (AMF)\n - h264_amf | H.264\n - hevc_amf | HEVC\n",
              "\n INTEL GPU (QSV)\n - h264_qsv | H.264\n - hevc_qsv | HEVC\n"],
-            App.create_option_menu(
+            lambda master: App.create_option_menu(
                 App.select_video_codec_from_menu, video_codec_list,
                 app_state.preferences.video_codec, width=little_menu_width,
-                variable=App.get_video_codec_var(),
+                variable=App.get_video_codec_var(), master=master,
             ),
         )
         App._paired_option(
@@ -1364,47 +1493,44 @@ class App:
             ["\n ON\n - Keep the video's .qualityscaler/frames.sqlite3 cache after creating the output\n",
              "\n OFF\n - Remove the frame cache after successful encoding\n"
              " - Interrupted jobs remain resumable\n"],
-            App.create_option_menu(
+            lambda master: App.create_option_menu(
                 App.select_save_frame_from_menu, keep_frames_list,
-                "ON" if app_state.preferences.keep_frames else "OFF", width=little_menu_width,
+                "ON" if app_state.preferences.keep_frames else "OFF",
+                width=little_menu_width, master=master,
             ),
         )
 
     @staticmethod
     def place_output_path_textbox():
-        background = App.create_option_background()
+        background = place_option_background(ROW_OUTPUT_PATH)
+        background.grid_columnconfigure(0, weight=1)
+        background.grid_columnconfigure(1, weight=0, uniform="")
         info = App.create_info_button(
             lambda: open_info_messagebox(
                 "Output path", "Choose where upscaled files are saved",
                 [" The default is the folder containing each input file.",
                  " Select another folder using the SELECT button."],
-            ), "Output path"
+            ), "Output path", master=background,
         )
-        entry = App.create_text_box(App.get_output_path_var(), 250, state=DISABLED)
-        button = App.create_active_button(open_output_path_action, "SELECT", None, 60, 26)
-        background.place(relx=0.75, rely=ROW_OUTPUT_PATH, relwidth=0.48, anchor="center")
-        App.place_at(info, COL_INFO_L, ROW_OUTPUT_PATH)
-        App.place_at(button, COL_INFO_L + 0.052, ROW_OUTPUT_PATH)
-        App.place_at(entry, COL_ZOOM - 0.008, ROW_OUTPUT_PATH)
+        entry = App.create_text_box(
+            App.get_output_path_var(), 1, state=DISABLED, master=background,
+        )
+        button = App.create_active_button(
+            open_output_path_action, "SELECT", None, 70, 26, master=background,
+        )
+        info.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
+        button.grid(row=0, column=1, padx=12, pady=(10, 6))
+        entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
 
     @staticmethod
     def place_message_label():
-        message_label = CTkLabel(
+        bar = StatusBar(
             App.get_app_window(), textvariable=App.get_info_message_var(),
-            height=25, width=250, font=bold11, bg_color=background_color,
-            fg_color=UI_ACCENT_COLOR, text_color="#0A0A0A",
-            anchor="center", corner_radius=UI_CORNER_RADIUS,
+            font=bold12, fg_color=CARD_BACKGROUND_COLOR, text_color=UI_ACCENT_COLOR,
         )
-        triangle = CTkCanvas(
-            App.get_app_window(), width=14, height=14, bg=background_color,
-            highlightthickness=0,
-        )
-        triangle_item = triangle.create_polygon(14, 0, 0, 7, 14, 14, fill=UI_ACCENT_COLOR)
-        App.place_at(triangle, 0.716, ROW_ACTIONS)
-        App.place_at(message_label, 0.85, ROW_ACTIONS)
-        App._message_label = message_label
-        App._message_triangle = triangle
-        App._message_triangle_item = triangle_item
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        app_state.status_bar = bar
+        App._message_label = bar.label
         App._message_color = UI_ACCENT_COLOR
         variable = App.get_info_message_var()
         app_state.traces.append((variable, variable.trace_add("write", App._refresh_message_color)))
@@ -1429,11 +1555,7 @@ class App:
     def _set_message_color(color):
         label = getattr(App, "_message_label", None)
         if label is not None and label.winfo_exists():
-            label.configure(fg_color=color)
-        triangle = getattr(App, "_message_triangle", None)
-        item = getattr(App, "_message_triangle_item", None)
-        if triangle is not None and triangle.winfo_exists() and item is not None:
-            triangle.itemconfig(item, fill=color)
+            label.configure(text_color=color)
         App._message_color = color
 
     @staticmethod
@@ -1460,9 +1582,10 @@ class App:
         if app_state.action_button is not None:
             app_state.action_button.destroy()
         button = App.create_active_button(
-            command, text, icon, width=150, height=30, border_color=border_color
+            command, text, icon, width=150, height=34, border_color=border_color,
+            master=app_state.action_panel,
         )
-        App.place_at(button, 0.62, ROW_ACTIONS)
+        button.grid(row=0, column=0, sticky="ew")
         app_state.action_button = button
 
     @staticmethod
@@ -1520,21 +1643,8 @@ class App:
         update_file_widget()
 
     @staticmethod
-    def create_option_background():
-        return CTkFrame(
-            App.get_app_window(), bg_color=background_color,
-            fg_color=CARD_BACKGROUND_COLOR, height=46, corner_radius=12,
-            border_width=1, border_color=CARD_BORDER_COLOR,
-        )
-
-    @staticmethod
-    def create_panel_background():
-        return CTkFrame(App.get_app_window(), fg_color=background_color,
-                        corner_radius=0, border_width=0)
-
-    @staticmethod
-    def create_info_button(command, text, width=200):
-        frame = CTkFrame(App.get_app_window(), fg_color=CARD_BACKGROUND_COLOR, height=25)
+    def create_info_button(command, text, *, master):
+        frame = CTkFrame(master, fg_color=CARD_BACKGROUND_COLOR, width=1, height=25)
         button = CTkButton(
             frame, command=command, font=bold14, text="?", border_width=0,
             fg_color=CARD_BACKGROUND_COLOR, hover_color=CARD_BACKGROUND_COLOR,
@@ -1545,41 +1655,32 @@ class App:
         button.bind("<Leave>", lambda e: button.configure(text_color=CARD_MUTED_COLOR))
         button.grid(row=0, column=0, padx=(0, 7), pady=0, sticky="w")
         CTkLabel(
-            frame, text=text, width=width, height=22, fg_color="transparent",
+            frame, text=text, width=0, height=22, fg_color="transparent",
             bg_color=CARD_BACKGROUND_COLOR, text_color=CARD_VALUE_COLOR,
             font=bold13, anchor="w",
         ).grid(row=0, column=1, pady=0, sticky="w")
-        frame.grid_propagate(False)
         frame.grid_rowconfigure(0, weight=1)
-        frame.grid_columnconfigure(1, weight=1)
         return frame
 
     @staticmethod
     def create_option_menu(command, values, default_value,
-                           border_color=UI_BORDER_COLOR, border_width=1,
-                           width=159, height=26, variable=None):
-        total_width = width + 2 * border_width
-        total_height = height + 2 * border_width
-        frame = CTkFrame(
-            App.get_app_window(), fg_color=background_color, width=total_width,
-            height=total_height, border_width=0, corner_radius=UI_CORNER_RADIUS,
-        )
+                           width=159, height=28, variable=None, *, master):
         option_menu = CTkOptionMenu(
-            frame, command=command, values=values, variable=variable,
+            master, command=command, values=values, variable=variable,
             width=width, height=height, corner_radius=UI_CORNER_RADIUS,
             dropdown_font=bold12, font=bold11, anchor="center",
+            dynamic_resizing=False,
             text_color=text_color, fg_color=background_color,
             button_color=background_color, button_hover_color=background_color,
             dropdown_fg_color=background_color,
         )
-        option_menu.place(x=(total_width - width) / 2, y=(total_height - height) / 2)
         option_menu.set(default_value)
-        return frame
+        return option_menu
 
     @staticmethod
-    def create_text_box(textvariable, width, height=26, state="normal"):
+    def create_text_box(textvariable, width, height=28, state="normal", *, master):
         return CTkEntry(
-            App.get_app_window(), textvariable=textvariable,
+            master, textvariable=textvariable,
             corner_radius=UI_CORNER_RADIUS, width=width, height=height,
             font=bold11, justify="center", text_color=text_color,
             fg_color="#000000", border_width=2, border_color=UI_BORDER_COLOR,
@@ -1588,9 +1689,9 @@ class App:
 
     @staticmethod
     def create_active_button(command, text, icon, width=140, height=30,
-                             border_color=UI_ACCENT_COLOR):
+                             border_color=UI_ACCENT_COLOR, *, master):
         button = CTkButton(
-            App.get_app_window(), text=text, image=icon, width=width,
+            master, text=text, image=icon, width=width,
             height=height, font=bold11, border_width=2,
             corner_radius=UI_CORNER_RADIUS, fg_color="#282828",
             text_color="#E0E0E0", border_color=border_color,
@@ -1605,9 +1706,9 @@ class App:
         return button
 
     @staticmethod
-    def create_link_button(command, icon):
+    def create_link_button(command, icon, *, master):
         button = CTkButton(
-            App.get_app_window(), command=command, image=icon,
+            master, command=command, image=icon,
             width=30, height=30, border_width=2, corner_radius=UI_CORNER_RADIUS,
             bg_color=background_color, fg_color=CARD_BACKGROUND_COLOR,
             hover_color=widget_background_color, text_color=text_color,
@@ -1659,6 +1760,9 @@ def _load_ui_resources():
 
     def icon(name, size):
         with pillow_image_open(find_by_relative_path(f"Assets{os_separator}{name}")) as image:
+            # Keep enough pixels for high-DPI/175% zoom without retaining the
+            # original 1280–2048px artwork for a 15–18px toolbar icon.
+            image.thumbnail((size[0] * 4, size[1] * 4))
             return CTkImage(image.copy(), size=size)
     logo_git = icon("github_logo.png", (18, 18))
     logo_telegram = icon("telegram_logo.png", (16, 16))
@@ -1679,11 +1783,15 @@ def main():
         app_state.process_status_q = manager.Queue(maxsize=1)
         app_state.event_stop_upscale_process = manager.Event()
         app_state.window = FileDropWindow()
+        # Construct the complete interface before revealing it, instead of
+        # showing an empty root followed by each individual canvas repaint.
+        app_state.window.withdraw()
         for name in (
             "info_message", "selected_output_path", "selected_input_resize_factor",
             "selected_output_resize_factor", "selected_VRAM_limiter", "selected_video_codec",
         ):
             setattr(app_state, name, StringVar(master=app_state.window))
+        update_splash("Detecting graphics adapters...")
         GPU.detect()
         if preferences.gpu not in GPU.menu_list():
             preferences.gpu = GPU.default()
@@ -1698,22 +1806,26 @@ def main():
             app_state.selected_input_resize_factor, app_state.selected_output_resize_factor,
             app_state.selected_output_path, app_state.selected_VRAM_limiter,
         ):
-            app_state.traces.append((variable, variable.trace_add("write", update_file_widget)))
+            app_state.traces.append((variable, variable.trace_add("write", schedule_file_widget_update)))
+        update_splash("Preparing interface...")
         _load_ui_resources()
         App(app_state.window)
         app_state.window.file_drop_target = FileDropTarget(
             app_state.window, select_input_files, accepts=accept_input_drop,
             on_invalid=lambda: app_state.info_message.set("Unable to read the dropped file paths"),
         )
+        app_state.window.deiconify()
         app_state.window.update()
+        close_splash()
         app_state.window.mainloop()
     finally:
         try:
-            if not app_state.closing:
-                app_state.closing = True
-                try:
-                    stop_upscale_process()
-                finally:
-                    _destroy_window()
+            # The root can also be destroyed externally. Keep the manager alive
+            # through checkpoint/kill cleanup even when mainloop ends abruptly.
+            app_state.closing = True
+            try:
+                stop_upscale_process()
+            finally:
+                _destroy_window()
         finally:
             manager.shutdown()

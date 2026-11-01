@@ -27,7 +27,7 @@ def variable(value):
 
 
 def make_state():
-    return gui.AppState(
+    state = gui.AppState(
         preferences=gui.UserPreferences(),
         window=Mock(),
         info_message=Mock(),
@@ -39,6 +39,8 @@ def make_state():
         process_status_q=Queue(),
         event_stop_upscale_process=Event(),
     )
+    state.window.tk.splitlist.return_value = ()
+    return state
 
 
 class StateTestCase(unittest.TestCase):
@@ -186,16 +188,23 @@ with patch.dict(sys.modules, {'qualityscaler.gui': SimpleNamespace(main=launch_w
         schedule.assert_called_once_with(250, gui.check_upscale_steps)
 
     def test_completed_status_restores_sleep_and_refreshes_resume_badges(self):
+        self.state.processing = True
+        self.state.process_upscale_orchestrator = Mock(pid=123, exitcode=0)
+        self.state.process_upscale_orchestrator.is_alive.return_value = False
         self.state.process_status_q.put(gui.COMPLETED_STATUS)
         self.state.file_widget = Mock()
         with patch.object(gui, "allow_sleep") as allow, \
-                patch.object(gui, "show_completion_notification") as notify, \
+                patch.object(gui, "Thread") as notify, \
                 patch.object(gui, "update_file_widget") as refresh, \
                 patch.object(gui.App, "place_upscale_button"):
             gui.check_upscale_steps()
         self.state.info_message.set.assert_called_with("All files completed! :)")
         self.state.file_widget.clear_active_highlight.assert_called_once()
-        notify.assert_called_once()
+        notify.assert_called_once_with(
+            target=gui.show_completion_notification,
+            name="QualityScaler-completion-notification", daemon=True,
+        )
+        notify.return_value.start.assert_called_once()
         allow.assert_called_once()
         refresh.assert_called_once()
         self.assertFalse(self.state.processing)
@@ -241,6 +250,11 @@ class InputSelectionTests(StateTestCase):
         self.status = self.state.info_message
         self.placeholder = (Mock(), Mock(), Mock())
         self.state.input_widgets = self.placeholder
+        self.state.input_panel = Mock()
+        self.state.input_panel.winfo_rootx.return_value = 100
+        self.state.input_panel.winfo_rooty.return_value = 200
+        self.state.input_panel.winfo_width.return_value = 500
+        self.state.input_panel.winfo_height.return_value = 639
         self.state.window.winfo_rootx.return_value = 100
         self.state.window.winfo_rooty.return_value = 200
         self.state.window.winfo_width.return_value = 1000
@@ -327,7 +341,8 @@ class InputSelectionTests(StateTestCase):
 
     def test_drop_only_accepts_the_left_input_pane(self):
         self.assertTrue(gui.accept_input_drop(SimpleNamespace(x_root=350, y_root=300)))
-        for x, y in ((600, 300), (850, 300), (99, 300), (350, 199), (350, 875)):
+        for x, y in ((600, 300), (850, 300), (99, 300), (350, 199),
+                     (350, 839), (350, 875)):
             with self.subTest(x=x, y=y):
                 self.assertFalse(gui.accept_input_drop(SimpleNamespace(x_root=x, y_root=y)))
 
@@ -497,6 +512,31 @@ class DiskSpaceTests(unittest.TestCase):
 
 
 class CardResourceTests(StateTestCase):
+    def test_typing_coalesces_preview_rebuilds_until_last_edit(self):
+        self.state.file_widget = Mock()
+        with patch.object(gui, "_schedule", side_effect=["after#1", "after#2", "after#3"]) as schedule:
+            for value in ("5", "50", "500"):
+                self.state.selected_input_resize_factor.get.return_value = value
+                gui.schedule_file_widget_update()
+        self.state.file_widget.refresh_pipeline.assert_not_called()
+        self.assertEqual(schedule.call_count, 3)
+        self.assertEqual(self.state.preview_after_id, "after#3")
+        self.state.window.after_cancel.assert_any_call("after#1")
+        self.state.window.after_cancel.assert_any_call("after#2")
+        callback = schedule.call_args.args[1]
+        callback()
+        self.state.file_widget.refresh_pipeline.assert_called_once()
+        self.state.file_widget.set_input_resize_factor.assert_called_once_with(500)
+        self.assertIsNone(self.state.preview_after_id)
+
+    def test_discrete_change_cancels_pending_typing_refresh(self):
+        self.state.file_widget = Mock()
+        self.state.preview_after_id = "after#1"
+        gui.update_file_widget()
+        self.state.window.after_cancel.assert_called_once_with("after#1")
+        self.state.file_widget.refresh_pipeline.assert_called_once()
+        self.assertIsNone(self.state.preview_after_id)
+
     def test_unreadable_card_is_omitted_without_hiding_valid_cards(self):
         view = object.__new__(gui.FileWidget)
         view.file_list = ["good.png", "bad.mp4", "another.png"]
@@ -564,7 +604,7 @@ class LifecycleTests(StateTestCase):
         self.state.file_widget = Mock()
         window.destroy.side_effect = lambda: calls.append("destroy")
         with patch.object(gui, "save_user_choices_in_json", side_effect=OSError("readonly")), \
-                patch.object(gui, "stop_upscale_process", side_effect=lambda: calls.append("stop")):
+                patch.object(gui, "stop_button_command", side_effect=lambda: calls.append("stop")):
             gui.on_app_close()
         self.assertEqual(calls, ["stop", "destroy"])
         self.assertTrue(self.state.closing)

@@ -86,12 +86,34 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Native bootloader splash: visible while the onefile archive is still unpacking.
+# text_pos enables PyInstaller's per-file extraction progress; Python takes over
+# the same status line after freeze_support(), then closes it when the UI is ready.
+# Reuse the logo, with dark text in its clear lower margin; no generated artwork.
+splash = Splash(
+    str(ASSETS / "logo.png"),
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(16, 472),
+    # Pixel sizing keeps this line inside the logo's lower margin at high DPI.
+    text_size=-14,
+    text_font="TkDefaultFont",
+    text_color="#151515",
+    text_default="Starting QualityScaler...",
+    max_img_size=(480, 480),
+    full_tk=False,
+    always_on_top=False,
+)
+
 # Supplying binaries/data directly to EXE, with no COLLECT, makes this onefile.
+# Both Splash outputs are required: the native resource and its Tcl/Tk binaries.
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.datas,
+    splash,
+    splash.binaries,
     [],
     name="QualityScaler",
     console=False,

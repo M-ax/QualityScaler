@@ -14,6 +14,16 @@ if __name__ == "__main__":
 
         raise SystemExit(run_self_test(sys.argv[2]))
     else:
-        from qualityscaler.gui import main
+        from qualityscaler.startup import _enable_splash, close_splash, update_splash
 
-        main()
+        try:
+            _enable_splash()
+            update_splash("Loading QualityScaler...")
+            from qualityscaler.gui import main
+
+            update_splash("Preparing desktop...")
+            main()
+        finally:
+            # Includes import/preparation errors, SystemExit and KeyboardInterrupt.
+            # The desktop closes earlier, after window.update(), on normal startup.
+            close_splash()

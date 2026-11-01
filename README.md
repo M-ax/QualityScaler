@@ -98,6 +98,9 @@ sharpening rules differ from 4.7, so old caches must not be reused as new jobs.
 The desktop window can be resized or maximized. Settings scroll on shorter
 windows, and the full-width bottom status bar wraps long filenames and progress
 messages. Very long messages scroll within the bar without covering Stop.
+Video jobs show separate extraction and AI upscaling status/progress rows.
+Frame totals are estimates until extraction finishes; unknown totals show saved
+frame counts instead of a percentage.
 Scale edits refresh file previews after typing pauses instead of
 rebuilding the cards on every keystroke.
 
@@ -296,8 +299,9 @@ cache conversion.
   to resume in the GUI. Finished extraction is reused, and only missing upscaled
   frames are processed.
 - A partial extraction is replayed from the beginning, reusing saved frames.
-  This avoids inaccurate timestamp/keyframe seeking. Upscaling starts after
-  extraction completes successfully.
+  This avoids inaccurate timestamp/keyframe seeking. AI upscaling consumes
+  available cached frames while extraction continues, including during replay.
+  Encoding starts only after extraction succeeds and every upscaled frame is saved.
 - Frame writes are committed in batches of 16. A graceful stop commits the
   current batch; a forced termination can lose the uncommitted batch, but cannot
   mark those frames complete. SQLite recovers interrupted transactions on reopen.
@@ -308,6 +312,16 @@ cache conversion.
   processing settings is rejected rather than mixed into an existing job. Restore the saved
   settings, choose a different output folder, or move the old cache aside to
   start fresh. GPU, worker count and encoding codec can change on resume.
+- For a processing-settings mismatch, the **Upscale error** dialog also offers
+  **Clear cache and continue**. It discards only that video's cached source/AI
+  frames and restarts it using the **current UI settings** by default. Select
+  the unchecked **Use settings from failed run** option to reuse that run's
+  choices instead. The batch continues without repeating earlier files.
+  Choosing a different output folder keeps the old cache and never authorizes
+  clearing a cache in the new folder; another conflict there requires a new
+  confirmation. Other caches are untouched, and any existing output is replaced
+  only after encoding succeeds. **Cancel** or closing the dialog leaves the
+  cache unchanged; cancel first if you want to edit the current settings.
 - Encoding streams cached frames in frame-index order directly to FFmpeg, with
   optional source audio and supported video metadata. Failed encoding retains
   the frames. The final output is replaced only after FFmpeg succeeds.
@@ -349,6 +363,8 @@ Each inference process owns its own ONNX Runtime session; SQLite stays in the
 parent. Process isolation avoids the Python DirectML allocator crashes seen
 when independent sessions run concurrently in threads. Only encoded JPEG bytes
 cross process boundaries, with at most twice the worker count in flight.
+Extraction runs in a background thread with a separately bounded JPEG queue;
+the parent remains the sole SQLite writer for both source and upscaled frames.
 
 Run the tests with the same Python environment used for the application:
 

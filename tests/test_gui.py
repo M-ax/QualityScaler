@@ -18,6 +18,8 @@ from qualityscaler import gui
 from qualityscaler.catalog import MODEL_NAMES, VERSION, VRAM_model_usage
 from qualityscaler.config import ProcessingConfig
 from qualityscaler.jobs import upscale_orchestrator
+from qualityscaler.status import CacheSettingsConflict, VideoProgress
+from qualityscaler.widgets import StatusBar
 
 
 def variable(value):
@@ -93,6 +95,7 @@ assert len(MODEL_NAMES) == 9
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_start_uses_modular_orchestrator_with_exact_positional_contract(self):
+        self.state.status_bar = Mock()
         process = Mock()
         config = ProcessingConfig(
             ["clip.mp4"], "output directory", "LVAx2", 2, 0.5, 1.0,
@@ -121,6 +124,9 @@ assert len(MODEL_NAMES) == 9
         prevent.assert_called_once()
         process.start.assert_called_once()
         self.assertTrue(self.state.processing)
+        self.state.status_bar.set_video_progress.assert_called_once_with(None)
+        self.assertIs(self.state.processing_config, config)
+        self.assertNotIn("kwargs", constructor.call_args.kwargs)
 
     def test_desktop_launcher_actually_spawns_gui_free_workers(self):
         root = Path(__file__).resolve().parents[1]
@@ -180,12 +186,51 @@ with patch.dict(sys.modules, {'qualityscaler.gui': SimpleNamespace(main=launch_w
         self.state.processing = True
         self.state.process_upscale_orchestrator = Mock()
         self.state.file_widget = Mock()
+        self.state.status_bar = Mock()
         self.state.process_status_q.put("2. Upscaling video 30%")
         with patch.object(gui, "_schedule") as schedule:
             gui.check_upscale_steps()
         self.state.info_message.set.assert_called_with("2. Upscaling video 30%")
         self.state.file_widget.highlight_active_file.assert_called_once_with(2)
+        self.state.status_bar.set_video_progress.assert_called_once_with(None)
         schedule.assert_called_once_with(250, gui.check_upscale_steps)
+
+    def test_video_snapshot_updates_both_rows_and_highlight_from_message(self):
+        self.state.processing = True
+        self.state.process_upscale_orchestrator = Mock()
+        self.state.file_widget = Mock()
+        self.state.status_bar = Mock()
+        progress = VideoProgress("2. Upscaling video", 90, 30, 100, False)
+        self.state.process_status_q.put(progress)
+        with patch.object(gui, "_schedule") as schedule:
+            gui.check_upscale_steps()
+        self.state.info_message.set.assert_called_once_with(progress.message)
+        self.state.status_bar.set_video_progress.assert_called_once_with(progress)
+        self.state.file_widget.highlight_active_file.assert_called_once_with(2)
+        schedule.assert_called_once_with(250, gui.check_upscale_steps)
+
+    def test_encoding_snapshot_stays_structured_and_image_progress_resets_rows(self):
+        self.state.processing = True
+        self.state.process_upscale_orchestrator = Mock()
+        self.state.file_widget = Mock()
+        self.state.status_bar = Mock()
+        progress = VideoProgress("1. Encoding upscaled video", 100, 100, 100, True)
+        with patch.object(gui, "_schedule"):
+            self.state.process_status_q.put(progress)
+            gui.check_upscale_steps()
+            self.state.status_bar.set_video_progress.assert_called_with(progress)
+            self.state.process_status_q.put("2. Upscaling image")
+            gui.check_upscale_steps()
+        self.state.info_message.set.assert_called_with("2. Upscaling image")
+        self.state.status_bar.set_video_progress.assert_called_with(None)
+        self.state.file_widget.highlight_active_file.assert_called_with(2)
+
+    def test_progress_after_job_settles_cannot_repopulate_rows(self):
+        self.state.status_bar = Mock()
+        self.state.process_status_q.put(VideoProgress("1. Upscaling video", 10, 2, None, False))
+        gui.check_upscale_steps()
+        self.state.status_bar.set_video_progress.assert_not_called()
+        self.state.info_message.set.assert_not_called()
 
     def test_completed_status_restores_sleep_and_refreshes_resume_badges(self):
         self.state.processing = True
@@ -233,6 +278,170 @@ with patch.dict(sys.modules, {'qualityscaler.gui': SimpleNamespace(main=launch_w
         with patch.object(gui, "Process") as constructor:
             gui.upscale_button_command()
         constructor.assert_not_called()
+
+
+class CacheConflictDialogTests(StateTestCase):
+    def test_clear_action_explains_scope_and_cancel_preserves_cache(self):
+        command = Mock()
+        with patch.object(gui, "MessageBox") as dialog:
+            gui.show_error_message("Cached settings differ", clear_cache_command=command)
+        self.assertEqual(dialog.call_args.kwargs, {
+            "action_text": "Clear cache and continue", "action_command": command,
+            "action_option_text": "Use settings from failed run",
+        })
+        self.assertIn("Current UI settings are used by default", dialog.call_args.args[2])
+        details = "\n".join(dialog.call_args.args[4])
+        self.assertIn("cached source and AI frames", details)
+        self.assertIn("Other caches are untouched", details)
+        self.assertIn("Any existing output is replaced only after the new video encodes successfully", details)
+        self.assertIn("Cancel leaves the cache unchanged", details)
+        self.assertIn("old cache is kept", details)
+        command.assert_not_called()
+
+    def test_generic_error_has_no_cache_deletion_action(self):
+        with patch.object(gui, "MessageBox") as dialog:
+            gui.show_error_message("The cached job has different settings")
+        self.assertEqual(dialog.call_args.kwargs, {})
+
+    def test_action_dismisses_dialog_before_starting_once(self):
+        events = []
+        dialog = object.__new__(gui.MessageBox)
+        dialog.grab_release = lambda: events.append("release")
+        dialog.destroy = lambda: events.append("destroy")
+        dialog._action_command = lambda: events.append("retry")
+        dialog._action_event()
+        dialog._action_event()
+        self.assertEqual(events, ["release", "destroy", "retry"])
+
+    def test_settings_choice_is_read_before_destroy_and_sent_once(self):
+        for use_failed_settings in (False, True):
+            with self.subTest(use_failed_settings=use_failed_settings):
+                command = Mock()
+                option = Mock()
+                option.get.return_value = use_failed_settings
+                dialog = object.__new__(gui.MessageBox)
+                dialog._action_command = command
+                dialog._action_option = option
+                dialog.grab_release = Mock()
+                dialog.destroy = lambda: setattr(
+                    option.get, "side_effect", AssertionError("Read choice after destroying dialog"),
+                )
+                dialog._action_event()
+                dialog._action_event()
+                command.assert_called_once_with(use_failed_settings)
+                option.get.assert_called_once()
+
+    def test_cancel_and_window_close_disarm_the_action(self):
+        for dismiss in ("_ok_event", "_on_closing"):
+            with self.subTest(dismiss=dismiss):
+                command = Mock()
+                dialog = object.__new__(gui.MessageBox)
+                dialog.grab_release = Mock()
+                dialog.destroy = Mock()
+                dialog._action_command = command
+                getattr(dialog, dismiss)()
+                dialog._action_event()
+                command.assert_not_called()
+                dialog.destroy.assert_called_once()
+
+    def test_retry_uses_current_ui_settings_by_default_and_preserves_batch_numbering(self):
+        config = ProcessingConfig(
+            ["first.png", "second.mp4", "third.mp4"], gui.OUTPUT_PATH_CODED, "LVAx2",
+            2, 0.5, 1.0, "0", 800, 0.3, True, ".png", ".mp4", "x264",
+        )
+        self.state.preferences.ai_model = "BSRGANx2"
+        self.state.selected_input_resize_factor.get.return_value = "75"
+        self.state.selected_output_resize_factor.get.return_value = "125"
+        self.state.file_widget = Mock()
+        self.state.file_widget.get_selected_file_list.return_value = ["unrelated.mp4"]
+        with patch.object(gui, "build_processing_config") as build, \
+                patch.object(gui, "Process", return_value=Mock()) as constructor, \
+                patch.object(gui, "prevent_sleep"), \
+                patch.object(gui.App, "place_stop_button"), \
+                patch.object(gui, "_schedule"):
+            gui._retry_after_cache_conflict(config, 2)
+        build.assert_not_called()
+        self.state.file_widget.get_selected_file_list.assert_not_called()
+        self.assertEqual(constructor.call_args.kwargs["kwargs"], {
+            "retry_from": 2, "clear_cache": True,
+        })
+        args = constructor.call_args.kwargs["args"]
+        self.assertEqual(args[2], ["first.png", "second.mp4", "third.mp4"])
+        self.assertEqual(args[4], "BSRGANx2")
+        self.assertEqual(args[6:8], (0.75, 1.25))
+        self.assertIsNot(self.state.processing_config, config)
+
+    def test_failed_run_settings_require_explicit_opt_in(self):
+        config = ProcessingConfig(
+            ["first.png", "second.mp4", "third.mp4"], "original output", "LVAx2",
+            2, 0.5, 1.0, "0", 800, 0.3, True, ".png", ".mp4", "x264",
+        )
+        self.state.preferences.ai_model = "Changed after failure"
+        with patch.object(gui, "_processing_config") as build, \
+                patch.object(gui, "Process", return_value=Mock()) as constructor, \
+                patch.object(gui, "prevent_sleep"), \
+                patch.object(gui.App, "place_stop_button"), \
+                patch.object(gui, "_schedule"):
+            gui._retry_after_cache_conflict(config, 2, use_failed_settings=True)
+        build.assert_not_called()
+        self.assertEqual(constructor.call_args.kwargs["kwargs"], {
+            "retry_from": 2, "clear_cache": True,
+        })
+        args = constructor.call_args.kwargs["args"]
+        self.assertEqual(args[2], ["first.png", "second.mp4", "third.mp4"])
+        self.assertEqual(args[3:5], ("original output", "LVAx2"))
+        self.assertIs(self.state.processing_config, config)
+
+    def test_current_output_folder_change_does_not_authorize_clearing_another_cache(self):
+        config = ProcessingConfig(
+            ["first.png", "second.mp4"], "failed output", "LVAx2",
+            2, 0.5, 1.0, "0", 800, 0.3, True, ".png", ".mp4", "x264",
+        )
+        self.state.selected_output_path.get.return_value = "new output"
+        with patch.object(gui, "_start_upscale") as start, \
+                patch.object(gui, "check_disk_space", return_value=None) as disk:
+            gui._retry_after_cache_conflict(config, 2)
+        args, kwargs = start.call_args
+        self.assertEqual(args[0].selected_output_path, "new output")
+        self.assertEqual(kwargs, {"retry_from": 2, "clear_cache": False})
+        disk.assert_called_once_with("new output", ["second.mp4"])
+
+    def test_equivalent_output_locations_allow_clearing_the_reported_cache(self):
+        with TemporaryDirectory() as directory:
+            video = str(Path(directory) / "second.mp4")
+            config = ProcessingConfig(
+                ["first.png", video], gui.OUTPUT_PATH_CODED, "LVAx2",
+                2, 0.5, 1.0, "0", 800, 0.3, True, ".png", ".mp4", "x264",
+            )
+            self.state.selected_output_path.get.return_value = directory
+            with patch.object(gui, "_start_upscale") as start, \
+                    patch.object(gui, "check_disk_space", return_value=None):
+                gui._retry_after_cache_conflict(config, 2)
+            self.assertEqual(start.call_args.kwargs, {"retry_from": 2, "clear_cache": True})
+
+    def test_invalid_current_settings_do_not_clear_or_restart(self):
+        self.state.preferences.ai_model = "Invalid model"
+        with patch.object(gui, "_start_upscale") as start:
+            gui._retry_after_cache_conflict(Mock(selected_file_list=["clip.mp4"]), 1)
+        start.assert_not_called()
+        self.state.info_message.set.assert_called_once_with("Please select the AI model")
+
+    def test_low_disk_space_blocks_retry_without_clearing(self):
+        with patch.object(gui, "_start_upscale") as start, \
+                patch.object(gui, "check_disk_space", return_value="Free up space"), \
+                patch.object(gui, "show_disk_space_error_message") as error:
+            gui._retry_after_cache_conflict(Mock(selected_file_list=["clip.mp4"]), 1)
+        start.assert_not_called()
+        error.assert_called_once_with("Free up space")
+
+    def test_retry_cannot_start_during_another_job_or_shutdown(self):
+        for flag in ("processing", "closing"):
+            with self.subTest(flag=flag):
+                setattr(self.state, flag, True)
+                with patch.object(gui, "_start_upscale") as start:
+                    gui._retry_after_cache_conflict(Mock(), 2)
+                start.assert_not_called()
+                setattr(self.state, flag, False)
 
 
 class InputSelectionTests(StateTestCase):
@@ -349,12 +558,112 @@ class InputSelectionTests(StateTestCase):
     def test_clear_resets_widget_and_queue_before_showing_placeholder(self):
         gui.select_input_files([self.first])
         view = self.state.file_widget
+        self.state.status_bar = Mock()
         with patch.object(gui.App, "place_loadFile_section") as placeholder:
             self.assertTrue(gui.clear_input_files())
         self.assertIsNone(self.state.file_widget)
         self.assertEqual(self.state.selected_file_list, [])
         view.destroy.assert_called_once()
         placeholder.assert_called_once()
+        self.state.status_bar.set_video_progress.assert_called_once_with(None)
+
+    def test_new_selection_clears_video_rows_from_previous_job(self):
+        self.state.status_bar = Mock()
+        self.assertTrue(gui.select_input_files([self.first]))
+        self.state.status_bar.set_video_progress.assert_called_once_with(None)
+
+
+class VideoStatusWidgetTests(unittest.TestCase):
+    """Snapshot rendering rules without a Tk interpreter or display."""
+
+    def setUp(self):
+        self.bar = object.__new__(StatusBar)
+        self.bar.video_rows = Mock()
+        self.bar.extraction_label = Mock()
+        self.bar.upscaling_label = Mock()
+        self.bar.extraction_bar = Mock()
+        self.bar.upscaling_bar = Mock()
+        self.bar._queue_fit = Mock()
+        self.bar._video_progress = None
+
+    def test_unknown_total_shows_counts_without_a_percentage_or_fake_fraction(self):
+        self.bar.set_video_progress(VideoProgress("1. Video", 42, 17, None, False))
+        self.bar.extraction_label.configure.assert_called_with(
+            text="Extraction: 42 frames, total unknown — extracting"
+        )
+        self.bar.upscaling_label.configure.assert_called_with(
+            text="AI upscaling: 17 frames, total unknown — upscaling"
+        )
+        self.bar.extraction_bar.set.assert_called_with(0)
+        self.bar.upscaling_bar.set.assert_called_with(0)
+        self.bar.video_rows.grid.assert_called_once_with()
+
+    def test_estimated_total_is_marked_and_bars_clamp_without_losing_actual_counts(self):
+        self.bar.set_video_progress(VideoProgress("1. Video", 120, 110, 100, False))
+        self.bar.extraction_label.configure.assert_called_with(
+            text="Extraction: 120 / ~100 frames — extracting"
+        )
+        self.bar.upscaling_label.configure.assert_called_with(
+            text="AI upscaling: 110 / ~100 frames — upscaling"
+        )
+        self.bar.extraction_bar.set.assert_called_with(1)
+        self.bar.upscaling_bar.set.assert_called_with(1)
+        self.bar.set_video_progress(VideoProgress("1. Video", 130, 110, 130, True))
+        self.bar.extraction_label.configure.assert_called_with(
+            text="Extraction: 130 / 130 frames — complete"
+        )
+        self.bar.upscaling_label.configure.assert_called_with(
+            text="AI upscaling: 110 / 130 frames — upscaling"
+        )
+        self.bar.upscaling_bar.set.assert_called_with(110 / 130)
+
+    def test_waiting_for_frames_is_not_completion_when_estimate_is_reached(self):
+        self.bar.set_video_progress(VideoProgress("1. Video", 100, 100, 100, False))
+        self.bar.upscaling_label.configure.assert_called_with(
+            text="AI upscaling: 100 / ~100 frames — waiting for frames"
+        )
+        self.bar.set_video_progress(VideoProgress("1. Video", 100, 100, 100, True))
+        self.bar.upscaling_label.configure.assert_called_with(
+            text="AI upscaling: 100 / 100 frames — complete"
+        )
+
+    def test_zero_estimate_does_not_divide_by_zero(self):
+        self.bar.set_video_progress(VideoProgress("1. Video", 1, 0, 0, False))
+        self.bar.extraction_bar.set.assert_called_with(0)
+        self.bar.upscaling_bar.set.assert_called_with(0)
+
+    def test_new_file_replaces_both_resume_counters_and_reset_clears_them(self):
+        self.bar.set_video_progress(VideoProgress("1. Video", 100, 90, 100, True))
+        self.bar.set_video_progress(VideoProgress("2. Video", 4, 2, 50, False))
+        self.bar.extraction_bar.set.assert_called_with(4 / 50)
+        self.bar.upscaling_bar.set.assert_called_with(2 / 50)
+        self.bar.upscaling_label.configure.assert_called_with(
+            text="AI upscaling: 2 / ~50 frames — upscaling"
+        )
+        self.bar.set_video_progress(None)
+        self.bar.video_rows.grid_remove.assert_called_once_with()
+        self.bar.extraction_label.configure.assert_called_with(text="")
+        self.bar.upscaling_label.configure.assert_called_with(text="")
+        self.bar.extraction_bar.set.assert_called_with(0)
+        self.bar.upscaling_bar.set.assert_called_with(0)
+        self.assertIsNone(self.bar._video_progress)
+
+    def test_cleanup_preserves_counters_without_leaving_active_stage_wording(self):
+        self.bar.set_video_progress(VideoProgress("1. Video", 100, 90, 100, True))
+        for status in ("stopping", "finalizing", "stopped", "error", "job finished"):
+            with self.subTest(status=status):
+                self.bar.set_video_status(status)
+                self.bar.extraction_label.configure.assert_called_with(
+                    text="Extraction: 100 / 100 frames — complete"
+                )
+                self.bar.upscaling_label.configure.assert_called_with(
+                    text=f"AI upscaling: 90 / 100 frames — {status}"
+                )
+                self.bar.upscaling_bar.set.assert_called_with(0.9)
+        self.bar.set_video_progress(None)
+        self.bar.set_video_status("error")
+        self.bar.video_rows.grid_remove.assert_called_once_with()
+        self.bar.upscaling_label.configure.assert_called_with(text="")
 
 
 class PreferencesAndConfigTests(StateTestCase):
@@ -579,6 +888,17 @@ class CardResourceTests(StateTestCase):
         cards[1].configure.assert_called_with(border_color=gui.CARD_ACCENT_COLOR)
         view.clear_active_highlight()
         cards[1].configure.assert_called_with(border_color=gui.CARD_BORDER_COLOR)
+
+    def test_removing_file_resets_previous_video_rows(self):
+        view = object.__new__(gui.FileWidget)
+        view.file_list = ["clip.mp4", "image.png"]
+        view.clean_file_list = Mock()
+        view._render_cards = Mock()
+        self.state.status_bar = Mock()
+        view._remove_file("clip.mp4")
+        self.assertEqual(self.state.selected_file_list, ["image.png"])
+        self.state.status_bar.set_video_progress.assert_called_once_with(None)
+        self.state.info_message.set.assert_called_once_with("Ready — 1 input file(s)")
 
 
 class LifecycleTests(StateTestCase):

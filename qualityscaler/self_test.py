@@ -235,9 +235,13 @@ def _check_bundle(root, report):
     else:
         raise RuntimeError("The job did not pause")
     with FrameStore(cache, read_only=True) as store:
-        total = store.get_metadata("total_frames")
+        # Extraction and AI now overlap, so pausing at the first saved AI frame
+        # can leave a partial source cache with no exact total recorded yet.
+        total = 8
+        recorded_total = store.get_metadata("total_frames")
         saved = store.frame_count("upscaled")
-        if total != 8 or not 0 < saved < total or store.get_metadata("stage") != "paused":
+        if (recorded_total not in (None, total) or not 0 < saved < total
+                or store.get_metadata("stage") != "paused"):
             raise RuntimeError("Interrupted job state was not saved correctly")
         if (store.get_metadata("job_version") != 3
                 or store.get_metadata("source_size") != [48, 32]
@@ -262,7 +266,8 @@ def _check_bundle(root, report):
     if len(submitted) != total - saved:
         raise RuntimeError("Resume did not process exactly the missing frames")
     with FrameStore(cache, read_only=True) as store:
-        if store.get_metadata("stage") != "complete" or store.frame_count("upscaled") != total:
+        if (store.get_metadata("stage") != "complete" or store.frame_count("upscaled") != total
+                or store.get_metadata("total_frames") != total):
             raise RuntimeError("Resumed job did not complete")
         for index, data in previous_frames.items():
             if store.get_frame("upscaled", index) != data:

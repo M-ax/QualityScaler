@@ -108,15 +108,17 @@ class RealModelIntegrationTests(unittest.TestCase):
                 ffmpeg=ffmpeg, stop_event=stop, status=pause_after_saving,
             ).run(source, output, cache, settings)
         with FrameStore(cache, read_only=True) as store:
-            total = store.get_metadata("total_frames")
+            total = 8  # The generated source, even if extraction was interrupted.
+            extraction_complete = store.get_metadata("extraction_complete", False)
             saved_before = store.frame_count("upscaled")
             original_source = list(store.iter_frames("source"))
             saved_frames = {index: store.get_frame("upscaled", index)
                             for index in store.iter_indices("upscaled")}
-            self.assertEqual(total, 8)
             self.assertGreater(saved_before, 0)
             self.assertLess(saved_before, total)
-            self.assertTrue(store.get_metadata("extraction_complete"))
+            self.assertEqual(
+                store.get_metadata("total_frames"), total if extraction_complete else None,
+            )
             self.assertEqual(store.get_metadata("stage"), "paused")
             self.assertEqual(store.get_metadata("source_size"), [48, 32])
             self.assertEqual(store.get_metadata("input_size"), [24, 16])
@@ -131,13 +133,14 @@ class RealModelIntegrationTests(unittest.TestCase):
                 return super().submit(*args, **kwargs)
 
         # Record submissions without replacing inference or process isolation.
-        # A complete extraction must not run again or saved JPEGs be recomputed.
-        with patch.object(ffmpeg, "extract",
-                          side_effect=AssertionError("Resume repeated extraction")):
+        # Complete extraction is reused; interrupted extraction is replayed
+        # without recomputing or overwriting already saved AI/source JPEGs.
+        with patch.object(ffmpeg, "extract", wraps=ffmpeg.extract) as extract:
             VideoUpscaler(
                 ffmpeg=ffmpeg,
                 executor_factory=partial(RecordingExecutor, mp_context=get_context("spawn")),
             ).run(source, output, cache, settings)
+        self.assertEqual(extract.call_count, 0 if extraction_complete else 1)
         self.assertEqual(len(inference_submissions), total - saved_before)
         self.assertEqual(list(cache.parent.iterdir()), [cache])
         with FrameStore(cache, read_only=True) as store:
@@ -145,7 +148,9 @@ class RealModelIntegrationTests(unittest.TestCase):
             self.assertEqual(store.get_metadata("settings")["model"], self.model)
             self.assertEqual(store.frame_count("source"), total)
             self.assertEqual(store.frame_count("upscaled"), total)
-            self.assertEqual(list(store.iter_frames("source")), original_source)
+            self.assertEqual(
+                list(store.iter_frames("source"))[:len(original_source)], original_source,
+            )
             for index, data in saved_frames.items():
                 self.assertEqual(store.get_frame("upscaled", index), data)
             expected_shape = decode_frame(store.get_frame("upscaled", 0)).shape

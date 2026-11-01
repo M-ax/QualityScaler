@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 from qualityscaler import gui
 from qualityscaler.catalog import MODEL_NAMES, VERSION, VRAM_model_usage
 from qualityscaler.config import ProcessingConfig
+from qualityscaler.encoders import EncoderOptions
 from qualityscaler.jobs import upscale_orchestrator
 from qualityscaler.status import CacheSettingsConflict, VideoProgress
 from qualityscaler.widgets import StatusBar
@@ -38,6 +39,8 @@ def make_state():
         selected_output_resize_factor=variable("100"),
         selected_VRAM_limiter=variable("4"),
         selected_video_codec=variable("x264"),
+        selected_video_crf=variable("23"),
+        selected_video_bitrate=variable("50000"),
         process_status_q=Queue(),
         event_stop_upscale_process=Event(),
     )
@@ -100,6 +103,7 @@ assert len(MODEL_NAMES) == 9
         config = ProcessingConfig(
             ["clip.mp4"], "output directory", "LVAx2", 2, 0.5, 1.0,
             "0", 800, 0.3, True, ".png", ".mp4", "h264_nvenc",
+            EncoderOptions(preset="p5", bitrate_kbps=12000),
         )
         with patch.object(gui, "build_processing_config", return_value=config), \
                 patch.object(gui.App, "place_stop_button"), \
@@ -113,6 +117,7 @@ assert len(MODEL_NAMES) == 9
             self.state.process_status_q, self.state.event_stop_upscale_process,
             ["clip.mp4"], "output directory", "LVAx2", 2, 0.5, 1.0,
             "0", 800, 0.3, True, ".png", ".mp4", "h264_nvenc",
+            config.selected_video_options,
         ))
         bound = signature(upscale_orchestrator).bind(*args)
         self.assertIs(bound.arguments["event_stop_upscale_process"],
@@ -678,13 +683,14 @@ class PreferencesAndConfigTests(StateTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_exact_upstream_config_fields_and_nine_model_catalog(self):
+    def test_processing_config_fields_and_nine_model_catalog(self):
         self.assertEqual([field.name for field in fields(ProcessingConfig)], [
             "selected_file_list", "selected_output_path", "selected_AI_model",
             "selected_AI_multithreading", "input_resize_factor", "output_resize_factor",
             "selected_gpu", "tiles_resolution", "selected_sharpening_amount",
             "selected_keep_frames", "selected_image_extension",
             "selected_video_extension", "selected_video_codec",
+            "selected_video_options",
         ])
         self.assertEqual(VERSION, "2026.4")
         self.assertEqual(MODEL_NAMES, (
@@ -706,6 +712,75 @@ class PreferencesAndConfigTests(StateTestCase):
         self.assertEqual(config.output_resize_factor, 1.0)
         self.assertEqual(config.selected_sharpening_amount, 0.3)
         self.assertEqual(config.selected_AI_multithreading, 1)
+        self.assertEqual(config.selected_video_options, EncoderOptions())
+
+    def test_encoder_options_are_converted_and_validate_only_active_value(self):
+        self.state.preferences.video_preset = "slow"
+        self.state.preferences.video_rate_control = "CRF"
+        self.state.selected_video_crf.get.return_value = "18.5"
+        self.state.selected_video_bitrate.get.return_value = "unused"
+        config = gui.build_processing_config()
+        self.assertEqual(config.selected_video_options, EncoderOptions(
+            preset="slow", rate_control="CRF", crf=18.5,
+        ))
+        self.state.preferences.video_rate_control = "Bitrate"
+        self.state.selected_video_bitrate.get.return_value = "8500"
+        self.state.selected_video_crf.get.return_value = "unused"
+        self.assertEqual(gui.build_processing_config().selected_video_options.bitrate_kbps, 8500)
+
+    def test_invalid_encoder_numbers_are_reported_before_start(self):
+        for mode, name, values in (
+            ("CRF", "selected_video_crf", ("bad", "-1", "52", "nan", "inf")),
+            ("Bitrate", "selected_video_bitrate", ("bad", "0", "-1", "1.5", "nan", "inf")),
+        ):
+            self.state.preferences.video_rate_control = mode
+            for value in values:
+                with self.subTest(mode=mode, value=value):
+                    getattr(self.state, name).get.return_value = value
+                    self.assertIsNone(gui.build_processing_config())
+                    self.assertTrue(self.state.info_message.set.call_args.args[0])
+
+    def test_image_only_jobs_ignore_unused_video_quality_values(self):
+        self.state.file_widget.get_selected_file_list.return_value = ["photo.png"]
+        for mode, name in (("CRF", "selected_video_crf"), ("Bitrate", "selected_video_bitrate")):
+            with self.subTest(mode=mode):
+                self.state.preferences.video_rate_control = mode
+                getattr(self.state, name).get.return_value = ""
+                config = gui.build_processing_config()
+                self.assertEqual(config.selected_file_list, ["photo.png"])
+                self.assertEqual(config.selected_video_options, EncoderOptions())
+                with patch.object(gui, "get_resume_progress") as resume:
+                    self.assertIsNone(gui.get_video_resume_progress("clip.mp4"))
+                resume.assert_not_called()
+        self.state.info_message.set.assert_not_called()
+
+    def test_mixed_batch_validates_video_quality_even_when_image_is_first(self):
+        self.state.file_widget.get_selected_file_list.return_value = ["photo.png", "clip.mp4"]
+        self.state.selected_video_bitrate.get.return_value = ""
+        self.assertIsNone(gui.build_processing_config())
+        self.assertIn("bitrate", self.state.info_message.set.call_args.args[0])
+
+    def test_codec_change_resets_only_unsupported_options(self):
+        self.state.preferences.video_preset = "veryfast"
+        self.state.preferences.video_rate_control = "CRF"
+        with patch.object(gui, "update_file_widget"):
+            gui.App.select_video_codec_from_menu("x265")
+            self.assertEqual(self.state.preferences.video_preset, "veryfast")
+            self.assertEqual(self.state.preferences.video_rate_control, "CRF")
+            gui.App.select_video_codec_from_menu("h264_nvenc")
+        self.assertEqual(self.state.preferences.video_preset, "Default")
+        self.assertEqual(self.state.preferences.video_rate_control, "Bitrate")
+        self.state.selected_video_crf.set.assert_not_called()
+        self.state.selected_video_bitrate.set.assert_not_called()
+
+    def test_codec_separator_does_not_change_selected_encoder(self):
+        with patch.object(gui, "refresh_encoder_controls") as refresh, \
+                patch.object(gui, "update_file_widget") as update:
+            gui.App.select_video_codec_from_menu("----")
+        self.assertEqual(self.state.preferences.video_codec, "x264")
+        self.state.selected_video_codec.set.assert_called_once_with("x264")
+        refresh.assert_not_called()
+        update.assert_not_called()
 
     def test_models_use_upstream_vram_multipliers(self):
         for model, multiplier in VRAM_model_usage.items():
@@ -750,6 +825,8 @@ class PreferencesAndConfigTests(StateTestCase):
         self.state.info_message.set.assert_not_called()
 
     def test_gpu_selection_applies_detected_vram_and_vendor_codec(self):
+        self.state.preferences.video_preset = "slow"
+        self.state.preferences.video_rate_control = "CRF"
         with patch.object(gui.GPU, "vram_for", return_value=12), \
                 patch.object(gui.GPU, "codec_for", return_value="hevc_nvenc"), \
                 patch.object(gui, "update_file_widget") as refresh:
@@ -759,6 +836,8 @@ class PreferencesAndConfigTests(StateTestCase):
         self.state.selected_VRAM_limiter.set.assert_called_with("12")
         self.state.selected_video_codec.set.assert_called_with("hevc_nvenc")
         self.assertEqual(self.state.preferences.video_codec, "hevc_nvenc")
+        self.assertEqual(self.state.preferences.video_preset, "Default")
+        self.assertEqual(self.state.preferences.video_rate_control, "Bitrate")
         refresh.assert_called_once()
 
     def test_no_gpu_detection_preserves_vram_fallback_and_software_codec(self):
@@ -783,6 +862,10 @@ class PreferencesAndConfigTests(StateTestCase):
             with patch.object(gui, "USER_PREFERENCE_PATH", str(path)):
                 self.state.preferences.app_zoom = "125%"
                 self.state.preferences.sharpening = "High"
+                self.state.preferences.video_preset = "veryfast"
+                self.state.preferences.video_rate_control = "CRF"
+                self.state.selected_video_crf.get.return_value = "19.5"
+                self.state.selected_video_bitrate.get.return_value = "9000"
                 gui.save_user_choices_in_json()
                 data = json.loads(path.read_text())
                 self.assertEqual(data["default_keep_frames"], "ON")
@@ -790,9 +873,28 @@ class PreferencesAndConfigTests(StateTestCase):
                 loaded = gui.load_user_preferences()
                 self.assertEqual(loaded.app_zoom, "125%")
                 self.assertEqual(loaded.sharpening, "High")
+                self.assertEqual(loaded.video_preset, "veryfast")
+                self.assertEqual(loaded.video_rate_control, "CRF")
+                self.assertEqual(loaded.video_crf, "19.5")
+                self.assertEqual(loaded.video_bitrate, "9000")
                 for contents in ("{broken", "[]", '{"default_app_zoom": "broken"}'):
                     path.write_text(contents)
                     self.assertEqual(gui.load_user_preferences().app_zoom, "100%")
+
+    def test_preferences_normalize_unsupported_encoder_choices(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            path.write_text(json.dumps({
+                "default_video_codec": "h264_amf",
+                "default_video_preset": "veryfast",
+                "default_video_rate_control": "CRF",
+            }))
+            with patch.object(gui, "USER_PREFERENCE_PATH", str(path)):
+                preferences = gui.load_user_preferences()
+        self.assertEqual(preferences.video_codec, "h264_amf")
+        self.assertEqual(preferences.video_preset, "Default")
+        self.assertEqual(preferences.video_rate_control, "Bitrate")
+        self.assertEqual(preferences.video_bitrate, "50000")
 
 
 class DiskSpaceTests(unittest.TestCase):

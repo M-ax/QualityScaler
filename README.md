@@ -64,6 +64,7 @@ native file drag-and-drop.
 - Resize image/video before upscaling and scale the output resolution
 - AI sharpening: OFF, Low, or High (the 2026 control replaces the old blending UI)
 - Upscale preview window with video frame seeking, scroll zoom, and drag-to-pan
+- Encoder-specific speed presets and selectable CRF or target bitrate for video export
 - Video upscaling STOP & RESUME, with frames and job settings in one SQLite cache
 - Native file drag-and-drop and appendable input selection
 - 🔒 Privacy focused - no internet connection required, everything runs on your PC
@@ -125,6 +126,31 @@ release their resources. Completion is reported only after the worker has exited
 successfully and the file cards are refreshed. Stop and close remain responsive
 while progress is checkpointed; a hung worker still has the 10-second hard-stop
 fallback.
+
+### Video encoder options
+
+Choose a **Video codec**, then an **Encoder preset** and **Rate control** mode.
+The controls list only options supported by that encoder:
+
+| Encoder | Presets | Rate control |
+| --- | --- | --- |
+| x264 / x265 | ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo | CRF or Bitrate |
+| NVIDIA NVENC | p1 (fastest) through p7 (slowest / higher quality) | Bitrate |
+| AMD AMF | speed, balanced, quality | Bitrate |
+| Intel QSV | veryfast, faster, fast, medium, slow, slower, veryslow | Bitrate |
+
+**Default** leaves the preset to the encoder. The initial rate control remains
+**Bitrate, 50000 kb/s** (50 Mb/s), matching previous exports. Bitrate is a target,
+not a strict constant rate or guaranteed file size. **CRF** accepts values from
+0 to 51, including decimals; lower values mean higher quality and larger files.
+23 is a starting point, not equivalent quality across codecs. Hardware quality
+modes are not labeled CRF and are not exposed by this control.
+
+Selections are saved with the other app preferences. Switching encoders resets
+unsupported presets to Default and unsupported CRF mode to Bitrate. If encoding
+falls back to x264, incompatible hardware presets are omitted, while the bitrate
+is retained. Audio-only retries keep the selected video settings. Changing
+encoding settings reuses cached AI frames; it does not require upscaling again.
 
 ## 🤖 Other AI projects
 - [RealScaler](https://github.com/Djdefrag/RealScaler) - image/video AI upscaler (Real-ESRGAN)

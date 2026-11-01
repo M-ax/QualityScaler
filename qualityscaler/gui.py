@@ -54,6 +54,7 @@ from .catalog import (
 )
 from .config import ProcessingConfig
 from .drag_drop import FileDropTarget, FileDropWindow
+from .encoders import EncoderOptions, encoder_capabilities, normalize_encoder_options
 from .formats import VIDEO_EXTENSIONS
 from .gpu import GPU, get_AI_engine_info
 from .inputs import merge_input_files, supported_input_files
@@ -124,6 +125,10 @@ class UserPreferences:
     image_extension: str = image_extension_list[0]
     video_extension: str = video_extension_list[0]
     video_codec: str = video_codec_list[0]
+    video_preset: str = "Default"
+    video_rate_control: str = "Bitrate"
+    video_crf: str = "23"
+    video_bitrate: str = "50000"
     sharpening: str = sharpening_list[1]
     output_path: str = OUTPUT_PATH_CODED
     input_resize_factor: str = "50"
@@ -149,6 +154,8 @@ class AppState:
     selected_output_resize_factor: Optional[StringVar] = None
     selected_VRAM_limiter: Optional[StringVar] = None
     selected_video_codec: Optional[StringVar] = None
+    selected_video_crf: Optional[StringVar] = None
+    selected_video_bitrate: Optional[StringVar] = None
     file_widget: Optional["FileWidget"] = None
     process_upscale_orchestrator: Optional[Any] = None
     processing_config: Optional[ProcessingConfig] = None
@@ -176,7 +183,9 @@ ROW_RESOLUTION = 3
 ROW_GPU = 4
 ROW_OUTPUT_FORMAT = 5
 ROW_CODEC = 6
-ROW_OUTPUT_PATH = 7
+ROW_ENCODER_PRESET = 7
+ROW_ENCODER_QUALITY = 8
+ROW_OUTPUT_PATH = 9
 little_textbox_width = 74
 little_menu_width = 98
 
@@ -703,9 +712,50 @@ def _positive_integer(variable, label):
     return value
 
 
+def _video_encoder_options():
+    preferences = app_state.preferences
+    options = dict(preset=preferences.video_preset, rate_control=preferences.video_rate_control)
+    if preferences.video_rate_control == "CRF":
+        value = (app_state.selected_video_crf.get() if app_state.selected_video_crf is not None
+                 else preferences.video_crf)
+        try:
+            options["crf"] = float(value)
+        except (ValueError, TypeError, OverflowError):
+            raise ValueError("CRF must be a number between 0 and 51") from None
+    else:
+        value = (app_state.selected_video_bitrate.get() if app_state.selected_video_bitrate is not None
+                 else preferences.video_bitrate)
+        try:
+            options["bitrate_kbps"] = int(value)
+        except (ValueError, TypeError, OverflowError):
+            raise ValueError("Video bitrate must be a positive whole number in kb/s") from None
+    result = EncoderOptions(**options)
+    result.validate(preferences.video_codec)
+    return result
+
+
+def _normalize_encoder_preferences(preferences):
+    options = normalize_encoder_options(preferences.video_codec, EncoderOptions(
+        preset=preferences.video_preset, rate_control=preferences.video_rate_control,
+    ))
+    preferences.video_preset = options.preset
+    preferences.video_rate_control = options.rate_control
+
+
+def refresh_encoder_controls():
+    _normalize_encoder_preferences(app_state.preferences)
+    for row in (ROW_ENCODER_PRESET, ROW_ENCODER_QUALITY):
+        background = app_state.option_rows.pop(row, None)
+        if background is not None:
+            background.destroy()
+    if app_state.settings_content is not None:
+        App.place_video_encoder_menus()
+
+
 def _processing_config(selected_files):
     """One conversion rule for job startup and SQLite resume identity."""
     preferences = app_state.preferences
+    selected_files = list(selected_files)
     if preferences.ai_model not in MODEL_NAMES:
         raise ValueError("Please select the AI model")
     if preferences.video_codec not in video_codec_list or preferences.video_codec == "----":
@@ -714,7 +764,7 @@ def _processing_config(selected_files):
     output_factor = _positive_integer(app_state.selected_output_resize_factor, "Output resolution %") / 100
     vram = _positive_integer(app_state.selected_VRAM_limiter, "GPU VRAM value")
     return ProcessingConfig(
-        selected_file_list=list(selected_files),
+        selected_file_list=selected_files,
         selected_output_path=app_state.selected_output_path.get(),
         selected_AI_model=preferences.ai_model,
         selected_AI_multithreading=get_current_ai_multithreading(),
@@ -727,6 +777,10 @@ def _processing_config(selected_files):
         selected_image_extension=preferences.image_extension,
         selected_video_extension=preferences.video_extension,
         selected_video_codec=preferences.video_codec,
+        selected_video_options=(
+            _video_encoder_options() if any(check_if_file_is_video(path) for path in selected_files)
+            else EncoderOptions()
+        ),
     )
 
 
@@ -734,7 +788,7 @@ def get_video_resume_progress(video_path):
     # The backend owns cache paths, source/settings identity and readonly
     # SQLite access. Never scan per-frame folders or synthesize stale 100% flags.
     try:
-        config = _processing_config(())
+        config = _processing_config((video_path,))
         settings = VideoSettings(
             model=config.selected_AI_model, gpu=config.selected_gpu,
             input_resize_factor=config.input_resize_factor,
@@ -744,6 +798,7 @@ def get_video_resume_progress(video_path):
             sharpening_amount=config.selected_sharpening_amount,
             codec=config.selected_video_codec, extension=config.selected_video_extension,
             keep_frames=config.selected_keep_frames,
+            encoder_options=config.selected_video_options,
         )
     except (ValueError, TypeError, OverflowError):
         return None
@@ -971,6 +1026,7 @@ def apply_auto_codec_for_gpu(selected_gpu):
         app_state.preferences.video_codec = codec
         if app_state.selected_video_codec is not None:
             app_state.selected_video_codec.set(codec)
+        refresh_encoder_controls()
 
 
 def open_info_messagebox(title, subtitle, option_list):
@@ -1258,6 +1314,7 @@ def _start_upscale(config, *, retry_from=None, clear_cache=False):
             config.selected_image_extension,
             config.selected_video_extension,
             config.selected_video_codec,
+            config.selected_video_options,
         ),
         **({"kwargs": {"retry_from": retry_from, "clear_cache": clear_cache}}
            if retry_from is not None else {}),
@@ -1282,6 +1339,10 @@ _PREFERENCE_FIELDS = {
     "image_extension": "default_image_extension",
     "video_extension": "default_video_extension",
     "video_codec": "default_video_codec",
+    "video_preset": "default_video_preset",
+    "video_rate_control": "default_video_rate_control",
+    "video_crf": "default_video_crf",
+    "video_bitrate": "default_video_bitrate",
     "sharpening": "default_sharpening",
     "output_path": "default_output_path",
     "input_resize_factor": "default_input_resize_factor",
@@ -1296,6 +1357,10 @@ def save_user_choices_in_json():
     preferences.input_resize_factor = str(app_state.selected_input_resize_factor.get())
     preferences.output_resize_factor = str(app_state.selected_output_resize_factor.get())
     preferences.vram_limiter = str(app_state.selected_VRAM_limiter.get())
+    if app_state.selected_video_crf is not None:
+        preferences.video_crf = app_state.selected_video_crf.get()
+    if app_state.selected_video_bitrate is not None:
+        preferences.video_bitrate = app_state.selected_video_bitrate.get()
     values = {key: getattr(preferences, name) for name, key in _PREFERENCE_FIELDS.items()}
     values["default_keep_frames"] = "ON" if preferences.keep_frames else "OFF"
     with open(USER_PREFERENCE_PATH, "w", encoding="utf-8") as preference_file:
@@ -1322,6 +1387,7 @@ def load_user_preferences():
                 preferences.keep_frames = value == "ON"
         elif isinstance(value, str) and (name not in choices or value in choices[name]):
             setattr(preferences, name, value)
+    _normalize_encoder_preferences(preferences)
     return preferences
 
 
@@ -1449,6 +1515,7 @@ class App:
         self.place_gpu_gpuVRAM_menus()
         self.place_image_video_output_menus()
         self.place_video_codec_keep_frames_menus()
+        self.place_video_encoder_menus()
         self.place_output_path_textbox()
         self.place_message_label()
         self.place_upscale_button()
@@ -1687,6 +1754,44 @@ class App:
         )
 
     @staticmethod
+    def place_video_encoder_menus():
+        preferences = app_state.preferences
+        _normalize_encoder_preferences(preferences)
+        capabilities = encoder_capabilities(preferences.video_codec)
+        App._single_option(
+            ROW_ENCODER_PRESET, "Encoder preset", "Trade encoding speed for compression efficiency",
+            [" Default lets the encoder choose its own preset.",
+             " x264/x265: ultrafast is fastest; slower presets usually create smaller files at the same CRF.",
+             " NVIDIA: p1 is fastest, p7 is slowest with higher quality.",
+             " AMD: speed, balanced, or quality. Intel: veryfast through veryslow.",
+             " Only presets supported by the selected encoder are listed."],
+            App.select_video_preset_from_menu, list(capabilities.presets), preferences.video_preset,
+        )
+        App._paired_option(
+            ROW_ENCODER_QUALITY, True, "Rate control", "Choose quality-based or bitrate-based encoding",
+            [" CRF is available for x264/x265 only. Lower values mean higher quality and larger files.",
+             " Bitrate sets a target video bitrate, not a guaranteed file size or constant bitrate.",
+             " Hardware encoders do not expose CRF; their quality modes are not equivalent to CRF."],
+            lambda master: App.create_option_menu(
+                App.select_video_rate_control_from_menu, list(capabilities.rate_controls),
+                preferences.video_rate_control, width=little_menu_width, master=master,
+            ),
+        )
+        crf = preferences.video_rate_control == "CRF"
+        App._paired_option(
+            ROW_ENCODER_QUALITY, False, "CRF" if crf else "Bitrate kb/s",
+            "Set constant rate factor" if crf else "Set the target video bitrate in kilobits per second",
+            ([" Range: 0–51, including decimals. Lower is better quality; 23 is a starting point.",
+              " The same CRF number is not equivalent quality across different encoders."]
+             if crf else [" Enter a positive whole number in kb/s; 50000 = 50 Mb/s.",
+                          " Higher bitrates generally produce larger files and better quality."]),
+            lambda master: App.create_text_box(
+                app_state.selected_video_crf if crf else app_state.selected_video_bitrate,
+                little_textbox_width, master=master,
+            ),
+        )
+
+    @staticmethod
     def place_output_path_textbox():
         background = place_option_background(ROW_OUTPUT_PATH)
         background.grid_columnconfigure(0, weight=1)
@@ -1825,8 +1930,21 @@ class App:
 
     @staticmethod
     def select_video_codec_from_menu(value):
+        if value == "----":
+            app_state.selected_video_codec.set(app_state.preferences.video_codec)
+            return
         app_state.preferences.video_codec = value
+        refresh_encoder_controls()
         update_file_widget()
+
+    @staticmethod
+    def select_video_preset_from_menu(value):
+        app_state.preferences.video_preset = value
+
+    @staticmethod
+    def select_video_rate_control_from_menu(value):
+        app_state.preferences.video_rate_control = value
+        refresh_encoder_controls()
 
     @staticmethod
     def create_info_button(command, text, *, master):
@@ -1975,6 +2093,7 @@ def main():
         for name in (
             "info_message", "selected_output_path", "selected_input_resize_factor",
             "selected_output_resize_factor", "selected_VRAM_limiter", "selected_video_codec",
+            "selected_video_crf", "selected_video_bitrate",
         ):
             setattr(app_state, name, StringVar(master=app_state.window))
         update_splash("Detecting graphics adapters...")
@@ -1984,6 +2103,8 @@ def main():
         app_state.selected_input_resize_factor.set(preferences.input_resize_factor)
         app_state.selected_output_resize_factor.set(preferences.output_resize_factor)
         app_state.selected_output_path.set(preferences.output_path)
+        app_state.selected_video_crf.set(preferences.video_crf)
+        app_state.selected_video_bitrate.set(preferences.video_bitrate)
         apply_auto_vram_for_gpu(preferences.gpu, fallback=preferences.vram_limiter)
         apply_auto_codec_for_gpu(preferences.gpu)
         app_state.selected_video_codec.set(preferences.video_codec)

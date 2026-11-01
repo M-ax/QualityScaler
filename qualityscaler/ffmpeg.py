@@ -10,6 +10,7 @@ import sys
 import tempfile
 from threading import Event, Thread
 
+from .encoders import EncoderOptions, normalize_encoder_options
 from .jpeg_stream import iter_jpeg_frames
 from .paths import find_by_relative_path
 from .status import PipelineStatus
@@ -174,16 +175,20 @@ class FFmpeg:
         return count
 
     def encode(self, video_path, output_path, fps, codec, frames, stop_event, *,
-               output_size=None, total_frames=None, status=None, progress=None):
+               output_size=None, total_frames=None, status=None, progress=None,
+               encoder_options=None):
         """Encode ordered cached JPEGs, preferring passthrough for optional audio.
 
         Replayable frames allow video-codec and AAC audio fallbacks. Publish only
         a successful encode; never replace an existing output with a failed video.
         A shared PipelineStatus keeps encoding alongside other active stages;
         status remains a string callback for standalone encoding callers.
+        Validate primary options before touching output files or starting FFmpeg.
         """
         if stop_event.is_set():
             raise UpscaleCancelled()
+        encoder_options = EncoderOptions() if encoder_options is None else encoder_options
+        primary_arguments = encoder_options.arguments(codec)
         output = Path(output_path)
         # Reserve an owned sibling file, never a predictable path that might
         # already be somebody's source video or another runner's temporary file.
@@ -229,12 +234,16 @@ class FFmpeg:
 
         try:
             for index, (current_codec, audio_codec) in enumerate(attempts):
+                option_arguments = primary_arguments if current_codec == codec else (
+                    normalize_encoder_options(current_codec, encoder_options)
+                    .arguments(current_codec)
+                )
                 arguments = [
                     "-y", "-f", "image2pipe", "-framerate", str(fps),
                     "-c:v", "mjpeg", "-i", "pipe:0", "-i", str(video_path),
                     "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1",
                     "-c:v", current_codec, "-c:a", audio_codec, "-g", str(max(1, round(fps))),
-                    "-vf", filters, "-color_range", "tv", "-b:v", "50000k",
+                    "-vf", filters, "-color_range", "tv", *option_arguments,
                 ]
                 if audio_codec == "aac":
                     arguments += ["-b:a", "192k"]

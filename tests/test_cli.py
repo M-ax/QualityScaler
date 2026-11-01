@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from qualityscaler.__main__ import main
+from qualityscaler.encoders import EncoderOptions
 from qualityscaler.frame_store import FrameStore
 from qualityscaler.video import VideoSettings
 
@@ -51,6 +52,28 @@ class SavedJobCommandTests(unittest.TestCase):
         self.assertEqual(arguments[3].blending_factor, 0.5)
         self.assertEqual(arguments[3].workers, 4)
         self.assertEqual(arguments[3].codec, "x265")
+
+    @patch("qualityscaler.__main__.VideoUpscaler")
+    def test_resume_restores_nested_encoder_options_and_normalizes_codec_override(self, pipeline):
+        options = EncoderOptions(preset="p7", bitrate_kbps=9000)
+        with FrameStore(self.cache) as store:
+            settings = asdict(self.settings)
+            settings.update(codec="h264_nvenc", encoder_options=asdict(options))
+            store.set_metadata("settings", settings)
+        self.assertEqual(main(["resume", str(self.cache)]), 0)
+        self.assertEqual(pipeline.return_value.run.call_args.args[3].encoder_options, options)
+        self.assertEqual(main(["resume", str(self.cache), "--codec", "x264"]), 0)
+        self.assertEqual(pipeline.return_value.run.call_args.args[3].encoder_options,
+                         EncoderOptions(bitrate_kbps=9000))
+
+    @patch("qualityscaler.__main__.VideoUpscaler")
+    def test_resume_legacy_settings_uses_original_bitrate_default(self, pipeline):
+        with FrameStore(self.cache) as store:
+            settings = asdict(self.settings)
+            settings.pop("encoder_options")
+            store.set_metadata("settings", settings)
+        self.assertEqual(main(["resume", str(self.cache)]), 0)
+        self.assertEqual(pipeline.return_value.run.call_args.args[3].encoder_options, EncoderOptions())
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import cv2
 
+from qualityscaler.encoders import EncoderOptions
 from qualityscaler.ffmpeg import FFmpeg, UpscaleCancelled
 from qualityscaler.frame_store import FrameStore
 from qualityscaler.status import PipelineStatus
@@ -83,6 +84,9 @@ class FFmpegStatusTests(unittest.TestCase):
 
         @contextmanager
         def pipe(arguments, stop, *, writing, progress):
+            self.assertEqual(arguments[arguments.index("-preset") + 1], "slow")
+            self.assertEqual(arguments[arguments.index("-crf") + 1], "19.5")
+            self.assertNotIn("-b:v", arguments)
             self.time = 12
             progress(2)
             yield BytesIO()
@@ -90,7 +94,8 @@ class FFmpegStatusTests(unittest.TestCase):
         ffmpeg = FFmpeg()
         with patch.object(ffmpeg, "_pipe", side_effect=pipe):
             ffmpeg.encode("source.mp4", self.output, 24, "x264", [b"jpeg"], Event(),
-                          total_frames=4, progress=self.progress)
+                          total_frames=4, progress=self.progress,
+                          encoder_options=EncoderOptions("slow", "CRF", 19.5))
         message = next(message for message in self.messages if "Encoding upscaled video 50%" in message)
         lines = message.splitlines()
         self.assertEqual(len(lines), 2)
@@ -119,8 +124,13 @@ class FFmpegStatusTests(unittest.TestCase):
         ffmpeg = FFmpeg()
         with patch.object(ffmpeg, "_pipe", side_effect=pipe):
             ffmpeg.encode("source.mp4", self.output, 24, "h264_nvenc", [b"jpeg"], Event(),
-                          total_frames=100, progress=self.progress)
+                          total_frames=100, progress=self.progress,
+                          encoder_options=EncoderOptions(preset="p7", bitrate_kbps=4800))
         self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0][attempts[0].index("-preset") + 1], "p7")
+        self.assertNotIn("-preset", attempts[1])
+        for arguments in attempts:
+            self.assertEqual(arguments[arguments.index("-b:v") + 1], "4800k")
         fallback = [message for message in self.messages if "x264 fallback" in message]
         self.assertEqual(len(fallback), 2)
         self.assertIn("ETA (local): estimating...", fallback[0])
@@ -160,6 +170,236 @@ class FFmpegStatusTests(unittest.TestCase):
                                       iter([b"jpeg"]), Event(), total_frames=10,
                                       progress=self.progress)
                 self.assertEqual(self.messages[-1], "")
+
+
+class FFmpegEncoderOptionsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / "source.mkv"
+        self.output = self.root / "output.mp4"
+        self.source.write_bytes(b"source video")
+        self.ffmpeg = FFmpeg("ffmpeg")
+        self.commands = []
+        self.written_frames = []
+        self.fail_attempts = set()
+        pipe_patch = patch.object(self.ffmpeg, "_pipe", side_effect=self.fake_pipe)
+        self.pipe = pipe_patch.start()
+        self.addCleanup(pipe_patch.stop)
+
+    @contextmanager
+    def fake_pipe(self, arguments, stop_event, *, writing=False, progress=None):
+        self.commands.append(list(arguments))
+        self.assertTrue(writing)
+        with BytesIO() as pipe:
+            yield pipe
+            self.written_frames.append(pipe.getvalue())
+        if len(self.commands) in self.fail_attempts:
+            raise RuntimeError("FFmpeg failed for this attempt")
+        Path(arguments[-1]).write_bytes(b"encoded video")
+
+    def encode(self, codec="x264", **kwargs):
+        self.ffmpeg.encode(
+            self.source, self.output, 5, codec, [b"jpeg1", b"jpeg2"], Event(), **kwargs,
+        )
+
+    def video_codec(self, command):
+        # The first -c:v selects the MJPEG input decoder, the last the encoder.
+        encoder_index = max(index for index, value in enumerate(command) if value == "-c:v")
+        return command[encoder_index + 1]
+
+    def test_default_and_explicit_none_preserve_fixed_bitrate_without_preset(self):
+        for kwargs in ({}, {"encoder_options": None}, {"encoder_options": EncoderOptions()}):
+            with self.subTest(kwargs=kwargs):
+                self.encode(**kwargs)
+                command = self.commands[-1]
+                self.assertEqual(self.video_codec(command), "libx264")
+                self.assertEqual(command[command.index("-b:v") + 1], "50000k")
+                for flag in ("-preset", "-quality", "-crf"):
+                    self.assertNotIn(flag, command)
+                self.assertEqual(self.output.read_bytes(), b"encoded video")
+
+    def test_software_crf_and_preset_replace_hardcoded_bitrate(self):
+        for codec, canonical in (("x264", "libx264"), ("x265", "libx265"),
+                                 ("libx264", "libx264"), ("libx265", "libx265")):
+            with self.subTest(codec=codec):
+                options = EncoderOptions("slow", "CRF", 18.25, -1)
+                self.encode(codec, encoder_options=options)
+                command = self.commands[-1]
+                self.assertEqual(self.video_codec(command), canonical)
+                self.assertEqual(command[command.index("-crf") + 1], "18.25")
+                self.assertEqual(command[command.index("-preset") + 1], "slow")
+                self.assertNotIn("-b:v", command)
+                self.assertNotIn("-quality", command)
+
+    def test_hardware_uses_its_own_preset_flag_and_selected_bitrate(self):
+        for codec, preset, flag in (
+            ("h264_nvenc", "p7", "-preset"), ("hevc_nvenc", "p1", "-preset"),
+            ("h264_amf", "quality", "-quality"), ("hevc_amf", "speed", "-quality"),
+            ("h264_qsv", "fast", "-preset"), ("hevc_qsv", "veryslow", "-preset"),
+        ):
+            with self.subTest(codec=codec):
+                options = EncoderOptions(preset=preset, bitrate_kbps=6500, crf=float("nan"))
+                self.encode(codec, encoder_options=options)
+                command = self.commands[-1]
+                self.assertEqual(self.video_codec(command), codec)
+                self.assertEqual(command[command.index(flag) + 1], preset)
+                self.assertEqual(command[command.index("-b:v") + 1], "6500k")
+                self.assertNotIn("-crf", command)
+                self.assertNotIn("-quality" if flag == "-preset" else "-preset", command)
+
+    def test_invalid_primary_options_fail_before_tempfile_process_or_frame_iteration(self):
+        self.output.write_bytes(b"previous output")
+        for codec, options in (
+            ("x264", EncoderOptions(preset="p7")),
+            ("h264_nvenc", EncoderOptions(rate_control="CRF")),
+            ("x265", EncoderOptions(rate_control="CRF", crf=float("nan"))),
+            ("hevc_amf", EncoderOptions(bitrate_kbps=0)),
+            ("x264", EncoderOptions(bitrate_kbps=1.5)),
+        ):
+            with self.subTest(codec=codec):
+                with (
+                    patch("qualityscaler.ffmpeg.tempfile.mkstemp") as mkstemp,
+                    patch("qualityscaler.ffmpeg.subprocess.Popen") as popen,
+                ):
+                    with self.assertRaises(ValueError):
+                        self.ffmpeg.encode(
+                            self.source, self.output, 5, codec,
+                            lambda: self.fail("Invalid options consumed frames"), Event(),
+                            encoder_options=options,
+                        )
+                mkstemp.assert_not_called()
+                popen.assert_not_called()
+                self.pipe.assert_not_called()
+                self.assertEqual(self.output.read_bytes(), b"previous output")
+                self.assertEqual(self.source.read_bytes(), b"source video")
+                self.assertFalse(any(self.root.glob(".*.partial-*")))
+
+    def test_x264_fallback_drops_gpu_specific_presets_and_retains_bitrate(self):
+        for codec, preset, expected_preset in (
+            ("h264_nvenc", "p7", None), ("hevc_nvenc", "p1", None),
+            ("h264_amf", "quality", None), ("hevc_amf", "speed", None),
+            ("h264_qsv", "fast", "fast"), ("hevc_qsv", "veryslow", "veryslow"),
+        ):
+            with self.subTest(codec=codec):
+                self.commands.clear()
+                self.written_frames.clear()
+                self.fail_attempts = {1}
+                messages = []
+                options = EncoderOptions(preset=preset, bitrate_kbps=4800)
+                self.encode(codec, encoder_options=options, status=messages.append)
+                self.assertEqual(len(self.commands), 2)
+                fallback = self.commands[1]
+                self.assertEqual(self.video_codec(fallback), "libx264")
+                self.assertEqual(fallback[fallback.index("-b:v") + 1], "4800k")
+                self.assertNotIn("-quality", fallback)
+                if expected_preset is None:
+                    self.assertNotIn("-preset", fallback)
+                else:
+                    self.assertEqual(fallback[fallback.index("-preset") + 1], expected_preset)
+                self.assertEqual(self.written_frames, [b"jpeg1jpeg2"] * 2)
+                self.assertTrue(any("x264 fallback" in message for message in messages))
+                self.assertEqual(options.preset, preset)
+                self.assertFalse(any(self.root.glob(".*.partial-*")))
+
+    def test_software_fallback_retains_crf_and_shared_preset(self):
+        self.fail_attempts = {1}
+        self.encode("x265", encoder_options=EncoderOptions("slower", "CRF", 21.5, None))
+        self.assertEqual([self.video_codec(command) for command in self.commands],
+                         ["libx265", "libx264"])
+        for command in self.commands:
+            self.assertEqual(command[command.index("-crf") + 1], "21.5")
+            self.assertEqual(command[command.index("-preset") + 1], "slower")
+            self.assertNotIn("-b:v", command)
+
+    def test_audio_retries_restore_primary_gpu_options_after_software_fallback(self):
+        for codec, preset, flag in (
+            ("h264_nvenc", "p6", "-preset"), ("hevc_amf", "balanced", "-quality"),
+        ):
+            with self.subTest(codec=codec):
+                self.commands.clear()
+                self.fail_attempts = {1, 2}
+                options = EncoderOptions(preset=preset, bitrate_kbps=3600)
+                self.encode(codec, encoder_options=options)
+                self.assertEqual([self.video_codec(command) for command in self.commands],
+                                 [codec, "libx264", codec])
+                self.assertEqual(
+                    [command[command.index("-c:a") + 1] for command in self.commands],
+                    ["copy", "copy", "aac"],
+                )
+                self.assertEqual(self.commands[0][self.commands[0].index(flag) + 1], preset)
+                self.assertEqual(self.commands[2][self.commands[2].index(flag) + 1], preset)
+                self.assertNotIn("-preset", self.commands[1])
+                self.assertNotIn("-quality", self.commands[1])
+                for command in self.commands:
+                    self.assertEqual(command[command.index("-b:v") + 1], "3600k")
+                    self.assertNotIn("-crf", command)
+                self.assertEqual(self.commands[2][self.commands[2].index("-b:a") + 1], "192k")
+
+    def test_audio_retry_on_x264_keeps_crf_and_never_adds_video_bitrate(self):
+        self.fail_attempts = {1}
+        self.encode(encoder_options=EncoderOptions("fast", "CRF", 19.5, None))
+        self.assertEqual(len(self.commands), 2)
+        self.assertEqual(self.commands[1][self.commands[1].index("-c:a") + 1], "aac")
+        for command in self.commands:
+            self.assertEqual(command[command.index("-crf") + 1], "19.5")
+            self.assertEqual(command[command.index("-preset") + 1], "fast")
+            self.assertNotIn("-b:v", command)
+
+    def test_last_audio_fallback_uses_normalized_options_and_replays_frames(self):
+        self.fail_attempts = {1, 2, 3}
+        options = EncoderOptions(preset="quality", bitrate_kbps=8100)
+        self.encode("h264_amf", encoder_options=options)
+        self.assertEqual(len(self.commands), 4)
+        self.assertEqual(self.video_codec(self.commands[-1]), "libx264")
+        self.assertEqual(self.commands[-1][self.commands[-1].index("-c:a") + 1], "aac")
+        self.assertNotIn("-quality", self.commands[-1])
+        self.assertNotIn("-preset", self.commands[-1])
+        for command in self.commands:
+            self.assertEqual(command[command.index("-b:v") + 1], "8100k")
+        self.assertEqual(self.written_frames, [b"jpeg1jpeg2"] * 4)
+
+    def test_unknown_codec_keeps_legacy_x264_fallback(self):
+        self.fail_attempts = {1}
+        self.encode("not_a_video_codec")
+        self.assertEqual([self.video_codec(command) for command in self.commands],
+                         ["not_a_video_codec", "libx264"])
+
+    def test_nonreplayable_frames_do_not_retry_or_replace_existing_output_on_failure(self):
+        self.output.write_bytes(b"previous output")
+        self.fail_attempts = {1}
+        with self.assertRaisesRegex(RuntimeError, "FFmpeg failed"):
+            self.ffmpeg.encode(
+                self.source, self.output, 5, "h264_nvenc",
+                iter([b"jpeg1"]), Event(), encoder_options=EncoderOptions(preset="p4"),
+            )
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(self.output.read_bytes(), b"previous output")
+        self.assertFalse(any(self.root.glob(".*.partial-*")))
+
+    def test_failed_options_attempts_preserve_output_and_remove_partial(self):
+        self.output.write_bytes(b"previous output")
+        self.fail_attempts = {1, 2, 3, 4}
+        with self.assertRaisesRegex(RuntimeError, "FFmpeg failed"):
+            self.encode("h264_amf", encoder_options=EncoderOptions(preset="quality"))
+        self.assertEqual(len(self.commands), 4)
+        self.assertEqual(self.output.read_bytes(), b"previous output")
+        self.assertEqual(self.source.read_bytes(), b"source video")
+        self.assertFalse(any(self.root.glob(".*.partial-*")))
+
+    def test_precancelled_encoding_does_not_validate_or_create_output(self):
+        stop = Event()
+        stop.set()
+        with patch("qualityscaler.ffmpeg.tempfile.mkstemp") as mkstemp:
+            with self.assertRaises(UpscaleCancelled):
+                self.ffmpeg.encode(
+                    self.source, self.output, 5, "x264", [], stop,
+                    encoder_options=EncoderOptions(preset="invalid"),
+                )
+        mkstemp.assert_not_called()
+        self.pipe.assert_not_called()
+        self.assertFalse(self.output.exists())
 
 
 class ResizeEngine:
@@ -224,7 +464,10 @@ class FFmpegIntegrationTests(unittest.TestCase):
             VideoUpscaler(
                 ffmpeg=self.ffmpeg, engine_factory=lambda settings: ResizeEngine(),
                 executor_factory=ThreadPoolExecutor, checkpoint_interval=1, progress=progress,
-            ).run(self.source, output, cache, VideoSettings("FakeTestx2", keep_frames=True))
+            ).run(self.source, output, cache, VideoSettings(
+                "FakeTestx2", keep_frames=True,
+                encoder_options=EncoderOptions("veryfast", "CRF", 18.5),
+            ))
         self.assertTrue(first_saved.is_set())
         self.assertTrue(extraction_finished.is_set())
         capture = cv2.VideoCapture(str(output))
@@ -285,6 +528,49 @@ class FFmpegIntegrationTests(unittest.TestCase):
             self.ffmpeg.executable, "-v", "error", "-i", str(output),
             "-map", "0:a:0", "-f", "null", "-",
         ], check=True)
+
+    def test_software_presets_and_rate_modes_reencode_cached_frames(self):
+        output = self.root / "configured_upscaled.mp4"
+        cache = self.root / "configured cache" / "frames.sqlite3"
+        processed = []
+
+        class RecordingEngine(ResizeEngine):
+            def AI_orchestration(inner, image):
+                processed.append(image.shape)
+                return super().AI_orchestration(image)
+
+        pipeline = VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=lambda settings: RecordingEngine(),
+            executor_factory=ThreadPoolExecutor,
+        )
+        for codec in ("x264", "x265"):
+            for mode in ("CRF", "Bitrate"):
+                with self.subTest(codec=codec, mode=mode):
+                    options = EncoderOptions(
+                        preset="veryfast", rate_control=mode, crf=18.5, bitrate_kbps=2500,
+                    )
+                    settings = VideoSettings("FakeTestx2", codec=codec, keep_frames=True,
+                                             encoder_options=options)
+                    with patch.object(self.ffmpeg, "_pipe", wraps=self.ffmpeg._pipe) as pipe:
+                        pipeline.run(self.source, output, cache, settings)
+                    commands = [call.args[0] for call in pipe.call_args_list
+                                if call.kwargs.get("writing")]
+                    # Verify the requested encoder accepted the options, rather
+                    # than masking a failure with the automatic x264 fallback.
+                    self.assertEqual(len(commands), 1)
+                    self.assertIn("lib" + codec, commands[0])
+                    self.assertIn("-crf" if mode == "CRF" else "-b:v", commands[0])
+                    capture = cv2.VideoCapture(str(output))
+                    try:
+                        self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+                        self.assertTrue(capture.read()[0])
+                    finally:
+                        capture.release()
+                    self.assertEqual(len(processed), 5)  # No repeated AI work.
+                    with FrameStore(cache, read_only=True) as store:
+                        self.assertEqual(store.get_metadata("stage"), "complete")
+                        self.assertEqual(store.get_metadata("settings")["encoder_options"]["rate_control"],
+                                         mode)
 
     def test_scaled_extraction_resumes_without_resampling_inputs_twice(self):
         output = self.root / "scaled_upscaled.mp4"

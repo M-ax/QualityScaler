@@ -36,7 +36,8 @@ def upscale_orchestrator(
     selected_output_path, selected_AI_model, selected_AI_multithreading,
     input_resize_factor, output_resize_factor, selected_gpu, tiles_resolution,
     selected_sharpening_amount, selected_keep_frames, selected_image_extension,
-    selected_video_extension, selected_video_codec, *, retry_from=None, clear_cache=False,
+    selected_video_extension, selected_video_codec, selected_video_options=None,
+    *, retry_from=None, clear_cache=False,
 ):
     try:
         from pathlib import Path
@@ -46,6 +47,8 @@ def upscale_orchestrator(
         ):
             raise ValueError("retry_from must be a 1-based file number within the selected batch")
         image_engine = None
+        # Keep the legacy adapter call shape when no encoder options were supplied.
+        encoder_args = () if selected_video_options is None else (selected_video_options,)
         for file_number, path in enumerate(selected_file_list, 1):
             if retry_from is not None and file_number < retry_from:
                 continue
@@ -60,7 +63,7 @@ def upscale_orchestrator(
                     selected_output_path, selected_AI_model, selected_sharpening_amount,
                     selected_AI_multithreading, selected_gpu, input_resize_factor,
                     output_resize_factor, tiles_resolution, selected_video_extension,
-                    selected_video_codec, selected_keep_frames, **video_options,
+                    selected_video_codec, selected_keep_frames, *encoder_args, **video_options,
                 )
             else:
                 if image_engine is None:

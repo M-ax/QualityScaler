@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 from threading import Event
 
+from .encoders import EncoderOptions, normalize_encoder_options
 from .ffmpeg import UpscaleCancelled
 from .frame_store import FrameStore
 from .video import VideoSettings, VideoUpscaler
@@ -42,9 +43,13 @@ def main(argv=None):
         return 0
     if not saved["settings"] or not saved["source"] or not saved["output_path"]:
         parser.error("Cache does not contain a complete saved job configuration")
-    settings = VideoSettings(**saved["settings"])
+    settings_data = dict(saved["settings"])
+    settings_data["encoder_options"] = EncoderOptions(**settings_data.get("encoder_options", {}))
+    settings = VideoSettings(**settings_data)
     overrides = {key: getattr(args, key) for key in ("codec", "workers", "gpu", "keep_frames")
                  if getattr(args, key) is not None}
+    if args.codec is not None:
+        overrides["encoder_options"] = normalize_encoder_options(args.codec, settings.encoder_options)
     settings = replace(settings, **overrides)
     stop = Event()
     previous_handler = signal.signal(signal.SIGINT, lambda signum, frame: stop.set())

@@ -2,7 +2,7 @@
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 import hashlib
@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from .ai import AI_upscale, calculate_optimal_workers, get_model_upscale_factor
+from .encoders import EncoderOptions
 from .ffmpeg import FFmpeg, UpscaleCancelled
 from .frame_store import FrameStore
 from .geometry import VideoGeometry
@@ -90,6 +91,7 @@ class VideoSettings:
     codec: str = "x264"
     extension: str = ".mp4"
     keep_frames: bool = False
+    encoder_options: EncoderOptions = field(default_factory=EncoderOptions)
 
     def __post_init__(self):
         factors = (self.input_resize_factor, self.output_resize_factor)
@@ -103,6 +105,7 @@ class VideoSettings:
             raise ValueError("Sharpening amount must be finite and nonnegative")
         if self.extension not in (".mp4", ".mkv", ".avi", ".mov"):
             raise ValueError(f"Unsupported video extension: {self.extension}")
+        self.encoder_options.validate(self.codec)
 
     def processing_settings(self):
         # Execution and encoding choices can change without invalidating JPEGs.
@@ -535,7 +538,7 @@ class VideoUpscaler:
                     video_path, output_path, store.get_metadata("fps"),
                     settings.codec, lambda: store.iter_frames("upscaled"), self.stop_event,
                     output_size=geometry.output_size, total_frames=store.get_metadata("total_frames"),
-                    progress=self.task_status,
+                    progress=self.task_status, encoder_options=settings.encoder_options,
                 )
                 self._check_stop()
                 self._state(store, "complete")
@@ -568,7 +571,8 @@ def upscale_video(
     selected_output_path, selected_AI_model, selected_sharpening_amount,
     selected_AI_multithreading, selected_gpu, input_resize_factor,
     output_resize_factor, tiles_resolution, selected_video_extension,
-    selected_video_codec, selected_keep_frames, *, clear_cache=False,
+    selected_video_codec, selected_keep_frames, selected_video_options=None,
+    *, clear_cache=False,
 ):
     """GUI adapter; backend modules never import the GUI entry point."""
     from .status import write_process_status
@@ -579,6 +583,7 @@ def upscale_video(
         tiles_resolution=tiles_resolution, workers=selected_AI_multithreading,
         sharpening_amount=selected_sharpening_amount, codec=selected_video_codec,
         extension=selected_video_extension, keep_frames=selected_keep_frames,
+        encoder_options=selected_video_options if selected_video_options is not None else EncoderOptions(),
     )
     directory = prepare_output_video_directory_name(
         video_path, selected_output_path, selected_AI_model,

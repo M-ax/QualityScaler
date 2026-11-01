@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+from qualityscaler.encoders import EncoderOptions
 from qualityscaler.ffmpeg import UpscaleCancelled
 from qualityscaler.jobs import check_if_file_is_video, upscale_image, upscale_orchestrator
 from qualityscaler.status import CacheSettingsConflict, VideoProgress
@@ -38,6 +39,17 @@ class BatchJobTests(unittest.TestCase):
             unittest.mock.ANY, unittest.mock.ANY, str(self.source), 1, "output", "Testx2",
             0, 1, "Auto", 1, 1, 1024, ".mp4", "x264", True,
         )
+
+    @patch("qualityscaler.jobs.upscale_video")
+    def test_batch_forwards_encoder_options_to_video_adapter(self, upscale):
+        queue = Queue()
+        options = EncoderOptions(preset="slow", rate_control="CRF", crf=20)
+        upscale_orchestrator(
+            queue, Event(), [str(self.source)], "output", "Testx2", 1,
+            1, 1, "Auto", 1024, 0, True, ".png", ".mp4", "x264", options,
+        )
+        self.assertIs(upscale.call_args.args[-1], options)
+        self.assertEqual(queue.get_nowait(), "Completed")
 
     @patch("qualityscaler.jobs.upscale_video", side_effect=UpscaleCancelled)
     def test_cancelled_video_does_not_report_completed(self, upscale):

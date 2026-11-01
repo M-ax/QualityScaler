@@ -279,9 +279,17 @@ class AI_upscale:
             return blended[:, :, 0].astype(np.uint8)
         return blended.astype(np.uint8)
 
-    def AI_orchestration(self, image: np.ndarray) -> np.ndarray:
+    def AI_orchestration(
+        self, image: np.ndarray, *, input_is_scaled: bool = False
+    ) -> np.ndarray:
+        """Infer with configured input scaling, or accept a pre-scaled frame.
+
+        Video extraction and previews may supply the exact inference geometry,
+        including their two-pixel minimum, without changing a reusable engine's
+        configured input factor.
+        """
         self.ensure_session()
-        resized_image = self.resize_with_input_factor(image)
+        resized_image = image if input_is_scaled else self.resize_with_input_factor(image)
         if self.image_need_tilling(resized_image):
             return self.AI_upscale_with_tilling(resized_image)
         return self.AI_upscale(resized_image)

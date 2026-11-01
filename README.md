@@ -63,6 +63,7 @@ native file drag-and-drop.
 - Automatic overlapping, feathered image tiling to reduce seams and limit VRAM use
 - Resize image/video before upscaling and scale the output resolution
 - AI sharpening: OFF, Low, or High (the 2026 control replaces the old blending UI)
+- Upscale preview window with video frame seeking, scroll zoom, and drag-to-pan
 - Video upscaling STOP & RESUME, with frames and job settings in one SQLite cache
 - Native file drag-and-drop and appendable input selection
 - 🔒 Privacy focused - no internet connection required, everything runs on your PC
@@ -100,6 +101,21 @@ windows, and the full-width bottom status bar wraps long filenames and progress
 messages. Very long messages scroll within the bar without covering Stop.
 Scale edits refresh file previews after typing pauses instead of
 rebuilding the cards on every keystroke.
+
+### Preview an upscale
+
+Select input files, then click **Preview upscale ↗** in the settings pane. Choose
+an input in the preview window and move the seek bar (or use the frame arrows) to
+upscale a video frame. Still images are previewed with seeking disabled. The preview
+uses the current AI model, GPU/VRAM limit, input/output scales, and sharpening;
+setting changes refresh it automatically. **Refresh** retries the current frame.
+
+Scroll over the result to zoom around the pointer and drag to pan. **Fit** and
+**100%** reset the view; zoom only changes the display, never the inference size.
+The preview runs in a separate worker process and does not save output files or
+modify video caches. It shows the result before video/image encoding, so final
+codec compression can look different. Starting a batch or changing the input
+list closes the preview to release its GPU memory.
 
 After the last output is written, the app shows **Finalizing** while workers
 release their resources. Completion is reported only after the worker has exited

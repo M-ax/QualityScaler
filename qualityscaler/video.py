@@ -210,7 +210,9 @@ class VideoUpscaler:
         self.task_status = PipelineStatus(self._report)
 
     def _report(self, message, **changes):
-        self._progress = replace(self._progress, message=message, **changes)
+        self._progress = replace(
+            self._progress, message=message, stages=self.task_status.stages, **changes,
+        )
         self.status(message)
         self.progress(self._progress)
 
@@ -282,6 +284,13 @@ class VideoUpscaler:
         decoder is slow. Closing this iterator cancels and joins the producer.
         """
         if store.get_metadata("extraction_complete", False):
+            count = store.get_metadata("total_frames")
+            if not isinstance(count, int) or count <= 0 or store.frame_count("source") != count:
+                raise ValueError("Source frame cache is incomplete")
+            self.task_status.finish(
+                "extracting", f"Extracting video frames 100% ({count} cached)",
+                completed=count, total=count,
+            )
             return
         fps = get_video_fps(str(video_path))
         previous_count = store.frame_count("source")
@@ -389,7 +398,8 @@ class VideoUpscaler:
                 # SQLite or status-consumer failure. Do not cancel the user's
                 # event on failure: the original exception must remain an error.
                 stop.aborted.set()
-                self.task_status.finish("extracting")
+        self._check_stop()
+        self.task_status.finish("extracting")
 
     def _upscale(self, store, settings, extraction=None):
         """Pump extraction and bounded AI futures through the sole cache writer."""
@@ -425,6 +435,11 @@ class VideoUpscaler:
                     if completed == total:
                         break
                 if executor is None and available > completed:
+                    self.task_status.start(
+                        "upscaling", "Preparing video upscaling",
+                        completed=completed, total=self._progress.total,
+                        estimated_total=not self._progress.extraction_complete,
+                    )
                     frame = decode_frame(store.get_frame("source", 0))
                     if source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
                         geometry = geometry_for_settings(source_frame_size(store), settings)
@@ -446,10 +461,8 @@ class VideoUpscaler:
                         max_workers=workers, initializer=initialize_worker,
                         initargs=(settings, self.engine_factory),
                     )
-                    self.task_status.start(
+                    self.task_status.update(
                         "upscaling", f"Preparing video upscaling ({workers} workers)",
-                        completed=completed, total=self._progress.total,
-                        estimated_total=not self._progress.extraction_complete,
                     )
                 if executor is None:
                     continue
@@ -500,10 +513,15 @@ class VideoUpscaler:
                 finally:
                     if executor is not None:
                         executor.shutdown(wait=True)
-                    self.task_status.finish("upscaling")
         store.commit()
-        if store.frame_count("upscaled") != store.get_metadata("total_frames"):
+        total = store.get_metadata("total_frames")
+        if store.frame_count("upscaled") != total:
             raise ValueError("Not all video frames were saved")
+        self._check_stop()
+        self.task_status.finish(
+            "upscaling", f"Upscaling video 100.00% ({total}/{total} saved)",
+            completed=total, total=total,
+        )
 
     def run(self, video_path, output_path, cache_path, settings, *, clear_cache=False):
         # SQLite transactions protect each batch, not the lifetime between
@@ -515,7 +533,9 @@ class VideoUpscaler:
 
     def _run_locked(self, video_path, output_path, cache_path, settings, *, clear_cache=False):
         # A resumed/reused runner must not retain interrupted stages or rates.
+        self._progress = VideoProgress("", 0, 0, None, False)
         self.task_status = PipelineStatus(self._report)
+        self._report("")
         cache_path = Path(cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with FrameStore(cache_path) as store:
@@ -527,7 +547,8 @@ class VideoUpscaler:
                     self._upscale(store, settings, extraction)
                 self._check_stop()
                 self._state(store, "encoding", error=None)
-                self.task_status.start("encoding", "Encoding upscaled video")
+                total = store.get_metadata("total_frames")
+                self.task_status.start("encoding", "Encoding upscaled video", total=total)
                 if source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
                     size = source_frame_size(store)
                 else:
@@ -542,7 +563,7 @@ class VideoUpscaler:
                 )
                 self._check_stop()
                 self._state(store, "complete")
-                self.task_status.finish("encoding")
+                self.task_status.finish("encoding", completed=total, total=total)
             except BaseException as error:
                 try:
                     self._state(
@@ -554,9 +575,10 @@ class VideoUpscaler:
                     # A disk-full/SQLite error must not hide the original failure.
                     # SQLite rolls back an uncommitted batch on the next open.
                     pass
+                self.task_status.interrupt(
+                    "stopped" if isinstance(error, UpscaleCancelled) else "error",
+                )
                 raise
-            finally:
-                self.task_status.clear()
         if not settings.keep_frames:
             cache_path.unlink()
             try:

@@ -9,6 +9,8 @@ from time import monotonic, sleep
 import unittest
 from unittest.mock import Mock, patch
 
+from customtkinter import ScalingTracker
+
 from qualityscaler import gui
 from qualityscaler.encoders import encoder_capabilities
 from qualityscaler.status import PipelineStatus, VideoProgress
@@ -17,10 +19,14 @@ from qualityscaler.status import PipelineStatus, VideoProgress
 @unittest.skipUnless(sys.platform == "win32" or os.environ.get("DISPLAY"),
                      "Layout tests need a desktop display")
 class DesktopLayoutTests(unittest.TestCase):
-    def run_desktop(self, check):
+    def run_desktop(self, check, *, system_dpi=None):
         manager = Mock()
         manager.Queue.return_value = Queue()
         manager.Event.return_value = Event()
+        # Install the early awareness hook before substituting the monitor
+        # detector, so the production wrapper never retains a test mock.
+        gui.configure_high_dpi()
+        detect_dpi = ScalingTracker.get_window_dpi_scaling
 
         def smoke(window):
             try:
@@ -43,45 +49,92 @@ class DesktopLayoutTests(unittest.TestCase):
                     patch.object(gui.GPU, "codec_for", return_value="h264_nvenc"), \
                     patch.object(gui, "get_AI_engine_info", return_value="QualityScaler layout test"), \
                     patch.object(gui, "allow_sleep"), \
+                    patch.object(ScalingTracker, "get_window_dpi_scaling",
+                                 side_effect=detect_dpi if system_dpi is None else system_dpi), \
                     patch("customtkinter.CTk.mainloop", smoke):
                 gui.main()
         finally:
-            gui.apply_app_zoom(1.0)
             # Release every Tk variable/image on its owning thread, not during
             # a later worker's unrelated garbage collection.
             gui.app_state = None
             gc.collect()
         manager.shutdown.assert_called_once()
 
-    def test_paired_controls_do_not_overlap_at_any_app_zoom(self):
+    def test_paired_controls_follow_automatic_system_dpi(self):
         def check(window):
-            for zoom in gui.zoom_option_list:
-                gui.App.select_app_zoom(zoom)
-                window.update()
-                for row in (gui.ROW_RESOLUTION, gui.ROW_GPU,
-                            gui.ROW_OUTPUT_FORMAT, gui.ROW_CODEC, gui.ROW_ENCODER_QUALITY):
-                    background = gui.app_state.option_rows[row]
-                    slots = [child for child in background.winfo_children()
-                             if isinstance(child, gui.CTkFrame)]
-                    self.assertEqual(len(slots), 2)
-                    previous_right = None
-                    for slot in slots:
-                        info, control = slot.winfo_children()
-                        with self.subTest(zoom=zoom, row=row, column=slot.grid_info()["column"]):
-                            self.assertLessEqual(info.winfo_x() + info.winfo_width(),
-                                                 control.winfo_x())
-                            self.assertLessEqual(control.winfo_x() + control.winfo_width(),
-                                                 slot.winfo_width())
-                            self.assertLessEqual(slot.winfo_x() + slot.winfo_width(),
-                                                 background.winfo_width())
-                            if previous_right is not None:
-                                self.assertLessEqual(previous_right, slot.winfo_x())
-                            previous_right = slot.winfo_x() + slot.winfo_width()
-                            if isinstance(control, gui.CTkOptionMenu):
-                                self.assertFalse(control.cget("dynamic_resizing"))
-                                self.assertTrue(control.get())
-                                self.assertGreater(control._text_label.winfo_width(), 20)
-        self.run_desktop(check)
+            window.geometry("1000x540")
+            window.update()
+            self.assertEqual(ScalingTracker.widget_scaling, 1)
+            self.assertEqual(ScalingTracker.window_scaling, 1)
+            self.assertAlmostEqual(window._get_window_scaling(), dpi)
+            self.assertAlmostEqual(window.winfo_width(), round(1000 * dpi), delta=2)
+            self.assertAlmostEqual(window.winfo_height(), round(540 * dpi), delta=2)
+            for row in (gui.ROW_RESOLUTION, gui.ROW_GPU,
+                        gui.ROW_OUTPUT_FORMAT, gui.ROW_CODEC, gui.ROW_ENCODER_QUALITY):
+                background = gui.app_state.option_rows[row]
+                slots = [child for child in background.winfo_children()
+                         if isinstance(child, gui.CTkFrame)]
+                self.assertEqual(len(slots), 2)
+                previous_right = None
+                for slot in slots:
+                    info, control = slot.winfo_children()
+                    with self.subTest(row=row, column=slot.grid_info()["column"]):
+                        self.assertAlmostEqual(control._get_widget_scaling(), dpi)
+                        self.assertLessEqual(info.winfo_x() + info.winfo_width(),
+                                             control.winfo_x())
+                        self.assertLessEqual(control.winfo_x() + control.winfo_width(),
+                                             slot.winfo_width())
+                        self.assertLessEqual(slot.winfo_x() + slot.winfo_width(),
+                                             background.winfo_width())
+                        if previous_right is not None:
+                            self.assertLessEqual(previous_right, slot.winfo_x())
+                        previous_right = slot.winfo_x() + slot.winfo_width()
+                        if isinstance(control, gui.CTkOptionMenu):
+                            self.assertFalse(control.cget("dynamic_resizing"))
+                            self.assertTrue(control.get())
+                            self.assertGreater(control._text_label.winfo_width(), 20)
+                            actual_font = window.tk.splitlist(control._text_label.cget("font"))
+                            self.assertEqual(int(actual_font[1]),
+                                             -round(gui.bold11.cget("size") * dpi))
+            state = gui.app_state
+            self.assertEqual(state.status_bar.winfo_width(), window.winfo_width())
+            self.assertEqual(state.status_bar.winfo_y() + state.status_bar.winfo_height(),
+                             window.winfo_height())
+            self.assertLessEqual(
+                state.action_button.winfo_rooty() + state.action_button.winfo_height(),
+                state.status_bar.winfo_rooty(),
+            )
+
+        # Substitute CTk's monitor detector, not the removed app-zoom multipliers.
+        for dpi in (1, 1.25, 1.5, 2):
+            with self.subTest(system_dpi=dpi):
+                self.run_desktop(check, system_dpi=lambda window: dpi)
+
+    def test_monitor_dpi_changes_rescale_existing_window_and_widgets_once(self):
+        dpi = 1
+
+        def check(window):
+            nonlocal dpi
+            window.geometry("1000x540")
+            window.update()
+            for dpi in (1.5, 2, 1.25, 1):
+                with self.subTest(system_dpi=dpi):
+                    # Exercise CTk's own monitor-change polling and registered
+                    # callbacks, without any user widget/window scaling calls.
+                    ScalingTracker.check_dpi_scaling()
+                    window.update()
+                    self.assertEqual(ScalingTracker.window_dpi_scaling_dict[window], dpi)
+                    self.assertEqual((ScalingTracker.widget_scaling, ScalingTracker.window_scaling),
+                                     (1, 1))
+                    self.assertAlmostEqual(window.winfo_width(), round(1000 * dpi), delta=2)
+                    self.assertAlmostEqual(window.winfo_height(), round(540 * dpi), delta=2)
+                    button = gui.app_state.action_button
+                    self.assertEqual(button._get_widget_scaling(), dpi)
+                    self.assertEqual(button.winfo_height(), round(button.cget("height") * dpi))
+                    actual_font = window.tk.splitlist(button._text_label.cget("font"))
+                    self.assertEqual(int(actual_font[1]), -round(gui.bold11.cget("size") * dpi))
+                    self.assertEqual(tuple(bool(value) for value in window.resizable()), (True, True))
+        self.run_desktop(check, system_dpi=lambda window: dpi)
 
     def test_encoder_controls_follow_codec_and_preserve_numeric_edits(self):
         def check(window):
@@ -233,51 +286,48 @@ class DesktopLayoutTests(unittest.TestCase):
             if dialog.winfo_exists():
                 dialog.destroy()
 
-    def test_concurrent_video_rows_fit_at_all_zooms_without_hiding_stop(self):
+    def test_concurrent_video_rows_fit_without_hiding_stop(self):
         message = "2. Upscaling video — " + ("long processing details " * 100)
 
         def check(window):
             state = gui.app_state
             gui.App.place_stop_button()
-            for zoom in gui.zoom_option_list:
-                gui.App.select_app_zoom(zoom)
-                window.geometry("1000x540")
-                gui._display_status(VideoProgress(message, 120, 35, 100, False))
-                window.update()
-                bar = state.status_bar
-                with self.subTest(zoom=zoom):
-                    self.assertEqual(bar.label.get("1.0", "end-1c"), message)
-                    self.assertTrue(bar.video_rows.winfo_ismapped())
-                    self.assertEqual(bar.extraction_bar.get(), 1)
-                    self.assertEqual(bar.upscaling_bar.get(), 0.35)
-                    self.assertIn("120 / ~100 frames", bar.extraction_label.cget("text"))
-                    self.assertIn("35 / ~100 frames", bar.upscaling_label.cget("text"))
-                    self.assertEqual(bar.extraction_bar.winfo_x(), bar.upscaling_bar.winfo_x())
-                    for label, progress in (
-                        (bar.extraction_label, bar.extraction_bar),
-                        (bar.upscaling_label, bar.upscaling_bar),
-                    ):
-                        self.assertLessEqual(label.winfo_x() + label.winfo_width(),
-                                             progress.winfo_x())
-                        self.assertGreater(progress.winfo_width(), 50)
-                        self.assertLessEqual(progress.winfo_x() + progress.winfo_width(),
-                                             bar.video_rows.winfo_width())
-                    self.assertLess(
-                        bar.extraction_label.winfo_y() + bar.extraction_label.winfo_height(),
-                        bar.upscaling_label.winfo_y() + bar.upscaling_label.winfo_height(),
-                    )
-                    self.assertLess(bar.winfo_height(), window.winfo_height() / 4)
-                    self.assertEqual(bar.winfo_y() + bar.winfo_height(), window.winfo_height())
-                    self.assertLessEqual(
-                        state.action_button.winfo_rooty() + state.action_button.winfo_height(),
-                        bar.winfo_rooty(),
-                    )
-                    bar.label.yview_moveto(1)
-                    window.update()
-                    self.assertEqual(bar.label._textbox.yview()[1], 1)
+            window.geometry("1000x540")
+            gui._display_status(VideoProgress(message, 120, 35, 100, False))
+            window.update()
+            bar = state.status_bar
+            self.assertEqual(bar.label.get("1.0", "end-1c"), message)
+            self.assertTrue(bar.video_rows.winfo_ismapped())
+            self.assertEqual(bar.extraction_bar.get(), 1)
+            self.assertEqual(bar.upscaling_bar.get(), 0.35)
+            self.assertIn("120 / ~100 frames", bar.extraction_label.cget("text"))
+            self.assertIn("35 / ~100 frames", bar.upscaling_label.cget("text"))
+            self.assertEqual(bar.extraction_bar.winfo_x(), bar.upscaling_bar.winfo_x())
+            for label, progress in (
+                (bar.extraction_label, bar.extraction_bar),
+                (bar.upscaling_label, bar.upscaling_bar),
+            ):
+                self.assertLessEqual(label.winfo_x() + label.winfo_width(),
+                                     progress.winfo_x())
+                self.assertGreater(progress.winfo_width(), 50)
+                self.assertLessEqual(progress.winfo_x() + progress.winfo_width(),
+                                     bar.video_rows.winfo_width())
+            self.assertLess(
+                bar.extraction_label.winfo_y() + bar.extraction_label.winfo_height(),
+                bar.upscaling_label.winfo_y() + bar.upscaling_label.winfo_height(),
+            )
+            self.assertLess(bar.winfo_height(), window.winfo_height() / 2)
+            self.assertEqual(bar.winfo_y() + bar.winfo_height(), window.winfo_height())
+            self.assertLessEqual(
+                state.action_button.winfo_rooty() + state.action_button.winfo_height(),
+                bar.winfo_rooty(),
+            )
+            bar.label.yview_moveto(1)
+            window.update()
+            self.assertEqual(bar.label._textbox.yview()[1], 1)
         self.run_desktop(check)
 
-    def test_both_task_timings_are_visible_at_minimum_width_and_all_zooms(self):
+    def test_both_task_timings_are_visible_at_minimum_width(self):
         time = 0
         messages = []
         reporter = PipelineStatus(messages.append, clock=lambda: time)
@@ -291,20 +341,17 @@ class DesktopLayoutTests(unittest.TestCase):
         def check(window):
             state = gui.app_state
             gui.App.place_stop_button()
-            for zoom in gui.zoom_option_list:
-                gui.App.select_app_zoom(zoom)
-                window.geometry("1000x540")
-                gui._display_status(VideoProgress(message, 50, 25, 100, False))
-                window.update()
-                bar = state.status_bar
-                with self.subTest(zoom=zoom):
-                    self.assertEqual(bar.label.get("1.0", "end-1c"), message)
-                    self.assertEqual(bar.label._textbox.yview(), (0.0, 1.0))
-                    self.assertTrue(bar.video_rows.winfo_ismapped())
-                    self.assertLessEqual(
-                        state.action_button.winfo_rooty() + state.action_button.winfo_height(),
-                        bar.winfo_rooty(),
-                    )
+            window.geometry("1000x540")
+            gui._display_status(VideoProgress(message, 50, 25, 100, False))
+            window.update()
+            bar = state.status_bar
+            self.assertEqual(bar.label.get("1.0", "end-1c"), message)
+            self.assertEqual(bar.label._textbox.yview(), (0.0, 1.0))
+            self.assertTrue(bar.video_rows.winfo_ismapped())
+            self.assertLessEqual(
+                state.action_button.winfo_rooty() + state.action_button.winfo_height(),
+                bar.winfo_rooty(),
+            )
         self.run_desktop(check)
 
     def test_video_rows_remain_during_encoding_and_reset_for_images(self):
@@ -321,7 +368,7 @@ class DesktopLayoutTests(unittest.TestCase):
                 self.assertTrue(bar.video_rows.winfo_ismapped())
                 self.assertEqual(bar.label.get("1.0", "end-1c"), snapshot.message)
             self.assertTrue(bar.extraction_label.cget("text").endswith("complete"))
-            self.assertTrue(bar.upscaling_label.cget("text").endswith("complete"))
+            self.assertTrue(bar.upscaling_label.cget("text").endswith("finalizing"))
             self.assertEqual(bar.extraction_bar.get(), 1)
             self.assertEqual(bar.upscaling_bar.get(), 1)
             video_height = bar.winfo_height()

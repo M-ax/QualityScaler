@@ -11,7 +11,8 @@ from time import sleep
 import unittest
 
 from qualityscaler.status import (
-    CacheSettingsConflict, PipelineStatus, VideoProgress, format_duration, write_process_status,
+    CacheSettingsConflict, PipelineStatus, StageStatus, VideoProgress,
+    format_duration, write_process_status,
 )
 
 
@@ -70,7 +71,8 @@ class PipelineStatusTests(unittest.TestCase):
         self.assertIn("Remaining: 1m 30s", lines[0])
         self.assertIn("ETA (local): estimating...", lines[1])
         self.progress.finish("extract")
-        self.assertNotIn("Extracting", self.messages[-1])
+        self.assertIn("Extracting (10 saved) | Remaining: 0s", self.messages[-1])
+        self.assertIn("Complete", self.messages[-1])
         self.assertIn("Remaining: 1m 30s", self.messages[-1])
 
     def test_resume_uses_only_new_work_for_its_rate(self):
@@ -121,40 +123,89 @@ class PipelineStatusTests(unittest.TestCase):
         self.progress.update("encoding", "Encoding (x264 fallback) 20%", completed=20)
         self.assertIn("Remaining: 8s", self.messages[-1])
 
-    def test_finished_stage_is_removed_and_late_updates_are_ignored(self):
-        self.progress.start("extract", "Extracting", total=100)
-        self.progress.start("upscale", "Upscaling", total=100)
+    def test_finished_stage_is_retained_and_late_updates_are_ignored(self):
+        self.progress.start("extracting", "Extracting", total=100)
+        self.progress.start("upscaling", "Upscaling", total=100)
         self.time = 10
-        self.progress.update("upscale", "Upscaling 50%", completed=50)
-        self.progress.finish("extract")
-        self.assertTrue(self.messages[-1].startswith("Upscaling 50% |"))
+        self.progress.update("upscaling", "Upscaling 50%", completed=50)
+        self.progress.finish("extracting", "Extracting 100%", completed=100)
+        finished = self.progress.stages[0]
+        self.assertEqual(finished.state, "complete")
+        self.assertEqual(finished.remaining_seconds, 0)
+        self.assertEqual(finished.eta, f"{self.now.astimezone():%Y-%m-%d %H:%M:%S %Z}")
+        self.assertTrue(self.messages[-1].startswith("Extracting 100% |"))
         self.assertIn("Remaining: 10s", self.messages[-1])
         count = len(self.messages)
-        self.progress.update("extract", "Stale extraction", completed=99)
+        self.progress.update("extracting", "Stale extraction", completed=99)
         self.assertEqual(len(self.messages), count)
-        self.progress.finish("upscale")
-        self.assertEqual(self.messages[-1], "")
+        self.progress.finish("upscaling", completed=100)
+        self.time = 500
+        self.now += timedelta(seconds=500)
+        self.progress.start("encoding", "Encoding", total=100)
+        self.assertEqual(self.progress.stages[0], finished)
+        self.assertEqual(self.progress.stages[1].state, "complete")
+        self.assertEqual(self.progress.stages[2].state, "running")
         count = len(self.messages)
-        self.progress.update("upscale", "Stale inference", completed=99)
-        self.progress.finish("upscale")
+        self.progress.update("upscaling", "Stale inference", completed=99)
+        self.progress.finish("upscaling")
         self.assertEqual(len(self.messages), count)
 
-    def test_clear_removes_all_interrupted_tasks(self):
-        self.progress.start("extract", "Extracting", total=100)
-        self.progress.start("upscale", "Upscaling", total=100)
+    def test_clear_resets_rows_for_a_new_job(self):
+        self.progress.finish("extracting", "Cached extraction", completed=100, total=100)
+        self.progress.start("upscaling", "Upscaling", total=100)
         self.progress.clear()
         self.assertEqual(self.messages[-1], "")
+        self.assertEqual(self.progress.stages, tuple(StageStatus(stage) for stage in (
+            "extracting", "upscaling", "encoding",
+        )))
         count = len(self.messages)
-        self.progress.update("extract", "Stale extraction", completed=99)
-        self.progress.update("upscale", "Stale inference", completed=99)
+        self.progress.update("extracting", "Stale extraction", completed=99)
+        self.progress.update("upscaling", "Stale inference", completed=99)
         self.progress.clear()
         self.assertEqual(len(self.messages), count)
+
+    def test_interrupt_freezes_latest_timing_without_completing_running_stages(self):
+        for state in ("stopped", "error"):
+            with self.subTest(state=state):
+                self.progress.clear()
+                self.progress.finish("extracting", "Cached extraction", completed=100, total=100)
+                self.progress.start("upscaling", "Upscaling", total=100)
+                self.time += 10
+                self.progress.update("upscaling", "Upscaling 50%", completed=50)
+                previous = self.progress.stages[1]
+                self.progress.interrupt(state)
+                finished, interrupted, waiting = self.progress.stages
+                self.assertEqual(finished.state, "complete")
+                self.assertEqual(interrupted.state, state)
+                self.assertEqual(interrupted.message, previous.message)
+                self.assertEqual(interrupted.remaining_seconds, previous.remaining_seconds)
+                self.assertEqual(interrupted.eta, previous.eta)
+                self.assertEqual(waiting.state, "waiting")
+                snapshot = self.progress.stages
+                self.time += 100
+                self.progress.update("upscaling", "Stale callback", completed=100)
+                self.progress.finish("upscaling")
+                self.assertEqual(self.progress.stages, snapshot)
+
+    def test_snapshots_are_immutable_and_available_inside_the_string_callback(self):
+        received = []
+        progress = PipelineStatus(lambda message: received.append((message, progress.stages)))
+        self.assertEqual(len(progress.stages), 3)
+        progress.start("extracting", "Extracting", total=10, estimated_total=True)
+        progress.update("extracting", "Extracting 50%", completed=5)
+        self.assertEqual(received[-1][1], progress.stages)
+        self.assertEqual(received[0][1][0].completed, 0)
+        self.assertEqual(received[-1][1][0].completed, 5)
+        self.assertTrue(received[-1][1][0].estimated_total)
+        with self.assertRaises(FrozenInstanceError):
+            progress.stages[0].state = "complete"
 
     def test_completed_progress_has_no_negative_remaining_time(self):
         self.progress.start("encoding", "Encoding", total=10)
         self.time = 10
         self.progress.update("encoding", "Encoding 100%", completed=12)
         self.assertIn("Remaining: 0s", self.messages[-1])
+        self.assertEqual(self.progress.stages[2].state, "running")
 
     def test_simultaneous_updates_serialize_publication_of_complete_snapshots(self):
         active = 0
@@ -224,7 +275,11 @@ class ProcessStatusTests(unittest.TestCase):
         self.assertEqual(queue.get_nowait(), "42")
 
     def test_snapshot_is_picklable_and_survives_the_gui_manager_queue(self):
-        snapshot = VideoProgress("2. Upscaling video", 12, 4, 100, False)
+        snapshot = VideoProgress("2. Upscaling video", 12, 4, 100, False, (
+            StageStatus("extracting", "Extracting", "running", 12, 100, True, 30, "local ETA"),
+            StageStatus("upscaling", "Upscaling", "running", 4, 100),
+            StageStatus("encoding"),
+        ))
         self.assertEqual(pickle.loads(pickle.dumps(snapshot)), snapshot)
         with multiprocessing.get_context("spawn").Manager() as manager:
             queue = manager.Queue()
@@ -233,6 +288,10 @@ class ProcessStatusTests(unittest.TestCase):
             self.assertIsInstance(received, VideoProgress)
             self.assertEqual(received, snapshot)
             self.assertEqual(str(received), "2. Upscaling video")
+
+    def test_old_positional_snapshot_constructor_keeps_default_stages(self):
+        snapshot = VideoProgress("Extracting", 0, 0, None, False)
+        self.assertEqual(snapshot.stages, ())
 
     def test_cache_conflict_replaces_progress_without_becoming_a_string(self):
         queue = Queue()

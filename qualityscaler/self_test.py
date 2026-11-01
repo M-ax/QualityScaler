@@ -222,7 +222,7 @@ def _check_bundle(root, report):
 
     def pause_after_saving(message):
         print(message, flush=True)
-        if message.startswith("Upscaling video"):
+        if any(line.startswith("Upscaling video") for line in message.splitlines()):
             stop.set()
 
     try:

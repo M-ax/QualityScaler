@@ -54,7 +54,7 @@ single-database video caching, resumable jobs, simple output filenames, and
 native file drag-and-drop.
 
 ## ✨ Features
-- Elegant and easy to use GUI, with app zoom from 50% to 175%
+- Resizable GUI with automatic per-monitor HiDPI scaling
 - Image and video upscale
 - Automatic GPU detection by name, with dedicated VRAM information
 - DirectML inference when available, with CPU fallback when DirectML is unavailable
@@ -93,18 +93,28 @@ Keep the VRAM limit within the selected adapter's capacity. CPU inference is
 available when the runtime has no DirectML provider, but is substantially slower;
 CPU inference does not make an unavailable hardware video encoder usable.
 
-**App zoom** changes the interface scale, not the output resolution. Large inputs
-are processed with overlapping tiles and feathered edges. These inference and
+The interface follows the system's display scaling; there is no separate app
+zoom setting. Preview-image scroll zoom still changes only the displayed image.
+Large inputs are processed with overlapping tiles and feathered edges. These inference and
 sharpening rules differ from 4.7, so old caches must not be reused as new jobs.
 
 The desktop window can be resized or maximized. Settings scroll on shorter
 windows, and the full-width bottom status bar wraps long filenames and progress
 messages. Very long messages scroll within the bar without covering Stop.
-Video jobs show separate extraction and AI upscaling status/progress rows.
+Video jobs keep separate **Extraction**, **AI upscaling**, and **Encoding**
+status/progress rows. Each stage gets a small green checkmark only after it
+succeeds, and completed rows stay visible while the remaining stages run.
 Frame totals are estimates until extraction finishes; unknown totals show saved
 frame counts instead of a percentage.
 Scale edits refresh file previews after typing pauses instead of
 rebuilding the cards on every keystroke.
+
+On Windows, the app enables per-monitor DPI awareness before creating Tk
+windows, while CustomTkinter handles monitor changes and scales widgets, fonts,
+and window geometry. It uses per-monitor v1 awareness to match CustomTkinter's
+supported path for fixed-size Tk dialogs, with an older-Windows fallback.
+Obsolete saved app-zoom values are ignored rather than applied on top of system
+scaling.
 
 ### Preview an upscale
 
@@ -374,13 +384,16 @@ cache conversion.
 - Only one runner may own a cache at a time. A crash-released OS lock prevents
   simultaneous GUI/CLI resumes from mixing job state. Its tiny, stable lock file
   lives in the OS temporary directory, not among the cached frames.
-- The status bar keeps only the latest status for each active task, on separate
-  lines. Each task has its own remaining time (for example, `1d 2h 3m 4s`) and ETA
+- The status bar keeps the latest status for each stage in its own persistent
+  row. Each running stage has its own remaining time (for example, `1d 2h 3m 4s`) and ETA
   in the system's local date/time and timezone; estimates are not combined.
   A task shows `estimating...` until it has a known total and measured progress.
   These are stage estimates, not predictions for unstarted stages or later files
   in the batch. Resumed inference measures only newly processed frames, and
-  encoding retries reset their estimate.
+  encoding retries reset their estimate. Successful stages show a green check
+  and their local finish time. For reused cached stages, that time records when
+  the cache was validated on resume. Merely reaching 100% does not finish encoding:
+  FFmpeg must finalize successfully and publish the output first.
 
 Inspect the saved settings/progress, or resume directly using the recorded
 configuration without re-entering it in the GUI:
@@ -504,7 +517,7 @@ CPU fallback is not a substitute for verifying DirectML execution.
     - [x] Video frames extraction by FFMPEG (x10 times faster)
 - [ ] 2026.X version
     - [x] Implement new AI models
-    - [x] App interface % scaling
+    - [x] Automatic per-monitor HiDPI interface scaling
     - [ ] TTA upscale mode
 
 </details>

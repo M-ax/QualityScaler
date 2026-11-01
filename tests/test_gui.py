@@ -584,10 +584,9 @@ class VideoStatusWidgetTests(unittest.TestCase):
     def setUp(self):
         self.bar = object.__new__(StatusBar)
         self.bar.video_rows = Mock()
-        self.bar.extraction_label = Mock()
-        self.bar.upscaling_label = Mock()
-        self.bar.extraction_bar = Mock()
-        self.bar.upscaling_bar = Mock()
+        for name in ("extraction", "upscaling", "encoding"):
+            for part in ("label", "bar", "check", "detail"):
+                setattr(self.bar, f"{name}_{part}", Mock())
         self.bar._queue_fit = Mock()
         self.bar._video_progress = None
 
@@ -629,7 +628,7 @@ class VideoStatusWidgetTests(unittest.TestCase):
         )
         self.bar.set_video_progress(VideoProgress("1. Video", 100, 100, 100, True))
         self.bar.upscaling_label.configure.assert_called_with(
-            text="AI upscaling: 100 / 100 frames — complete"
+            text="AI upscaling: 100 / 100 frames — finalizing"
         )
 
     def test_zero_estimate_does_not_divide_by_zero(self):
@@ -655,7 +654,7 @@ class VideoStatusWidgetTests(unittest.TestCase):
 
     def test_cleanup_preserves_counters_without_leaving_active_stage_wording(self):
         self.bar.set_video_progress(VideoProgress("1. Video", 100, 90, 100, True))
-        for status in ("stopping", "finalizing", "stopped", "error", "job finished"):
+        for status in ("stopping", "finalizing", "stopped", "error"):
             with self.subTest(status=status):
                 self.bar.set_video_status(status)
                 self.bar.extraction_label.configure.assert_called_with(
@@ -848,19 +847,10 @@ class PreferencesAndConfigTests(StateTestCase):
         self.state.selected_VRAM_limiter.set.assert_called_with("4")
         self.assertEqual(self.state.preferences.video_codec, "x264")
 
-    def test_zoom_updates_both_tk_scalings_and_preference(self):
-        with patch.object(gui, "set_window_scaling") as windows, \
-                patch.object(gui, "set_widget_scaling") as widgets:
-            gui.App.select_app_zoom("125%")
-        self.assertEqual(self.state.preferences.app_zoom, "125%")
-        windows.assert_called_once_with(1.25)
-        widgets.assert_called_once_with(1.25)
-
     def test_preferences_round_trip_upstream_keys_and_tolerate_corruption(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "preferences.json"
             with patch.object(gui, "USER_PREFERENCE_PATH", str(path)):
-                self.state.preferences.app_zoom = "125%"
                 self.state.preferences.sharpening = "High"
                 self.state.preferences.video_preset = "veryfast"
                 self.state.preferences.video_rate_control = "CRF"
@@ -871,15 +861,42 @@ class PreferencesAndConfigTests(StateTestCase):
                 self.assertEqual(data["default_keep_frames"], "ON")
                 self.assertNotIn("default_blending", data)
                 loaded = gui.load_user_preferences()
-                self.assertEqual(loaded.app_zoom, "125%")
                 self.assertEqual(loaded.sharpening, "High")
                 self.assertEqual(loaded.video_preset, "veryfast")
                 self.assertEqual(loaded.video_rate_control, "CRF")
                 self.assertEqual(loaded.video_crf, "19.5")
                 self.assertEqual(loaded.video_bitrate, "9000")
-                for contents in ("{broken", "[]", '{"default_app_zoom": "broken"}'):
+                for contents in ("{broken", "[]"):
                     path.write_text(contents)
-                    self.assertEqual(gui.load_user_preferences().app_zoom, "100%")
+                    self.assertEqual(gui.load_user_preferences(), gui.UserPreferences())
+
+    def test_obsolete_preferences_are_ignored_without_losing_current_choices(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            with patch.object(gui, "USER_PREFERENCE_PATH", str(path)):
+                for obsolete in ("175%", "broken", None, {"invalid": True}):
+                    with self.subTest(obsolete=obsolete):
+                        path.write_text(json.dumps({
+                            "app_zoom": obsolete, "default_app_zoom": obsolete,
+                            "default_sharpening": "High", "default_keep_frames": "OFF",
+                            "default_output_path": "custom output",
+                            "default_input_resize_factor": "75",
+                            "default_video_codec": "x265",
+                        }))
+                        loaded = gui.load_user_preferences()
+                        self.assertEqual(loaded.sharpening, "High")
+                        self.assertFalse(loaded.keep_frames)
+                        self.assertEqual(loaded.output_path, "custom output")
+                        self.assertEqual(loaded.input_resize_factor, "75")
+                        self.assertEqual(loaded.video_codec, "x265")
+                        self.state.preferences = loaded
+                        self.state.selected_output_path = variable(loaded.output_path)
+                        self.state.selected_input_resize_factor = variable(loaded.input_resize_factor)
+                        gui.save_user_choices_in_json()
+                        data = json.loads(path.read_text())
+                        self.assertNotIn("app_zoom", data)
+                        self.assertNotIn("default_app_zoom", data)
+                        self.assertEqual(gui.load_user_preferences(), loaded)
 
     def test_preferences_normalize_unsupported_encoder_choices(self):
         with TemporaryDirectory() as directory:
@@ -1012,7 +1029,6 @@ class LifecycleTests(StateTestCase):
                 patch.object(gui, "load_user_preferences", return_value=gui.UserPreferences()), \
                 patch.object(gui, "set_appearance_mode"), \
                 patch.object(gui, "set_default_color_theme"), \
-                patch.object(gui, "apply_app_zoom"), \
                 patch.object(gui, "allow_sleep"), \
                 patch.object(gui, "FileDropWindow", side_effect=RuntimeError("Tk init failed")):
             with self.assertRaisesRegex(RuntimeError, "Tk init failed"):

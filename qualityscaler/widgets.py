@@ -2,11 +2,14 @@
 
 from customtkinter import CTkFrame, CTkLabel, CTkProgressBar, CTkTextbox
 
-from .status import VideoProgress
+from .status import VideoProgress, format_duration
+
+
+STAGE_COMPLETE_COLOR = "#4ADE80"
 
 
 class StatusBar(CTkFrame):
-    """Wrap general status and show both concurrent video stages together."""
+    """Keep extraction, upscaling and encoding visible through job completion."""
 
     def __init__(self, master, *, textvariable, font, text_color, **kwargs):
         super().__init__(master, corner_radius=0, **kwargs)
@@ -31,15 +34,32 @@ class StatusBar(CTkFrame):
             self.video_rows, text="", font=font, text_color=text_color,
             height=20, anchor="w",
         )
+        self.encoding_label = CTkLabel(
+            self.video_rows, text="", font=font, text_color=text_color,
+            height=20, anchor="w",
+        )
         self.extraction_bar = CTkProgressBar(self.video_rows, width=1, height=8)
         self.upscaling_bar = CTkProgressBar(self.video_rows, width=1, height=8)
-        for row, (label, bar) in enumerate((
-            (self.extraction_label, self.extraction_bar),
-            (self.upscaling_label, self.upscaling_bar),
-        )):
-            label.grid(row=row, column=0, sticky="w", padx=(0, 12))
-            bar.grid(row=row, column=1, sticky="ew")
+        self.encoding_bar = CTkProgressBar(self.video_rows, width=1, height=8)
+        for row, name in enumerate(("extraction", "upscaling", "encoding")):
+            check = CTkLabel(
+                self.video_rows, text="", font=font, text_color=STAGE_COMPLETE_COLOR,
+                width=20, height=20,
+            )
+            detail = CTkLabel(
+                self.video_rows, text="", font=font, text_color=text_color,
+                width=1, height=16, anchor="w", justify="left", wraplength=600,
+            )
+            setattr(self, f"{name}_check", check)
+            setattr(self, f"{name}_detail", detail)
+            getattr(self, f"{name}_label").grid(
+                row=row * 2, column=0, sticky="w", padx=(0, 12),
+            )
+            getattr(self, f"{name}_bar").grid(row=row * 2, column=1, sticky="ew")
+            check.grid(row=row * 2, column=2, sticky="e", padx=(6, 0))
+            detail.grid(row=row * 2 + 1, column=0, columnspan=3, sticky="ew", pady=(0, 3))
         self.video_rows.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.video_rows.bind("<Configure>", self._queue_fit, add="+")
         self.set_video_progress(None)
         self._trace = textvariable.trace_add("write", self._replace_message)
         self.bind("<Configure>", self._queue_fit, add="+")
@@ -65,37 +85,83 @@ class StatusBar(CTkFrame):
         self._video_progress = progress
         if progress is None:
             self.video_rows.grid_remove()
-            self.extraction_label.configure(text="")
-            self.upscaling_label.configure(text="")
-            self.extraction_bar.set(0)
-            self.upscaling_bar.set(0)
+            for name in ("extraction", "upscaling", "encoding"):
+                getattr(self, f"{name}_label").configure(text="")
+                getattr(self, f"{name}_bar").set(0)
+                getattr(self, f"{name}_check").configure(text="")
+                detail = getattr(self, f"{name}_detail")
+                detail.configure(text="")
+                detail.grid_remove()
         else:
+            stages = {stage.stage: stage for stage in getattr(progress, "stages", ())}
             extraction_status = "complete" if progress.extraction_complete else "extracting"
             if progress.upscaled < progress.extracted:
                 upscaling_status = "upscaling"
             elif progress.extraction_complete:
-                upscaling_status = "complete"
+                upscaling_status = "finalizing"
             else:
                 upscaling_status = "waiting for frames"
-            for label, bar, stage, count, stage_status in (
-                (self.extraction_label, self.extraction_bar, "Extraction",
-                 progress.extracted, extraction_status),
-                (self.upscaling_label, self.upscaling_bar, "AI upscaling",
-                 progress.upscaled, upscaling_status),
+            for key, name, title, count, stage_status in (
+                ("extracting", "extraction", "Extraction", progress.extracted, extraction_status),
+                ("upscaling", "upscaling", "AI upscaling", progress.upscaled, upscaling_status),
+                ("encoding", "encoding", "Encoding", 0, "waiting"),
             ):
-                if progress.total is None:
+                task = stages.get(key)
+                total = progress.total
+                estimated = not progress.extraction_complete
+                if task is not None:
+                    count, total, estimated = task.completed, task.total, task.estimated_total
+                    stage_status = {
+                        "waiting": "waiting", "running": "encoding" if key == "encoding" else (
+                            "extracting" if key == "extracting" else "upscaling"
+                        ),
+                        "complete": "complete", "stopped": "stopped", "error": "error",
+                    }[task.state]
+                # The terminal success is authoritative even when the GUI's
+                # single-slot queue skipped the final completed-stage snapshot.
+                if status == "job finished":
+                    stage_status = "complete"
+                    if total is None:
+                        total = progress.total
+                    if total is not None:
+                        count = total
+                        estimated = False
+                elif status is not None and stage_status not in ("complete", "waiting"):
+                    stage_status = status
+                if total is None:
                     detail = f"{count} frames, total unknown"
                     fraction = 0
                 else:
-                    estimate = "" if progress.extraction_complete else "~"
-                    detail = f"{count} / {estimate}{progress.total} frames"
+                    estimate = "~" if estimated else ""
+                    detail = f"{count} / {estimate}{total} frames"
                     # Estimates can lag extraction; never let a bar overflow.
-                    fraction = (min(1, max(0, count / progress.total))
-                                if progress.total > 0 else 0)
-                if status is not None and stage_status != "complete":
-                    stage_status = status
-                label.configure(text=f"{stage}: {detail} — {stage_status}")
-                bar.set(fraction)
+                    fraction = min(1, max(0, count / total)) if total > 0 else 0
+                complete = (
+                    (task is not None and task.state == "complete")
+                    or (task is None and key == "extracting" and progress.extraction_complete)
+                    or status == "job finished"
+                )
+                getattr(self, f"{name}_label").configure(text=f"{title}: {detail} — {stage_status}")
+                getattr(self, f"{name}_bar").set(1 if complete else fraction)
+                getattr(self, f"{name}_check").configure(text="✓" if complete else "")
+                text = task.message if task is not None else ""
+                if task is not None and stage_status == "complete":
+                    if task.state == "complete" and task.eta:
+                        text = f"{text} | Finished (local): {task.eta}"
+                    elif status == "job finished":
+                        text = "Completed successfully"
+                elif task is not None and task.state == "running" and status is None:
+                    remaining = (
+                        format_duration(task.remaining_seconds)
+                        if task.remaining_seconds is not None else "estimating..."
+                    )
+                    text = f"{text} | Remaining: {remaining} | ETA (local): {task.eta or 'estimating...'}"
+                detail_label = getattr(self, f"{name}_detail")
+                detail_label.configure(text=text)
+                if text:
+                    detail_label.grid()
+                else:
+                    detail_label.grid_remove()
             self.video_rows.grid()
         self._queue_fit()
 
@@ -110,8 +176,16 @@ class StatusBar(CTkFrame):
 
     def _fit_message(self):
         self._layout_after_id = None
+        if self._video_progress is not None:
+            # CustomTkinter applies monitor DPI once. wraplength is expressed
+            # in its logical pixels, while winfo_width returns physical pixels.
+            width = max(100, self._reverse_widget_scaling(self.video_rows.winfo_width()) - 12)
+            for name in ("extraction", "upscaling", "encoding"):
+                detail = getattr(self, f"{name}_detail")
+                if detail.cget("wraplength") != width:
+                    detail.configure(wraplength=width)
         # Tk counts real wrapped display lines at the current physical width
-        # and font/DPI scale. Leave room for both video rows by capping their
+        # and font/DPI scale. Leave room for the video rows by capping their
         # general message at two lines (four otherwise). Each concurrent task
         # has its own line with timing, so give multi-task snapshots four
         # wrapped lines to keep both estimates visible at the minimum width.

@@ -11,7 +11,7 @@ import numpy as np
 from qualityscaler.encoders import EncoderOptions
 from qualityscaler.ffmpeg import UpscaleCancelled
 from qualityscaler.jobs import check_if_file_is_video, upscale_image, upscale_orchestrator
-from qualityscaler.status import CacheSettingsConflict, VideoProgress
+from qualityscaler.status import CacheSettingsConflict, StageStatus, VideoProgress
 from qualityscaler.video import CacheSettingsMismatch, upscale_video
 
 
@@ -157,9 +157,14 @@ class BatchJobTests(unittest.TestCase):
         self.assertEqual(backend.return_value.run.call_args.kwargs, {})
         report = backend.call_args.kwargs["progress"]
         report(VideoProgress("Extracting video frames", 3, 1, 5, False))
-        report(VideoProgress("Encoding upscaled video 20%", 5, 5, 5, True))
+        stages = (
+            StageStatus("extracting", "Extracting complete", "complete", 5, 5),
+            StageStatus("upscaling", "Upscaling complete", "complete", 5, 5),
+            StageStatus("encoding", "Encoding 20%", "running", 1, 5),
+        )
+        report(VideoProgress("Encoding upscaled video 20%", 5, 5, 5, True, stages))
         self.assertEqual(queue.get_nowait(), VideoProgress(
-            "2. Encoding upscaled video 20%", 5, 5, 5, True,
+            "2. Encoding upscaled video 20%", 5, 5, 5, True, stages,
         ))
 
     def test_video_adapter_forwards_explicit_cache_reset_authorization(self):

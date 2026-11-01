@@ -36,7 +36,7 @@ def upscale_orchestrator(
     selected_output_path, selected_AI_model, selected_AI_multithreading,
     input_resize_factor, output_resize_factor, selected_gpu, tiles_resolution,
     selected_sharpening_amount, selected_keep_frames, selected_image_extension,
-    selected_video_extension, selected_video_codec,
+    selected_video_extension, selected_video_codec, selected_video_options=None,
 ):
     try:
         from pathlib import Path
@@ -52,7 +52,7 @@ def upscale_orchestrator(
                     selected_output_path, selected_AI_model, selected_sharpening_amount,
                     selected_AI_multithreading, selected_gpu, input_resize_factor,
                     output_resize_factor, tiles_resolution, selected_video_extension,
-                    selected_video_codec, selected_keep_frames,
+                    selected_video_codec, selected_keep_frames, selected_video_options,
                 )
             else:
                 if image_engine is None:

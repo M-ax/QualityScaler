@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from qualityscaler import gui
+from qualityscaler.encoders import encoder_capabilities
 
 
 @unittest.skipUnless(sys.platform == "win32" or os.environ.get("DISPLAY"),
@@ -56,7 +57,7 @@ class DesktopLayoutTests(unittest.TestCase):
                 gui.App.select_app_zoom(zoom)
                 window.update()
                 for row in (gui.ROW_RESOLUTION, gui.ROW_GPU,
-                            gui.ROW_OUTPUT_FORMAT, gui.ROW_CODEC):
+                            gui.ROW_OUTPUT_FORMAT, gui.ROW_CODEC, gui.ROW_ENCODER_QUALITY):
                     background = gui.app_state.option_rows[row]
                     slots = [child for child in background.winfo_children()
                              if isinstance(child, gui.CTkFrame)]
@@ -78,6 +79,34 @@ class DesktopLayoutTests(unittest.TestCase):
                                 self.assertFalse(control.cget("dynamic_resizing"))
                                 self.assertTrue(control.get())
                                 self.assertGreater(control._text_label.winfo_width(), 20)
+        self.run_desktop(check)
+
+    def test_encoder_controls_follow_codec_and_preserve_numeric_edits(self):
+        def check(window):
+            state = gui.app_state
+            state.selected_video_crf.set("18.5")
+            state.selected_video_bitrate.set("8500")
+            for codec in (value for value in gui.video_codec_list if value != "----"):
+                gui.App.select_video_codec_from_menu(codec)
+                window.update()
+                capabilities = encoder_capabilities(codec)
+                preset = state.option_rows[gui.ROW_ENCODER_PRESET].winfo_children()[1]
+                self.assertEqual(preset.cget("values"), list(capabilities.presets))
+                slots = state.option_rows[gui.ROW_ENCODER_QUALITY].winfo_children()
+                mode = slots[0].winfo_children()[1]
+                self.assertEqual(mode.cget("values"), list(capabilities.rate_controls))
+                for rate_control in capabilities.rate_controls:
+                    gui.App.select_video_rate_control_from_menu(rate_control)
+                    window.update()
+                    slots = state.option_rows[gui.ROW_ENCODER_QUALITY].winfo_children()
+                    entry = slots[1].winfo_children()[1]
+                    self.assertEqual(entry.get(), "18.5" if rate_control == "CRF" else "8500")
+                    options = gui._video_encoder_options()
+                    self.assertEqual(options.rate_control, rate_control)
+                # A rebuild must replace rather than accumulate controls.
+                self.assertEqual(len(state.option_rows[gui.ROW_ENCODER_QUALITY].winfo_children()), 2)
+            self.assertEqual(state.selected_video_crf.get(), "18.5")
+            self.assertEqual(state.selected_video_bitrate.get(), "8500")
         self.run_desktop(check)
 
     def test_resize_keeps_status_and_action_visible_and_settings_scrollable(self):

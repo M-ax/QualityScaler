@@ -3,7 +3,9 @@
 This module deliberately has no GUI, GPU, media, or storage imports.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from .encoders import EncoderOptions
 
 
 @dataclass
@@ -21,3 +23,4 @@ class ProcessingConfig:
     selected_image_extension: str
     selected_video_extension: str
     selected_video_codec: str
+    selected_video_options: EncoderOptions = field(default_factory=EncoderOptions)

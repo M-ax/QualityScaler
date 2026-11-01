@@ -15,6 +15,7 @@ from weakref import WeakSet
 import cv2
 import numpy as np
 
+from qualityscaler.encoders import EncoderOptions
 from qualityscaler.ffmpeg import UpscaleCancelled
 from qualityscaler.frame_store import FrameStore
 from qualityscaler.job_lock import JobAlreadyRunning, JobLock
@@ -535,6 +536,20 @@ class VideoUpscalerTests(unittest.TestCase):
         with FrameStore(self.cache, read_only=True) as store:
             self.assertEqual(store.get_metadata("settings")["codec"], "x265")
 
+    def test_encoder_choices_are_forwarded_saved_and_reuse_ai_frames(self):
+        self.run_job()
+        self.calls.clear()
+        options = EncoderOptions(preset="veryfast", rate_control="CRF", crf=18.5)
+        settings = replace(self.settings, encoder_options=options)
+        self.run_job(settings=settings)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.ffmpeg.extractions, 1)
+        self.assertEqual(self.ffmpeg.encodings, 2)
+        self.assertEqual(self.ffmpeg.encoding_options["encoder_options"], options)
+        self.assertEqual(settings.processing_settings(), self.settings.processing_settings())
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(store.get_metadata("settings")["encoder_options"], asdict(options))
+
     def test_default_batch_is_committed_before_waiting_for_running_inference(self):
         blocked = Event()
         release = Event()
@@ -723,7 +738,9 @@ class VideoUpscalerTests(unittest.TestCase):
     def test_invalid_settings_and_frames_fail_clearly(self):
         for changes in ({"workers": 0}, {"input_resize_factor": 0},
                         {"output_resize_factor": float("nan")},
-                        {"blending_factor": 2}, {"extension": ".txt"}):
+                        {"blending_factor": 2}, {"extension": ".txt"},
+                        {"encoder_options": EncoderOptions(preset="p7")},
+                        {"codec": "h264_nvenc", "encoder_options": EncoderOptions(rate_control="CRF")}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(self.settings, **changes)
         with self.assertRaisesRegex(ValueError, "decodable"):

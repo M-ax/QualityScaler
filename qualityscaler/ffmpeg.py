@@ -12,6 +12,7 @@ from threading import Event, Thread
 
 from .jpeg_stream import iter_jpeg_frames
 from .paths import find_by_relative_path
+from .status import PipelineStatus
 
 
 class UpscaleCancelled(Exception):
@@ -173,11 +174,13 @@ class FFmpeg:
         return count
 
     def encode(self, video_path, output_path, fps, codec, frames, stop_event, *,
-               output_size=None, total_frames=None, status=None):
+               output_size=None, total_frames=None, status=None, progress=None):
         """Encode ordered cached JPEGs, preferring passthrough for optional audio.
 
         Replayable frames allow video-codec and AAC audio fallbacks. Publish only
         a successful encode; never replace an existing output with a failed video.
+        A shared PipelineStatus keeps encoding alongside other active stages;
+        status remains a string callback for standalone encoding callers.
         """
         if stop_event.is_set():
             raise UpscaleCancelled()
@@ -213,9 +216,16 @@ class FFmpeg:
             # than dropping audio or failing a valid video after upscaling.
             attempts += [(video_codec, "aac") for video_codec in codecs]
 
-        def progress(count):
-            percent = min(100, int(count * 100 / total_frames)) if total_frames else 0
-            status(f"Encoding upscaled video {percent}%")
+        reporter = progress if progress is not None else (
+            PipelineStatus(status) if status is not None else None
+        )
+
+        def report_encoding(count):
+            detail = (
+                f"{min(100, int(count * 100 / total_frames))}%"
+                if total_frames and total_frames > 0 else f"({count} frames)"
+            )
+            reporter.update("encoding", f"{message} {detail}", completed=count)
 
         try:
             for index, (current_codec, audio_codec) in enumerate(attempts):
@@ -230,16 +240,22 @@ class FFmpeg:
                     arguments += ["-b:a", "192k"]
                 if output.suffix.lower() in (".mp4", ".mov", ".m4v"):
                     arguments += ["-movflags", "+faststart"]
-                if status:
+                if reporter is not None:
                     arguments += ["-progress", "pipe:1", "-nostats"]
                 arguments.append(str(partial))
-                if index and current_codec != codec and status:
-                    status("Encoding upscaled video (x264 fallback)")
-                if audio_codec == "aac" and status:
-                    status("Encoding upscaled video (AAC audio fallback)")
+                message = "Encoding upscaled video"
+                fallbacks = []
+                if current_codec != codec:
+                    fallbacks.append("x264 fallback")
+                if audio_codec == "aac":
+                    fallbacks.append("AAC audio fallback")
+                if fallbacks:
+                    message += f" ({', '.join(fallbacks)})"
+                if reporter is not None:
+                    reporter.start("encoding", message, total=total_frames)
                 try:
                     with self._pipe(arguments, stop_event, writing=True,
-                                    progress=progress if status else None) as pipe:
+                                    progress=report_encoding if reporter is not None else None) as pipe:
                         for frame in frame_factory():
                             if stop_event.is_set():
                                 raise UpscaleCancelled()
@@ -253,3 +269,5 @@ class FFmpeg:
                         raise
         finally:
             partial.unlink(missing_ok=True)
+            if reporter is not None:
+                reporter.finish("encoding")

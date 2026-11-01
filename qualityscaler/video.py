@@ -12,7 +12,6 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 import sys
 from threading import Event, local
-from time import monotonic
 
 import cv2
 import numpy as np
@@ -24,7 +23,7 @@ from .geometry import VideoGeometry
 from .job_lock import JobLock
 from .media import blend_images, get_video_fps, sharpen_image
 from .paths import find_by_relative_path, prepare_output_video_directory_name, prepare_output_video_filename
-from .status import VideoProgress
+from .status import PipelineStatus, VideoProgress
 
 
 SOURCE_LAYOUT_ORIGINAL = "original"
@@ -205,6 +204,7 @@ class VideoUpscaler:
         self._progress = VideoProgress("", 0, 0, None, False)
         self.stop_event = stop_event if stop_event is not None else Event()
         self.checkpoint_interval = checkpoint_interval
+        self.task_status = PipelineStatus(self._report)
 
     def _report(self, message, **changes):
         self._progress = replace(self._progress, message=message, **changes)
@@ -308,10 +308,13 @@ class VideoUpscaler:
                 store, "extracting", source_size=list(geometry.source_size),
                 input_size=list(input_size),
             )
-            self._report(f"Extracting video frames ({input_size[0]}×{input_size[1]} input)")
+            message = f"Extracting video frames ({input_size[0]}×{input_size[1]} input)"
         else:
             self._state(store, "extracting")
-            self._report("Extracting video frames")
+            message = "Extracting video frames"
+        # Partial extraction is replayed from zero, including already-cached
+        # frames, so its timing baseline differs from resumable inference.
+        self.task_status.start("extracting", message, total=expected, estimated_total=True)
 
         frames = Queue(maxsize=settings.workers * 2)
         stop = _ExtractionStop(self.stop_event)
@@ -359,7 +362,10 @@ class VideoUpscaler:
                         store.commit()
                     if index == 0 or (index + 1) % self.checkpoint_interval == 0:
                         progress = f"{min(100, (index + 1) / expected * 100):.0f}% " if expected else ""
-                        self._report(f"Extracting video frames {progress}({index + 1} saved)")
+                        self.task_status.update(
+                            "extracting", f"Extracting video frames {progress}({index + 1} saved)",
+                            completed=index + 1,
+                        )
                     yield index
                 count = result.result()  # Propagate decoder errors; never encode a partial stream.
                 self._check_stop()
@@ -367,15 +373,20 @@ class VideoUpscaler:
                     raise ValueError("Extracted frame count does not match the cached source")
                 self._state(store, "upscaling", fps=fps, total_frames=count,
                             extraction_complete=True)
-                self._report(
-                    f"Extracting video frames 100% ({count} saved)",
-                    total=count, extraction_complete=True,
+                self._progress = replace(self._progress, total=count, extraction_complete=True)
+                self.task_status.update(
+                    "extracting", f"Extracting video frames 100% ({count} saved)",
+                    completed=count, total=count, estimated_total=False,
                 )
+                # The probe total was only an estimate. Inference may already
+                # be running; update its total without resetting its own rate.
+                self.task_status.update("upscaling", total=count, estimated_total=False)
             finally:
                 # Also release a producer blocked on a full queue after an AI,
                 # SQLite or status-consumer failure. Do not cancel the user's
                 # event on failure: the original exception must remain an error.
                 stop.aborted.set()
+                self.task_status.finish("extracting")
 
     def _upscale(self, store, settings, extraction=None):
         """Pump extraction and bounded AI futures through the sole cache writer."""
@@ -390,7 +401,6 @@ class VideoUpscaler:
         workers = 0
         next_index = 0
         pending = {}
-        started = monotonic()
         saved_this_run = 0
         try:
             while True:
@@ -433,6 +443,11 @@ class VideoUpscaler:
                         max_workers=workers, initializer=initialize_worker,
                         initargs=(settings, self.engine_factory),
                     )
+                    self.task_status.start(
+                        "upscaling", f"Preparing video upscaling ({workers} workers)",
+                        completed=completed, total=self._progress.total,
+                        estimated_total=not self._progress.extraction_complete,
+                    )
                 if executor is None:
                     continue
                 # Scan only available indices. Never retain one Future per
@@ -459,15 +474,14 @@ class VideoUpscaler:
                         store.commit()
                     total = self._progress.total
                     if total:
-                        seconds_per_frame = (monotonic() - started) / saved_this_run
-                        remaining = max(0, round(seconds_per_frame * (total - completed)))
                         message = (
                             f"Upscaling video {min(1, completed / total):.2%} "
-                            f"({completed}/{total} saved, {remaining}s remaining)"
+                            f"({completed}/{total} saved)"
                         )
                     else:
                         message = f"Upscaling video ({completed} saved)"
-                    self._report(message, upscaled=completed)
+                    self._progress = replace(self._progress, upscaled=completed)
+                    self.task_status.update("upscaling", message, completed=completed)
                 if not extracting and not pending and next_index >= available:
                     break
         finally:
@@ -483,6 +497,7 @@ class VideoUpscaler:
                 finally:
                     if executor is not None:
                         executor.shutdown(wait=True)
+                    self.task_status.finish("upscaling")
         store.commit()
         if store.frame_count("upscaled") != store.get_metadata("total_frames"):
             raise ValueError("Not all video frames were saved")
@@ -496,6 +511,8 @@ class VideoUpscaler:
             )
 
     def _run_locked(self, video_path, output_path, cache_path, settings, *, clear_cache=False):
+        # A resumed/reused runner must not retain interrupted stages or rates.
+        self.task_status = PipelineStatus(self._report)
         cache_path = Path(cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with FrameStore(cache_path) as store:
@@ -507,7 +524,7 @@ class VideoUpscaler:
                     self._upscale(store, settings, extraction)
                 self._check_stop()
                 self._state(store, "encoding", error=None)
-                self._report("Encoding upscaled video")
+                self.task_status.start("encoding", "Encoding upscaled video")
                 if source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
                     size = source_frame_size(store)
                 else:
@@ -518,10 +535,11 @@ class VideoUpscaler:
                     video_path, output_path, store.get_metadata("fps"),
                     settings.codec, lambda: store.iter_frames("upscaled"), self.stop_event,
                     output_size=geometry.output_size, total_frames=store.get_metadata("total_frames"),
-                    status=self._report,
+                    progress=self.task_status,
                 )
                 self._check_stop()
                 self._state(store, "complete")
+                self.task_status.finish("encoding")
             except BaseException as error:
                 try:
                     self._state(
@@ -534,6 +552,8 @@ class VideoUpscaler:
                     # SQLite rolls back an uncommitted batch on the next open.
                     pass
                 raise
+            finally:
+                self.task_status.clear()
         if not settings.keep_frames:
             cache_path.unlink()
             try:
@@ -573,7 +593,9 @@ def upscale_video(
     return VideoUpscaler(
         stop_event=event_stop_upscale_process,
         progress=lambda snapshot: write_process_status(
-            process_status_q, replace(snapshot, message=f"{file_number}. {snapshot.message}")
+            process_status_q, replace(
+                snapshot, message=f"{file_number}. {snapshot.message}" if snapshot.message else "",
+            )
         ),
     ).run(video_path, output, Path(directory) / "frames.sqlite3", settings, **run_options)
 

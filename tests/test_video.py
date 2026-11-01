@@ -200,6 +200,36 @@ class VideoUpscalerTests(unittest.TestCase):
             self.assertEqual(store.get_metadata("source_size"), [12, 8])
             self.assertEqual(store.get_metadata("input_size"), [12, 8])
 
+    def test_all_video_stages_publish_their_own_timing(self):
+        messages = []
+        runner = self.upscaler(status=messages.append)
+        self.run_job(runner)
+        for stage in ("Extracting video frames", "Upscaling video", "Encoding upscaled video"):
+            self.assertTrue(any(stage in message for message in messages))
+        for message in messages:
+            for line in message.splitlines():
+                self.assertEqual(line.count("Remaining:"), 1)
+                self.assertEqual(line.count("ETA (local):"), 1)
+        upscale = [
+            line for message in messages for line in message.splitlines()
+            if line.startswith("Upscaling video")
+        ]
+        self.assertTrue(any("estimating..." not in line for line in upscale))
+        self.assertIs(self.ffmpeg.encoding_options["progress"], runner.task_status)
+        self.assertEqual(messages[-1], "")
+
+    def test_interrupted_video_clears_its_latest_status(self):
+        messages = []
+
+        def status(message):
+            messages.append(message)
+            if any(line.startswith("Upscaling video") for line in message.splitlines()):
+                self.stop.set()
+
+        with self.assertRaises(UpscaleCancelled):
+            self.run_job(self.upscaler(status=status))
+        self.assertEqual(messages[-1], "")
+
     def test_new_jobs_cache_input_scaled_frames_and_normalize_worker_factor(self):
         seen = []
 
@@ -403,7 +433,7 @@ class VideoUpscalerTests(unittest.TestCase):
 
     def test_interrupted_upscaling_resumes_only_missing_frames(self):
         def status(message):
-            if message.startswith("Upscaling video"):
+            if any(line.startswith("Upscaling video") for line in message.splitlines()):
                 self.stop.set()
 
         with self.assertRaises(UpscaleCancelled):
@@ -464,6 +494,14 @@ class VideoUpscalerTests(unittest.TestCase):
                 self.assertFalse(extraction_finished.is_set())
                 self.assertFalse(snapshot.extraction_complete)
                 self.assertEqual(snapshot.extracted, 1)
+                lines = snapshot.message.splitlines()
+                self.assertEqual(len(lines), 2)
+                self.assertTrue(lines[0].startswith("Extracting video frames"))
+                self.assertTrue(lines[1].startswith("Upscaling video"))
+                for line in lines:
+                    self.assertEqual(line.count("Remaining:"), 1)
+                    self.assertEqual(line.count("ETA (local):"), 1)
+                self.assertNotIn("Preparing video upscaling", snapshot.message)
                 with FrameStore(self.cache, read_only=True) as store:
                     self.assertEqual(store.frame_count("upscaled"), 1)
                 first_saved.set()
@@ -644,7 +682,7 @@ class VideoUpscalerTests(unittest.TestCase):
                 return super().submit(*args, **kwargs)
 
         def status(message):
-            if message.startswith("Upscaling video"):
+            if any(line.startswith("Upscaling video") for line in message.splitlines()):
                 self.stop.set()
 
         with self.assertRaises(UpscaleCancelled):
@@ -741,7 +779,7 @@ class VideoUpscalerTests(unittest.TestCase):
                 return super().AI_orchestration(image)
 
         def status(message):
-            if message.startswith("Upscaling video"):
+            if any(line.startswith("Upscaling video") for line in message.splitlines()):
                 self.stop.set()
                 stopping.set()
 

@@ -112,12 +112,17 @@ class StatusBar(CTkFrame):
         self._layout_after_id = None
         # Tk counts real wrapped display lines at the current physical width
         # and font/DPI scale. Leave room for both video rows by capping their
-        # general message at two lines (four otherwise). Text retains the entire
-        # message with selection, mouse-wheel and scrollbar scrolling.
+        # general message at two lines (four otherwise). Each concurrent task
+        # has its own line with timing, so give multi-task snapshots four
+        # wrapped lines to keep both estimates visible at the minimum width.
+        # Text retains longer messages with selection and scrolling.
         breaks = self.label._textbox.count("1.0", "end-1c", "displaylines")
-        limit = 2 if self._video_progress is not None else 4
+        multiple_tasks = self._video_progress is not None and "\n" in self._video_progress.message
+        limit = 2 if self._video_progress is not None and not multiple_tasks else 4
         lines = min(limit, 1 + (breaks[0] if breaks else 0))
-        height = max(24, lines * 18 + 6)
+        # Leave padding for the text viewport and fractional DPI rounding so
+        # the last task's ETA is not clipped by a pixel at small app zooms.
+        height = max(24, lines * 18 + (12 if multiple_tasks else 6))
         if height != self._height:
             self._height = height
             self.label.configure(height=height)

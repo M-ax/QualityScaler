@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ import cv2
 
 from qualityscaler.ffmpeg import FFmpeg, UpscaleCancelled
 from qualityscaler.frame_store import FrameStore
+from qualityscaler.status import PipelineStatus
 from qualityscaler.video import CacheSettingsMismatch, VideoSettings, VideoUpscaler, decode_frame
 
 
@@ -62,6 +65,101 @@ class FFmpegProcessTests(unittest.TestCase):
                     cancellation.join()
                 self.assertLess(monotonic() - started, 10)
                 self.assertIsNotNone(processes[0].poll())
+
+
+class FFmpegStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.output = Path(self.temp.name) / "output.mp4"
+        self.time = 0
+        self.messages = []
+        self.progress = PipelineStatus(self.messages.append, clock=lambda: self.time)
+
+    def test_encoding_preserves_other_tasks_latest_status_and_own_timing(self):
+        self.progress.start("upscaling", "Upscaling video 0%", total=100)
+        self.time = 10
+        self.progress.update("upscaling", "Upscaling video 20%", completed=20)
+
+        @contextmanager
+        def pipe(arguments, stop, *, writing, progress):
+            self.time = 12
+            progress(2)
+            yield BytesIO()
+
+        ffmpeg = FFmpeg()
+        with patch.object(ffmpeg, "_pipe", side_effect=pipe):
+            ffmpeg.encode("source.mp4", self.output, 24, "x264", [b"jpeg"], Event(),
+                          total_frames=4, progress=self.progress)
+        message = next(message for message in self.messages if "Encoding upscaled video 50%" in message)
+        lines = message.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("Upscaling video 20% | Remaining: 48s"))
+        self.assertTrue(lines[1].startswith("Encoding upscaled video 50% | Remaining: 2s"))
+        self.assertNotIn("Upscaling video 0%", message)
+        self.assertEqual(message.count("ETA (local):"), 2)
+        self.assertNotIn("Encoding", self.messages[-1])
+        self.assertTrue(self.messages[-1].startswith("Upscaling video 20%"))
+
+    def test_codec_retry_resets_timing_and_keeps_fallback_in_latest_status(self):
+        attempts = []
+
+        @contextmanager
+        def pipe(arguments, stop, *, writing, progress):
+            attempts.append(arguments)
+            if len(attempts) == 1:
+                self.time = 10
+                progress(50)
+                yield BytesIO()
+                raise RuntimeError("Selected codec failed")
+            self.time = 12
+            progress(20)
+            yield BytesIO()
+
+        ffmpeg = FFmpeg()
+        with patch.object(ffmpeg, "_pipe", side_effect=pipe):
+            ffmpeg.encode("source.mp4", self.output, 24, "h264_nvenc", [b"jpeg"], Event(),
+                          total_frames=100, progress=self.progress)
+        self.assertEqual(len(attempts), 2)
+        fallback = [message for message in self.messages if "x264 fallback" in message]
+        self.assertEqual(len(fallback), 2)
+        self.assertIn("ETA (local): estimating...", fallback[0])
+        self.assertIn("Encoding upscaled video (x264 fallback) 20% | Remaining: 8s", fallback[1])
+
+    def test_unknown_encoding_total_reports_frames_without_a_fake_percentage(self):
+        @contextmanager
+        def pipe(arguments, stop, *, writing, progress):
+            self.time = 10
+            progress(5)
+            yield BytesIO()
+
+        ffmpeg = FFmpeg()
+        with patch.object(ffmpeg, "_pipe", side_effect=pipe):
+            ffmpeg.encode("source.mp4", self.output, 24, "x264", [b"jpeg"], Event(),
+                          progress=self.progress)
+        message = self.messages[-2]
+        self.assertIn("Encoding upscaled video (5 frames)", message)
+        self.assertIn("ETA (local): estimating...", message)
+        self.assertNotIn("%", message)
+        self.assertEqual(self.messages[-1], "")
+
+    def test_failed_or_cancelled_encoding_clears_its_latest_status(self):
+        for error in (RuntimeError("Encoder failed"), UpscaleCancelled()):
+            with self.subTest(error=type(error).__name__):
+                @contextmanager
+                def pipe(arguments, stop, *, writing, progress):
+                    self.time += 10
+                    progress(5)
+                    yield BytesIO()
+                    raise error
+
+                ffmpeg = FFmpeg()
+                with patch.object(ffmpeg, "_pipe", side_effect=pipe):
+                    with self.assertRaises(type(error)):
+                        ffmpeg.encode("source.mp4", self.output, 24, "x264",
+                                      iter([b"jpeg"]), Event(), total_frames=10,
+                                      progress=self.progress)
+                self.assertEqual(self.messages[-1], "")
 
 
 class ResizeEngine:
@@ -300,7 +398,7 @@ class FFmpegIntegrationTests(unittest.TestCase):
         stop = Event()
 
         def pause(message):
-            if message.startswith("Upscaling video"):
+            if any(line.startswith("Upscaling video") for line in message.splitlines()):
                 stop.set()
 
         pipeline = VideoUpscaler(

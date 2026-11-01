@@ -61,6 +61,7 @@ from .jobs import upscale_orchestrator
 from .media import get_image_resolution, image_read
 from .paths import OUTPUT_PATH_CODED, find_by_relative_path, prepare_output_video_directory_name
 from .platform_support import prevent_sleep, allow_sleep, show_completion_notification
+from .preview_window import UpscalePreview
 from .startup import close_splash, update_splash
 from .status import CacheSettingsConflict, VideoProgress
 from .video import VideoSettings, get_resume_progress
@@ -140,6 +141,7 @@ class AppState:
     header: Optional[Any] = None
     action_panel: Optional[Any] = None
     status_bar: Optional[StatusBar] = None
+    upscale_preview: Optional[UpscalePreview] = None
     option_rows: dict = field(default_factory=dict)
     info_message: Optional[StringVar] = None
     selected_output_path: Optional[StringVar] = None
@@ -381,6 +383,7 @@ class FileWidget(CTkScrollableFrame):
     def _remove_file(self, file_path):
         if inputs_are_busy() or file_path not in self.file_list:
             return
+        close_upscale_preview()
         self.file_list.remove(file_path)
         if not self.file_list:
             self._destroy_()
@@ -665,6 +668,8 @@ def update_file_widget(*_args):
     file_widget.set_input_resize_factor(input_factor)
     file_widget.set_output_resize_factor(output_factor)
     file_widget.refresh_pipeline()
+    if app_state.upscale_preview is not None:
+        app_state.upscale_preview.settings_changed()
 
 
 def schedule_file_widget_update(*_args):
@@ -869,6 +874,7 @@ def select_input_files(paths):
         new_widget.destroy()
         app_state.info_message.set("Unable to read the selected images or videos")
         return False
+    close_upscale_preview()
     if app_state.file_widget is not None:
         app_state.file_widget.destroy()
     for widget in app_state.input_widgets:
@@ -889,6 +895,7 @@ def clear_input_files():
     if inputs_are_busy():
         app_state.info_message.set("Stop the current job before changing input files")
         return False
+    close_upscale_preview()
     if app_state.file_widget is not None:
         app_state.file_widget.destroy()
     app_state.file_widget = None
@@ -911,6 +918,38 @@ def open_output_path_action():
     value = filedialog.askdirectory()
     app_state.preferences.output_path = value or OUTPUT_PATH_CODED
     app_state.selected_output_path.set(app_state.preferences.output_path)
+
+
+def close_upscale_preview():
+    preview = app_state.upscale_preview
+    app_state.upscale_preview = None
+    if preview is not None:
+        preview.destroy()
+
+
+def open_upscale_preview():
+    if app_state.closing:
+        return
+    if inputs_are_busy():
+        app_state.info_message.set("Stop the current job before opening an upscale preview")
+        return
+    if app_state.upscale_preview is not None:
+        app_state.upscale_preview.deiconify()
+        app_state.upscale_preview.lift()
+        app_state.upscale_preview.focus_set()
+        return
+    selected = app_state.file_widget.get_selected_file_list() if app_state.file_widget else []
+    if not selected:
+        app_state.info_message.set("Please select a file to preview")
+        return
+    try:
+        _processing_config(selected)  # Preview does not need output-drive disk space.
+        app_state.upscale_preview = UpscalePreview(
+            app_state.window, selected, lambda: _processing_config(selected),
+            lambda: setattr(app_state, "upscale_preview", None),
+        )
+    except (ValueError, OSError, RuntimeError, TclError) as error:
+        app_state.info_message.set(f"Cannot open preview: {error}")
 
 
 def apply_app_zoom(zoom):
@@ -1191,6 +1230,7 @@ def _retry_after_cache_conflict(config, file_number, *, use_failed_settings=Fals
 
 def _start_upscale(config, *, retry_from=None, clear_cache=False):
     """Keep batch position separate from the explicit permission to reset a cache."""
+    close_upscale_preview()  # Release VRAM for both normal starts and cache retries.
     _drain_status_queue()
     app_state.event_stop_upscale_process.clear()
     app_state.pending_upscale_status = None
@@ -1286,6 +1326,10 @@ def load_user_preferences():
 
 
 def _destroy_window():
+    try:
+        close_upscale_preview()
+    except TclError:
+        pass  # A host may already have destroyed Tk's children.
     for handle in tuple(app_state.after_ids):
         _cancel_after(handle)
     app_state.poll_after_id = None
@@ -1346,6 +1390,7 @@ def on_app_close():
         # A missing/unwritable Documents folder must not prevent shutdown.
         print(f"[{app_name}] Could not save preferences: {error}")
     app_state.closing = True
+    close_upscale_preview()
     stop_button_command()
     if not app_state.processing and app_state.window is not None:
         _destroy_window()
@@ -1396,6 +1441,7 @@ class App:
         self.place_loadFile_section()
         self.place_app_name()
         self.place_app_zoom_and_links()
+        self.place_preview_link()
         self.place_AI_menu()
         self.place_AI_sharpening_menu()
         self.place_AI_multithreading_menu()
@@ -1460,6 +1506,16 @@ class App:
         )
         telegram.grid(row=0, column=3, padx=(0, 6))
         github.grid(row=0, column=4)
+
+    @staticmethod
+    def place_preview_link():
+        link = CTkButton(
+            app_state.header, text="Preview upscale ↗", command=open_upscale_preview,
+            fg_color="transparent", hover_color=widget_background_color,
+            text_color=UI_ACCENT_COLOR, font=bold13, anchor="w",
+            width=150, height=28,
+        )
+        link.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
     @staticmethod
     def _single_option(row, title, subtitle, help_text, command, choices, value):

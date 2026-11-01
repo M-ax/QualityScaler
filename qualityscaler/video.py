@@ -1,7 +1,7 @@
 """Resumable video jobs with one SQLite cache and bounded in-flight frames."""
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 import hashlib
@@ -18,9 +18,40 @@ import numpy as np
 from .ai import AI_upscale, calculate_optimal_workers, get_model_upscale_factor
 from .ffmpeg import FFmpeg, UpscaleCancelled
 from .frame_store import FrameStore
+from .geometry import VideoGeometry
 from .job_lock import JobLock
 from .media import blend_images, get_video_fps, sharpen_image
 from .paths import find_by_relative_path, prepare_output_video_directory_name, prepare_output_video_filename
+
+
+SOURCE_LAYOUT_ORIGINAL = "original"
+SOURCE_LAYOUT_SCALED = "ffmpeg-area-v1"
+CURRENT_JOB_VERSION = 3
+
+
+def source_frame_layout(store):
+    # Untagged version-2 jobs contain full-resolution source JPEGs. Keep their
+    # original processing path so partial extraction/inference can still resume.
+    layout = store.get_metadata("source_frame_layout", SOURCE_LAYOUT_ORIGINAL)
+    version = store.get_metadata("job_version", 2)
+    if (version, layout) not in ((2, SOURCE_LAYOUT_ORIGINAL), (3, SOURCE_LAYOUT_SCALED)):
+        raise ValueError(f"Unsupported cached source frame layout: {layout!r}")
+    return layout
+
+
+def source_frame_size(store):
+    size = store.get_metadata("source_size")
+    if (not isinstance(size, list) or len(size) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in size)):
+        raise ValueError("Scaled frame cache is missing valid original video dimensions")
+    return tuple(size)
+
+
+def geometry_for_settings(size, settings):
+    return VideoGeometry.calculate(
+        *size, settings.input_resize_factor, get_model_upscale_factor(settings.model),
+        settings.output_resize_factor,
+    )
 
 
 @lru_cache(maxsize=32)
@@ -172,7 +203,7 @@ class VideoUpscaler:
         }
         previous_source = store.get_metadata("source")
         if previous_source is not None:
-            if store.get_metadata("job_version") != 2:
+            if store.get_metadata("job_version") not in (2, CURRENT_JOB_VERSION):
                 raise ValueError(
                     "This cache was created by a different processing version. "
                     "Move it aside or choose another output folder to start a 2026.4 job."
@@ -188,27 +219,53 @@ class VideoUpscaler:
                     "Restore its recorded settings or choose another output folder. "
                     "The existing cache has not been changed."
                 )
+            source_frame_layout(store)  # Reject unknown layouts before any writes.
         elif store.frame_count("source") or store.frame_count("upscaled"):
             raise ValueError("Frame cache is missing its job identity; refusing to mix frames")
-        store.set_metadata("job_version", 2)
+        else:
+            store.set_metadata("source_frame_layout", SOURCE_LAYOUT_SCALED)
+            # Older executables reject version 3, rather than treating these
+            # pre-scaled JPEGs as full-resolution frames and scaling them twice.
+            store.set_metadata("job_version", CURRENT_JOB_VERSION)
         store.set_metadata("source", source)
         store.set_metadata("processing_settings", settings.processing_settings())
         store.set_metadata("settings", asdict(settings))
         store.set_metadata("output_path", str(Path(output_path).resolve()))
         store.commit()
 
-    def _extract(self, store, video_path):
+    def _extract(self, store, video_path, settings):
         if store.get_metadata("extraction_complete", False):
             return
-        self._state(store, "extracting")
-        self.status("Extracting video frames")
         fps = get_video_fps(str(video_path))
         previous_count = store.frame_count("source")
         capture = cv2.VideoCapture(str(video_path))
         try:
             expected = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            if all(math.isfinite(value) and value > 0 for value in (width, height)):
+                width, height = round(width), round(height)
+            elif source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
+                success, first = capture.read()
+                if not success or first is None:
+                    raise ValueError("Unable to determine original video dimensions")
+                height, width = first.shape[:2]
         finally:
             capture.release()
+        input_size = None
+        if source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
+            geometry = geometry_for_settings((width, height), settings)
+            if previous_count and source_frame_size(store) != geometry.source_size:
+                raise ValueError("Cached source dimensions do not match the video")
+            input_size = geometry.inference_size
+            self._state(
+                store, "extracting", source_size=list(geometry.source_size),
+                input_size=list(input_size),
+            )
+            self.status(f"Extracting video frames ({input_size[0]}×{input_size[1]} input)")
+        else:
+            self._state(store, "extracting")
+            self.status("Extracting video frames")
 
         def save_frame(index, data):
             self._check_stop()
@@ -221,7 +278,9 @@ class VideoUpscaler:
                 progress = f"{min(100, (index + 1) / expected * 100):.0f}% " if expected > 0 else ""
                 self.status(f"Extracting video frames {progress}({index + 1} saved)")
 
-        count = self.ffmpeg.extract(video_path, fps, self.stop_event, save_frame)
+        count = self.ffmpeg.extract(
+            video_path, fps, self.stop_event, save_frame, input_size=input_size,
+        )
         self._check_stop()
         if count < previous_count or count != store.frame_count("source"):
             raise ValueError("Extracted frame count does not match the cached source")
@@ -237,12 +296,20 @@ class VideoUpscaler:
             return
         if completed > total:
             raise ValueError("Upscaled frame cache contains unexpected frames")
+        frame = decode_frame(store.get_frame("source", 0))
+        if source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
+            geometry = geometry_for_settings(source_frame_size(store), settings)
+            if frame.shape[1::-1] != geometry.inference_size:
+                raise ValueError("Cached frame dimensions do not match the extraction scale")
+            # The user's input scale is already baked into the cached JPEGs.
+            # Retain it in job identity, but never apply it again in workers.
+            settings = replace(settings, input_resize_factor=1.0)
         self._state(store, "upscaling")
         self._check_stop()
         workers = max(1, min(
             settings.workers, total - completed,
             calculate_optimal_workers(
-                decode_frame(store.get_frame("source", 0)), settings.model,
+                frame, settings.model,
                 settings.input_resize_factor, settings.tiles_resolution, settings.workers,
             ),
         ))
@@ -312,22 +379,21 @@ class VideoUpscaler:
             self._prepare_job(store, video_path, output_path, settings)
             try:
                 self._check_stop()
-                self._extract(store, video_path)
+                self._extract(store, video_path, settings)
                 self._upscale(store, settings)
                 self._check_stop()
                 self._state(store, "encoding", error=None)
                 self.status("Encoding upscaled video")
-                original = decode_frame(store.get_frame("source", 0))
-                height, width = original.shape[:2]
-                input_width = max(2, round(width * settings.input_resize_factor / 2) * 2)
-                input_height = max(2, round(input_width / (width / height) / 2) * 2)
-                scale = get_model_upscale_factor(settings.model) * settings.output_resize_factor
-                output_width = max(2, round(input_width * scale / 2) * 2)
-                output_height = max(2, round(output_width / (input_width / input_height) / 2) * 2)
+                if source_frame_layout(store) == SOURCE_LAYOUT_SCALED:
+                    size = source_frame_size(store)
+                else:
+                    original = decode_frame(store.get_frame("source", 0))
+                    size = original.shape[1::-1]
+                geometry = geometry_for_settings(size, settings)
                 self.ffmpeg.encode(
                     video_path, output_path, store.get_metadata("fps"),
                     settings.codec, lambda: store.iter_frames("upscaled"), self.stop_event,
-                    output_size=(output_width, output_height), total_frames=store.get_metadata("total_frames"),
+                    output_size=geometry.output_size, total_frames=store.get_metadata("total_frames"),
                     status=self.status,
                 )
                 self._check_stop()
@@ -402,8 +468,9 @@ def get_resume_progress(video_path, selected_output_path, settings):
         source = Path(video_path).resolve()
         stat = source.stat()
         with FrameStore(cache, read_only=True) as store:
-            if store.get_metadata("job_version") != 2:
+            if store.get_metadata("job_version") not in (2, CURRENT_JOB_VERSION):
                 return None
+            source_frame_layout(store)
             if store.get_metadata("source") != {
                 "path": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
             } or store.get_metadata("processing_settings") != settings.processing_settings():

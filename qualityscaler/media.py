@@ -5,6 +5,8 @@ import math
 import cv2
 import numpy as np
 
+from .geometry import scaled_size
+
 
 def image_read(file_path: str) -> np.ndarray:
     """Decode an image without OpenCV's platform-dependent filename handling."""
@@ -87,13 +89,7 @@ def get_image_mode(image: np.ndarray) -> str | None:
 def scaled_dimensions(image: np.ndarray, factor: float) -> tuple[int, int]:
     """Truncate scaled dimensions and round odd values up, even at unit scale."""
     height, width = get_image_resolution(image)
-    new_width = int(width * factor)
-    new_height = int(height * factor)
-    if new_width % 2:
-        new_width += 1
-    if new_height % 2:
-        new_height += 1
-    return new_width, new_height
+    return scaled_size(width, height, factor)
 
 
 def resize_with_factor(

@@ -136,12 +136,29 @@ class FFmpeg:
                 process.stdout.close()
             process.stderr.close()
 
-    def extract(self, video_path, fps, stop_event, save_frame):
-        """Pass each complete JPEG to save_frame(index, bytes) in display order."""
+    def extract(self, video_path, fps, stop_event, save_frame, *, input_size=None):
+        """Pass each complete JPEG to save_frame(index, bytes) in display order.
+
+        An explicit (width, height) tuple scales frames before JPEG encoding.
+        Dimensions must be even integers >= 2. None preserves full-resolution
+        extraction, including the source dimensions of resumable legacy jobs.
+        """
+        filters = f"fps={fps}"
+        if input_size is not None:
+            if not isinstance(input_size, tuple):
+                raise TypeError("input_size must be a (width, height) tuple")
+            if len(input_size) != 2:
+                raise ValueError("input_size must contain exactly (width, height)")
+            for dimension in input_size:
+                if isinstance(dimension, bool) or not isinstance(dimension, int):
+                    raise TypeError("input_size dimensions must be integers (not bools)")
+                if dimension < 2 or dimension % 2:
+                    raise ValueError("input_size dimensions must be even integers >= 2")
+            filters += f",scale={input_size[0]}:{input_size[1]}:flags=area"
         arguments = [
             "-threads", "0", "-err_detect", "ignore_err", "-hwaccel", "auto",
             "-i", str(video_path), "-map", "0:v:0", "-an",
-            "-vf", f"fps={fps}", "-qscale:v", "3", "-c:v", "mjpeg",
+            "-vf", filters, "-qscale:v", "3", "-c:v", "mjpeg",
             "-f", "image2pipe", "pipe:1",
         ]
         count = 0

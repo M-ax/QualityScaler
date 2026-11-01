@@ -96,6 +96,110 @@ class FFmpegIntegrationTests(unittest.TestCase):
         ], check=True)
         return source
 
+    def test_scaled_extraction_resumes_without_resampling_inputs_twice(self):
+        output = self.root / "scaled_upscaled.mp4"
+        cache = self.root / "scaled cache" / "frames.sqlite3"
+        settings = VideoSettings("FakeTestx2", input_resize_factor=0.5,
+                                 workers=2, keep_frames=True)
+        stop = Event()
+        observed_shapes = []
+
+        class NativeScaleEngine:
+            def AI_orchestration(inner, image):
+                observed_shapes.append(image.shape)
+                return cv2.resize(image, (image.shape[1] * 2, image.shape[0] * 2))
+
+        def engine(worker_settings):
+            self.assertEqual(worker_settings.input_resize_factor, 1)
+            return NativeScaleEngine()
+
+        def pause(message):
+            if message.startswith("Extracting video frames") and "saved" in message:
+                stop.set()
+
+        pipeline = VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=engine, executor_factory=ThreadPoolExecutor,
+            checkpoint_interval=1, stop_event=stop, status=pause,
+        )
+        with self.assertRaises(UpscaleCancelled):
+            pipeline.run(self.source, output, cache, settings)
+        with FrameStore(cache, read_only=True) as store:
+            self.assertEqual(store.frame_count("source"), 1)
+            first = store.get_frame("source", 0)
+            self.assertEqual(decode_frame(first).shape, (12, 16, 3))
+            self.assertEqual(store.get_metadata("source_size"), [32, 24])
+            self.assertEqual(store.get_metadata("input_size"), [16, 12])
+            self.assertFalse(store.get_metadata("extraction_complete", False))
+        stop.clear()
+        pipeline.status = lambda message: None
+        pipeline.run(self.source, output, cache, settings)
+        self.assertEqual(observed_shapes, [(12, 16, 3)] * 5)
+        with FrameStore(cache, read_only=True) as store:
+            self.assertEqual(store.get_frame("source", 0), first)
+            self.assertEqual(store.get_metadata("stage"), "complete")
+            self.assertEqual(store.get_metadata("settings")["input_resize_factor"], 0.5)
+            self.assertEqual(decode_frame(store.get_frame("upscaled", 0)).shape, (24, 32, 3))
+        capture = cv2.VideoCapture(str(output))
+        try:
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FPS), 5)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 32)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 24)
+        finally:
+            capture.release()
+        subprocess.run([
+            self.ffmpeg.executable, "-v", "error", "-i", str(output),
+            "-map", "0:a:0", "-f", "null", "-",
+        ], check=True)
+
+    def test_scaling_preserves_display_geometry_for_rotated_odd_sized_video(self):
+        original = self.root / "odd.mp4"
+        rotated = self.root / "rotated.mp4"
+        subprocess.run([
+            self.ffmpeg.executable, "-y", "-v", "error", "-f", "lavfi",
+            "-i", "testsrc=size=35x27:rate=5:duration=1", "-c:v", "libx264",
+            "-pix_fmt", "yuv444p", str(original),
+        ], check=True)
+        rotation = subprocess.run([
+            self.ffmpeg.executable, "-y", "-v", "error", "-display_rotation", "90",
+            "-i", str(original), "-c", "copy", str(rotated),
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if rotation.returncode:
+            # Older FFmpeg writes the matrix via metadata; recent FFmpeg uses
+            # the dedicated input option and may ignore the old rotate tag.
+            subprocess.run([
+                self.ffmpeg.executable, "-y", "-v", "error", "-i", str(original),
+                "-c", "copy", "-metadata:s:v:0", "rotate=90", str(rotated),
+            ], check=True)
+        legacy_frames = []
+        self.ffmpeg.extract(rotated, 5, Event(), lambda index, data: legacy_frames.append(data))
+        self.assertEqual(decode_frame(legacy_frames[0]).shape, (35, 27, 3))
+
+        class NativeScaleEngine:
+            def AI_orchestration(inner, image):
+                self.assertEqual(image.shape, (18, 14, 3))
+                return cv2.resize(image, (28, 36))
+
+        output = self.root / "rotated_upscaled.mp4"
+        cache = self.root / "rotated cache" / "frames.sqlite3"
+        settings = VideoSettings("FakeTestx2", input_resize_factor=0.5,
+                                 output_resize_factor=1.25, keep_frames=True)
+        VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=lambda settings: NativeScaleEngine(),
+            executor_factory=ThreadPoolExecutor,
+        ).run(rotated, output, cache, settings)
+        with FrameStore(cache, read_only=True) as store:
+            self.assertEqual(store.get_metadata("source_size"), [27, 35])
+            self.assertEqual(store.get_metadata("input_size"), [14, 18])
+            self.assertEqual(decode_frame(store.get_frame("source", 0)).shape, (18, 14, 3))
+        capture = cv2.VideoCapture(str(output))
+        try:
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 36)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 46)
+            self.assertEqual(capture.get(cv2.CAP_PROP_FRAME_COUNT), 5)
+        finally:
+            capture.release()
+
     def test_wmv_with_wma_audio_pauses_resumes_and_exports_mp4_with_aac(self):
         source = self.make_wmv()
         output = self.root / "wmv_upscaled.mp4"

@@ -95,6 +95,18 @@ CPU inference does not make an unavailable hardware video encoder usable.
 are processed with overlapping tiles and feathered edges. These inference and
 sharpening rules differ from 4.7, so old caches must not be reused as new jobs.
 
+The desktop window can be resized or maximized. Settings scroll on shorter
+windows, and the full-width bottom status bar wraps long filenames and progress
+messages. Very long messages scroll within the bar without covering Stop.
+Scale edits refresh file previews after typing pauses instead of
+rebuilding the cards on every keystroke.
+
+After the last output is written, the app shows **Finalizing** while workers
+release their resources. Completion is reported only after the worker has exited
+successfully and the file cards are refreshed. Stop and close remain responsive
+while progress is checkpointed; a hung worker still has the 10-second hard-stop
+fallback.
+
 ## 🤖 Other AI projects
 - [RealScaler](https://github.com/Djdefrag/RealScaler) - image/video AI upscaler (Real-ESRGAN)
 - [FluidFrames.RIFE](https://github.com/Djdefrag/FluidFrames.RIFE) - video AI frame generation
@@ -165,8 +177,20 @@ The portable build produces `dist/QualityScaler.exe`, a single Windows x64
 executable containing Python, the DirectML runtime, FFmpeg, UI assets, native
 TkDND support, and **all nine standard models** listed above. A completed build
 needs no Python installation or FFmpeg PATH configuration on the target PC.
-First launch briefly extracts its bundled resources to the Windows temporary
-directory.
+Each launch extracts its bundled resources to the Windows temporary directory.
+PyInstaller 6.16.0's native bootloader splash shows the logo and the file currently
+being unpacked, before Python or the desktop can run. This is per-file progress,
+not a percentage; unpacking a large model can leave the same filename visible
+for a while. After extraction, the status line switches to short startup phases
+and stays until the desktop's first `window.update()` has completed. Startup
+errors close the splash before propagating.
+
+The splash reuses `Assets/logo.png`, with dark status text in the lower margin;
+no separate image or second Python/Tk root is created. The lazy
+`qualityscaler.startup.update_splash(text)` and `close_splash()` helpers are
+enabled only by the frozen desktop launcher after `freeze_support()`. Source
+runs, CLI/self-test UI calls, and multiprocessing workers cannot attach to or
+close another process's splash.
 
 An existing 4.7 executable does not contain this 2026.4 forward-port. Rebuilding
 requires the current model bundle; these instructions do not claim that a new
@@ -209,7 +233,15 @@ FFmpeg encoding, and preserved audio:
 
 ```powershell
 $report = Join-Path $PWD 'build\packaged-self-test.json'
-$process = Start-Process .\dist\QualityScaler.exe -ArgumentList ('--self-test "' + $report + '"') -Wait -PassThru
+# The native bootloader runs before --self-test can be parsed. Suppress its
+# splash before launch; self-test deliberately never attaches to splash IPC.
+$previousSplashSuppression = $env:PYINSTALLER_SUPPRESS_SPLASH_SCREEN
+try {
+    $env:PYINSTALLER_SUPPRESS_SPLASH_SCREEN = '1'
+    $process = Start-Process .\dist\QualityScaler.exe -ArgumentList ('--self-test "' + $report + '"') -Wait -PassThru
+} finally {
+    $env:PYINSTALLER_SUPPRESS_SPLASH_SCREEN = $previousSplashSuppression
+}
 $process.ExitCode
 Get-Content $report
 ```
@@ -220,6 +252,14 @@ closes the desktop UI without changing saved user preferences, then tests
 DirectML inference and video resume. It requires a working desktop, DirectML
 hardware/runtime, and the current bundled models. Read the generated report;
 the command being documented is not evidence of a passing packaged build.
+
+Validate the splash separately with a normal desktop launch, with
+`PYINSTALLER_SUPPRESS_SPLASH_SCREEN` unset: it should be visible during onefile
+extraction, show import/GPU/UI preparation status, then disappear when the
+desktop is ready, without reappearing as workers start. PyInstaller's bootloader
+also accepts `PYINSTALLER_SUPPRESS_SPLASH_SCREEN=1` for deliberately splash-free
+desktop launches. Unit tests mock the native target/IPC; they do not prove that
+a packaged splash was displayed or that desktop readiness was reached.
 
 ## Video frame cache and resume
 
@@ -235,8 +275,19 @@ OFF, only a successful job removes the cache. Stopped and failed jobs keep it.
 SQLite may create a temporary rollback journal while a batch is being saved;
 the number of files stays constant regardless of video length.
 
-**Cache compatibility:** 2026.4 jobs use `job_version = 2`. The earlier 4.7
-SQLite jobs (`job_version = 1`) are rejected rather than reused with different
+**Cache compatibility:** new jobs use `job_version = 3`. FFmpeg applies the
+selected input scale with area interpolation **before JPEG compression and
+SQLite storage**. The cache records the original dimensions, scaled input
+dimensions, and `source_frame_layout = "ffmpeg-area-v1"`. Workers do not apply
+the input scale a second time, and final output geometry is still derived from
+the original video. JPEG/interpolation order changes, so pixels need not be
+bit-identical to the previous full-resolution-cache path.
+
+Existing 2026.4 `job_version = 2` jobs remain resumable using their original
+full-resolution source frames and worker-side scaling, even if extraction was
+interrupted. They are not converted or mixed with pre-scaled frames. Older
+executables reject new version-3 jobs rather than scaling them twice.
+The earlier 4.7 SQLite jobs (`job_version = 1`) are rejected rather than reused with different
 sharpening, tiling, or model semantics. Archive the old cache, choose a different
 output folder, or finish it with the matching older version. There is no automatic
 cache conversion.
@@ -313,6 +364,7 @@ The portable-spec tests use mocked PyInstaller hooks and fixture model files:
 
 ```powershell
 py -3.11 -m unittest discover -s tests -p test_build.py -v
+py -3.11 -m unittest discover -s tests -p test_startup.py -v
 ```
 
 These are commands for local validation, not claims that the full suite or

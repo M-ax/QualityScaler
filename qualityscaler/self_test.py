@@ -55,6 +55,32 @@ def _check_gui(report, root):
                 raise RuntimeError("The packaged GUI has no widgets")
             report["tkdnd_version"] = window.TkdndVersion
 
+            # Check actual Tk geometry, including the formerly hidden paired
+            # dropdowns and a long status message at the minimum window size.
+            window.geometry("1000x540")
+            gui.app_state.info_message.set("Preparing inputs — " + "long filename " * 40)
+            window.update()
+            state = gui.app_state
+            bar = state.status_bar
+            if not all(window.resizable()):
+                raise RuntimeError("Desktop window is not resizable")
+            if (bar.winfo_width() != window.winfo_width()
+                    or bar.winfo_y() + bar.winfo_height() != window.winfo_height()
+                    or bar.winfo_height() <= 36):
+                raise RuntimeError("Long status messages do not fit the bottom bar")
+            for row in (gui.ROW_GPU, gui.ROW_OUTPUT_FORMAT, gui.ROW_CODEC):
+                for slot in state.option_rows[row].winfo_children():
+                    info, menu = slot.winfo_children()
+                    if (info.winfo_x() + info.winfo_width() > menu.winfo_x()
+                            or menu.winfo_x() + menu.winfo_width() > slot.winfo_width()):
+                        raise RuntimeError("A paired control is obscured or clipped")
+            report["resizable_window"] = True
+            report["bottom_status_verified"] = True
+            report["dropdowns_verified"] = True
+            gui.app_state.info_message.set("Ready")
+            window.geometry("1100x760")
+            window.update()
+
             def drop(paths, fraction=0.25):
                 # Exercise the native Windows TkDND Tcl/OLE dispatch path, not
                 # just a direct Python callback. No mouse movement is needed.
@@ -126,7 +152,7 @@ def _check_bundle(root, report):
     from .ffmpeg import FFmpeg, UpscaleCancelled
     from .frame_store import FrameStore
     from .paths import find_by_relative_path
-    from .video import VideoSettings, VideoUpscaler
+    from .video import VideoSettings, VideoUpscaler, decode_frame
 
     model = Path(find_by_relative_path("AI-onnx/RealESR_Gx4_fp16.onnx"))
     bundled_ffmpeg = Path(find_by_relative_path("Assets/ffmpeg.exe"))
@@ -188,7 +214,9 @@ def _check_bundle(root, report):
         "-c:v", "wmv2", "-c:a", "wmav2", "-shortest", str(source),
     ], check=True, creationflags=flags)
     _check_gui(report, root)
-    settings = VideoSettings("RealESR_Gx4", workers=2, tiles_resolution=512, keep_frames=True)
+    settings = VideoSettings(
+        "RealESR_Gx4", input_resize_factor=0.5, workers=2, tiles_resolution=512, keep_frames=True,
+    )
     factory = partial(verified_engine, frozen=report["frozen"])
     stop = Event()
 
@@ -211,6 +239,12 @@ def _check_bundle(root, report):
         saved = store.frame_count("upscaled")
         if total != 8 or not 0 < saved < total or store.get_metadata("stage") != "paused":
             raise RuntimeError("Interrupted job state was not saved correctly")
+        if (store.get_metadata("job_version") != 3
+                or store.get_metadata("source_size") != [48, 32]
+                or store.get_metadata("input_size") != [24, 16]):
+            raise RuntimeError("The scaled source-frame layout was not saved")
+        if decode_frame(store.get_frame("source", 0)).shape != (16, 24, 3):
+            raise RuntimeError("FFmpeg did not scale the cached source frames")
         previous_frames = {index: store.get_frame("upscaled", index)
                            for index in store.iter_indices("upscaled")}
 
@@ -241,7 +275,7 @@ def _check_bundle(root, report):
             success, frame = capture.read()
             if not success:
                 break
-            if frame.shape != (128, 192, 3):
+            if frame.shape != (64, 96, 3):
                 raise RuntimeError(f"Incorrect encoded frame dimensions: {frame.shape}")
             decoded += 1
     finally:
@@ -260,10 +294,11 @@ def _check_bundle(root, report):
     if len(audio) < 8 or audio[0] != 0xFF or audio[1] & 0xF0 != 0xF0:
         raise RuntimeError("WMV audio was not converted to valid AAC")
     report.update({
-        "frames": decoded, "fps": fps, "width": 192, "height": 128,
+        "frames": decoded, "fps": fps, "width": 96, "height": 64,
         "frames_before_pause": saved, "frames_resumed": len(submitted),
         "audio_preserved": True, "workers": settings.workers,
         "input_format": "wmv", "audio_codec": "aac",
+        "input_resize_factor": 0.5, "cached_input_width": 24, "cached_input_height": 16,
         "cache_files": sorted(path.name for path in cache.parent.iterdir()),
     })
 

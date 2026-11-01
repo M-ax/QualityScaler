@@ -31,8 +31,9 @@ def main(argv=None):
     # by a hard kill. A read-only connection cannot perform that recovery.
     with FrameStore(args.cache, read_only=args.command == "inspect") as store:
         saved = {key: store.get_metadata(key) for key in (
-            "source", "settings", "output_path", "stage", "interrupted_stage",
+            "job_version", "source", "settings", "output_path", "stage", "interrupted_stage",
             "total_frames", "extraction_complete", "fps", "updated_at", "error",
+            "source_frame_layout", "source_size", "input_size",
         )}
         saved["source_frames"] = store.frame_count("source")
         saved["upscaled_frames"] = store.frame_count("upscaled")

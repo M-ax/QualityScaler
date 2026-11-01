@@ -93,8 +93,8 @@ class RealModelIntegrationTests(unittest.TestCase):
             "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
             "-c:v", "libx264", "-c:a", "aac", "-shortest", str(source),
         ], check=True)
-        settings = VideoSettings(self.model, workers=2, tiles_resolution=512,
-                                 keep_frames=True)
+        settings = VideoSettings(self.model, input_resize_factor=0.5, workers=2,
+                                 tiles_resolution=512, keep_frames=True)
         stop = Event()
 
         def pause_after_saving(message):
@@ -118,6 +118,9 @@ class RealModelIntegrationTests(unittest.TestCase):
             self.assertLess(saved_before, total)
             self.assertTrue(store.get_metadata("extraction_complete"))
             self.assertEqual(store.get_metadata("stage"), "paused")
+            self.assertEqual(store.get_metadata("source_size"), [48, 32])
+            self.assertEqual(store.get_metadata("input_size"), [24, 16])
+            self.assertEqual(decode_frame(original_source[0]).shape, (16, 24, 3))
         self.assertFalse(output.exists())
 
         inference_submissions = []
@@ -147,7 +150,7 @@ class RealModelIntegrationTests(unittest.TestCase):
                 self.assertEqual(store.get_frame("upscaled", index), data)
             expected_shape = decode_frame(store.get_frame("upscaled", 0)).shape
         factor = 4 if "x4" in self.model else 2 if "x2" in self.model else 1
-        self.assertEqual(expected_shape, (32 * factor, 48 * factor, 3))
+        self.assertEqual(expected_shape, (16 * factor, 24 * factor, 3))
         capture = cv2.VideoCapture(str(output))
         decoded = 0
         try:

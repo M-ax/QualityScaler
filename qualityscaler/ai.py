@@ -113,6 +113,10 @@ class AI_upscale:
         return height * self.upscale_factor, width * self.upscale_factor
 
     def resize_with_input_factor(self, image: np.ndarray) -> np.ndarray:
+        if image.shape[1::-1] == scaled_dimensions(image, self.input_resize_factor):
+            # Video extraction already supplies even, pre-scaled inputs. Avoid
+            # an otherwise redundant OpenCV resize/copy at worker factor 1.
+            return image
         return resize_with_factor(image, self.input_resize_factor, cv2.INTER_AREA)
 
     def calculate_optimal_multithreads_number(

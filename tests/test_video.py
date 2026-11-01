@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ from threading import Event, Thread
 from time import sleep
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from weakref import WeakSet
 
 import cv2
@@ -20,7 +20,7 @@ from qualityscaler.frame_store import FrameStore
 from qualityscaler.job_lock import JobAlreadyRunning, JobLock
 from qualityscaler.video import (
     VideoSettings, VideoUpscaler, decode_frame, get_resume_progress,
-    initialize_worker, process_frame,
+    initialize_worker, process_frame, SOURCE_LAYOUT_SCALED,
 )
 
 
@@ -36,10 +36,15 @@ class FakeFFmpeg:
         self.encoded_values = []
         self.fail_encoding = False
         self.stop_during_extraction = False
+        self.input_sizes = []
 
-    def extract(self, source, fps, stop, save_frame):
+    def extract(self, source, fps, stop, save_frame, *, input_size=None):
         self.extractions += 1
+        self.input_sizes.append(input_size)
         for index, data in enumerate(self.frames):
+            if input_size is not None:
+                image = cv2.resize(decode_frame(data), input_size, interpolation=cv2.INTER_AREA)
+                data = cv2.imencode(".jpg", image)[1].tobytes()
             save_frame(index, data)
             if self.stop_during_extraction and index == 1:
                 stop.set()
@@ -122,6 +127,19 @@ class VideoUpscalerTests(unittest.TestCase):
         patcher = patch("qualityscaler.video.get_video_fps", return_value=24.0)
         patcher.start()
         self.addCleanup(patcher.stop)
+        capture = Mock()
+
+        def property_value(prop):
+            if prop == cv2.CAP_PROP_FRAME_COUNT:
+                return len(self.ffmpeg.frames)
+            height, width = decode_frame(self.ffmpeg.frames[0]).shape[:2]
+            return {cv2.CAP_PROP_FRAME_WIDTH: width, cv2.CAP_PROP_FRAME_HEIGHT: height}[prop]
+
+        capture.get.side_effect = property_value
+        self.capture = capture
+        patcher = patch("qualityscaler.video.cv2.VideoCapture", return_value=capture)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def upscaler(self, **kwargs):
         # Deterministic in-process fake engines keep unit tests GPU-free.
@@ -138,6 +156,29 @@ class VideoUpscalerTests(unittest.TestCase):
             self.source, self.output, self.cache, settings or self.settings
         )
 
+    def prepare_legacy_cache(self, settings, *, extraction_complete):
+        """Write the untagged version-2 layout produced before FFmpeg scaling."""
+        self.cache.parent.mkdir()
+        stat = self.source.stat()
+        with FrameStore(self.cache) as store:
+            store.set_metadata("job_version", 2)
+            store.set_metadata("source", {
+                "path": str(self.source.resolve()), "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            })
+            store.set_metadata("settings", asdict(settings))
+            store.set_metadata("processing_settings", settings.processing_settings())
+            store.set_metadata("output_path", str(self.output))
+            store.set_metadata("stage", "paused")
+            store.set_metadata("fps", 24)
+            count = 5 if extraction_complete else 2
+            for index, data in enumerate(self.ffmpeg.frames[:count]):
+                store.put_frame("source", index, data)
+            if extraction_complete:
+                store.set_metadata("extraction_complete", True)
+                store.set_metadata("total_frames", count)
+                store.put_frame("upscaled", 0, jpeg(20))
+
     def test_single_cache_stores_settings_frames_and_ordered_output(self):
         self.run_job()
         self.assertEqual(self.ffmpeg.encoded_values, [20, 40, 60, 80, 100])
@@ -150,6 +191,143 @@ class VideoUpscalerTests(unittest.TestCase):
             self.assertEqual(store.get_metadata("settings")["model"], "Testx2")
             self.assertEqual(store.get_metadata("settings")["codec"], "x264")
             self.assertEqual(store.get_metadata("total_frames"), 5)
+            self.assertEqual(store.get_metadata("source_frame_layout"), SOURCE_LAYOUT_SCALED)
+            self.assertEqual(store.get_metadata("job_version"), 3)
+            self.assertEqual(store.get_metadata("source_size"), [12, 8])
+            self.assertEqual(store.get_metadata("input_size"), [12, 8])
+
+    def test_new_jobs_cache_input_scaled_frames_and_normalize_worker_factor(self):
+        seen = []
+
+        class RecordingEngine(FakeEngine):
+            def AI_orchestration(inner, image):
+                seen.append(image.shape)
+                return super().AI_orchestration(image)
+
+        def engine(settings):
+            self.assertEqual(settings.input_resize_factor, 1)
+            return RecordingEngine(self.calls)
+
+        pipeline = VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=engine, executor_factory=ThreadPoolExecutor,
+        )
+        settings = replace(self.settings, input_resize_factor=0.5)
+        self.run_job(pipeline, settings)
+        self.assertEqual(self.ffmpeg.input_sizes, [(6, 4)])
+        self.assertEqual(seen, [(4, 6, 3)] * 5)
+        self.assertEqual(self.ffmpeg.encoding_options["output_size"], (12, 8))
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(decode_frame(store.get_frame("source", 0)).shape, (4, 6, 3))
+            self.assertEqual(store.get_metadata("settings")["input_resize_factor"], 0.5)
+            self.assertEqual(store.get_metadata("processing_settings")["input_resize_factor"], 0.5)
+            self.assertEqual(store.get_metadata("input_size"), [6, 4])
+
+    def test_untagged_partial_extraction_resumes_without_mixing_frame_sizes(self):
+        settings = replace(self.settings, input_resize_factor=0.5)
+        self.prepare_legacy_cache(settings, extraction_complete=False)
+        seen_factors = []
+
+        def engine(worker_settings):
+            seen_factors.append(worker_settings.input_resize_factor)
+            return FakeEngine(self.calls)
+
+        self.run_job(VideoUpscaler(
+            ffmpeg=self.ffmpeg, engine_factory=engine, executor_factory=ThreadPoolExecutor,
+        ), settings)
+        self.assertEqual(self.ffmpeg.input_sizes, [None])
+        self.assertTrue(seen_factors)
+        self.assertEqual(set(seen_factors), {0.5})
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertIsNone(store.get_metadata("source_frame_layout"))
+            self.assertEqual(store.get_metadata("job_version"), 2)
+            self.assertEqual(list(store.iter_frames("source")), self.ffmpeg.frames)
+            self.assertEqual(store.get_metadata("stage"), "complete")
+
+    def test_untagged_completed_extraction_preserves_saved_upscaled_frames(self):
+        settings = replace(self.settings, input_resize_factor=0.5)
+        self.prepare_legacy_cache(settings, extraction_complete=True)
+        saved = jpeg(20)
+        self.run_job(settings=settings)
+        self.assertEqual(self.ffmpeg.extractions, 0)
+        self.assertCountEqual(self.calls, [40, 60, 80, 100])
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(store.get_frame("upscaled", 0), saved)
+            self.assertEqual(list(store.iter_frames("source")), self.ffmpeg.frames)
+        self.assertEqual(get_resume_progress(self.source, str(self.directory), settings), 100)
+
+    def test_unknown_source_layout_is_rejected_without_changing_the_job(self):
+        self.run_job()
+        with FrameStore(self.cache) as store:
+            store.set_metadata("source_frame_layout", "unknown-resizer")
+        before = self.cache.read_bytes()
+        with self.assertRaisesRegex(ValueError, "source frame layout"):
+            self.run_job()
+        self.assertEqual(self.cache.read_bytes(), before)
+        self.assertIsNone(get_resume_progress(
+            self.source, str(self.directory), self.settings,
+        ))
+
+    def test_inconsistent_cache_version_and_layout_are_rejected_before_writes(self):
+        self.run_job()
+        for version, layout in ((2, SOURCE_LAYOUT_SCALED), (3, "original")):
+            with self.subTest(version=version, layout=layout):
+                with FrameStore(self.cache) as store:
+                    store.set_metadata("job_version", version)
+                    store.set_metadata("source_frame_layout", layout)
+                before = self.cache.read_bytes()
+                with self.assertRaisesRegex(ValueError, "source frame layout"):
+                    self.run_job()
+                self.assertEqual(self.cache.read_bytes(), before)
+                self.assertIsNone(get_resume_progress(
+                    self.source, str(self.directory), self.settings,
+                ))
+
+    def test_unavailable_probe_dimensions_fall_back_to_a_decoded_frame(self):
+        for index, dimensions in enumerate(((0, 0), (float("nan"), 8), (12, float("inf")))):
+            with self.subTest(dimensions=dimensions):
+                self.cache = self.directory / f"probe-{index}" / "frames.sqlite3"
+                self.capture.get.side_effect = lambda prop: {
+                    cv2.CAP_PROP_FRAME_COUNT: 5,
+                    cv2.CAP_PROP_FRAME_WIDTH: dimensions[0],
+                    cv2.CAP_PROP_FRAME_HEIGHT: dimensions[1],
+                }[prop]
+                self.capture.read.return_value = (True, decode_frame(self.ffmpeg.frames[0]))
+                self.capture.reset_mock()
+                self.run_job(settings=replace(self.settings, input_resize_factor=0.5))
+                self.capture.read.assert_called_once()
+                self.capture.release.assert_called_once()
+                with FrameStore(self.cache, read_only=True) as store:
+                    self.assertEqual(store.get_metadata("source_size"), [12, 8])
+                    self.assertEqual(store.get_metadata("input_size"), [6, 4])
+
+    def test_unreadable_dimension_fallback_releases_capture_and_saves_no_frames(self):
+        self.capture.get.side_effect = lambda prop: 5 if prop == cv2.CAP_PROP_FRAME_COUNT else 0
+        self.capture.read.return_value = (False, None)
+        with self.assertRaisesRegex(ValueError, "original video dimensions"):
+            self.run_job()
+        self.capture.release.assert_called_once()
+        self.assertEqual(self.ffmpeg.extractions, 0)
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(store.frame_count("source"), 0)
+            self.assertEqual(store.get_metadata("stage"), "failed")
+
+    def test_partial_scaled_cache_rejects_changed_fallback_dimensions(self):
+        def pause(message):
+            if message.startswith("Extracting video frames") and "saved" in message:
+                self.stop.set()
+
+        with self.assertRaises(UpscaleCancelled):
+            self.run_job(self.upscaler(status=pause))
+        with FrameStore(self.cache, read_only=True) as store:
+            before = list(store.iter_frames("source"))
+        self.stop.clear()
+        self.capture.get.side_effect = lambda prop: 5 if prop == cv2.CAP_PROP_FRAME_COUNT else 0
+        self.capture.read.return_value = (True, np.zeros((8, 14, 3), np.uint8))
+        with self.assertRaisesRegex(ValueError, "source dimensions"):
+            self.run_job()
+        self.assertEqual(self.ffmpeg.extractions, 1)
+        with FrameStore(self.cache, read_only=True) as store:
+            self.assertEqual(list(store.iter_frames("source")), before)
 
     def test_video_geometry_preserves_upstream_aspect_derived_rounding(self):
         image = np.full((11, 15, 3), 20, np.uint8)
@@ -291,8 +469,8 @@ class VideoUpscalerTests(unittest.TestCase):
                 self.saved = set()
                 self.data = jpeg(20)
 
-            def get_metadata(self, key):
-                return self.metadata.get(key)
+            def get_metadata(self, key, default=None):
+                return self.metadata.get(key, default)
 
             def set_metadata(self, key, value):
                 self.metadata[key] = value

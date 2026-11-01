@@ -217,6 +217,13 @@ class SizingTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(upscaler, "resize_with_output_factor"))
 
+    def test_pre_scaled_even_input_is_not_resampled_or_copied(self):
+        upscaler = make_upscaler()
+        image = np.zeros((8, 12, 3), dtype=np.uint8)
+        with patch("qualityscaler.ai.resize_with_factor",
+                   side_effect=AssertionError("Redundant input resampling")):
+            self.assertIs(upscaler.resize_with_input_factor(image), image)
+
     def test_thread_count_uses_decoded_frame_and_input_resize(self):
         frame = np.zeros((100, 200, 3), dtype=np.uint8)
         for factor, max_resolution, selected, model, expected in (

@@ -1,11 +1,16 @@
 # Build with Python 3.11 / PyInstaller 6.16.0; see build.ps1.
 # Keep all resource paths relative to the extracted onefile bundle, not the exe.
 from pathlib import Path
+import sys
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, get_package_paths
 
 
 ROOT = Path(SPECPATH).resolve()
+# Build helpers must also work when PyInstaller is invoked outside this directory.
+sys.path.insert(0, str(ROOT))
+from qualityscaler.splash_art import jpeg_artifact_script
+
 ASSETS = ROOT / "Assets"
 MODELS = ROOT / "AI-onnx"
 STANDARD_MODELS = (
@@ -95,6 +100,7 @@ class ProgressiveSplash(Splash):
         script = super().generate_script()
         extraction_files = max(1, len(a.binaries) + len(a.datas))
         script += f"\nset qs_extraction_files {extraction_files}\n"
+        script += jpeg_artifact_script(self.image_file, self.max_img_size)
         script += (ROOT / "qualityscaler" / "splash.tcl").read_text(encoding="utf-8")
         # 6.16's resource writer counts characters but writes UTF-8 bytes.
         # Reject non-ASCII rather than silently truncating the embedded script.

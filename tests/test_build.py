@@ -51,6 +51,12 @@ class BuildSpecTests(unittest.TestCase):
             (ROOT / "qualityscaler/splash.tcl").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+        path_patch = patch.object(sys, "path", sys.path.copy())
+        path_patch.start()
+        self.addCleanup(path_patch.stop)
+        splash_art = ModuleType("qualityscaler.splash_art")
+        self.jpeg_artifact_script = Mock(return_value="# JPEG quality stages\n")
+        splash_art.jpeg_artifact_script = self.jpeg_artifact_script
 
         self.ctk_data = [
             ("venv/customtkinter/assets/themes/blue.json", "customtkinter/assets/themes"),
@@ -81,6 +87,7 @@ class BuildSpecTests(unittest.TestCase):
             "PyInstaller": ModuleType("PyInstaller"),
             "PyInstaller.utils": ModuleType("PyInstaller.utils"),
             "PyInstaller.utils.hooks": self.hooks,
+            "qualityscaler.splash_art": splash_art,
         }
         self.module_patch = patch.dict(sys.modules, modules)
         self.module_patch.start()
@@ -109,6 +116,8 @@ class BuildSpecTests(unittest.TestCase):
                 test.splash(*args, **kwargs)
                 test.splash_target = self
                 self.binaries = sentinel.splash_binaries
+                self.image_file = args[0]
+                self.max_img_size = kwargs["max_img_size"]
                 self.script_name = test.root / "splash_script.tcl"
                 self.script = self.generate_script()
 
@@ -240,7 +249,10 @@ class BuildSpecTests(unittest.TestCase):
         script = self.splash_target.script
         self.assertEqual(
             script, f"# Native template and IPC\n\nset qs_extraction_files {count}\n"
-            + extension,
+            + "# JPEG quality stages\n" + extension,
+        )
+        self.jpeg_artifact_script.assert_called_once_with(
+            str(self.root / "Assets/logo.png"), (480, 480),
         )
         self.assertEqual(
             Path(self.splash_target.script_name).read_text(encoding="utf-8"), script,

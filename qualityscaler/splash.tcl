@@ -1,14 +1,12 @@
 # Appended to PyInstaller 6.16.0's native splash script at build time.
-# No Python/Tk root or extra artwork: keep splash_image as the pristine source.
+# JPEG quality stages are embedded at build time; splash_image stays pristine.
 # Extraction occupies 0-70%; Python startup phases occupy the remaining range.
 # The file count is an estimate, not a byte percentage or time prediction.
 set qs_progress 0.0
 set qs_target 0.0
 set qs_extracted 0
-set qs_last_block 0
-set qs_blocks {24 20 16 12 10 8 6 5 4 3 2 1}
+set qs_last_frame -1
 
-image create photo qs_small
 image create photo qs_frame -width $image_width -height $image_height
 foreach item [.root.canvas find all] {
     if {[.root.canvas type $item] eq "image"} {
@@ -24,25 +22,32 @@ set qs_bar [.root.canvas create rectangle 0 $qs_bar_top 0 $image_height \
     -fill "#f35088" -outline ""]
 
 proc qs_render {} {
-    global qs_progress qs_blocks qs_last_block qs_bar qs_bar_top
+    global qs_progress qs_quality_images qs_quality_thresholds qs_last_frame
+    global qs_bar qs_bar_top
     global image_width image_height
     .root.canvas coords $qs_bar 0 $qs_bar_top \
         [expr {round($image_width * $qs_progress)}] $image_height
 
-    set index [expr {int($qs_progress * ([llength $qs_blocks] - 1))}]
-    set block [lindex $qs_blocks $index]
-    if {$block != $qs_last_block} {
+    set count [llength $qs_quality_images]
+    set index 0
+    foreach threshold [lrange $qs_quality_thresholds 1 end] {
+        if {$qs_progress < $threshold} {
+            break
+        }
+        incr index
+    }
+    if {$qs_progress >= 1.0} {
+        set index $count
+    }
+    if {$index != $qs_last_frame} {
         qs_frame blank
-        if {$block == 1} {
-            # Restore the original exactly, without resampling or residual blocks.
+        if {$index == $count} {
+            # Restore the original exactly, without residual compression artifacts.
             qs_frame copy splash_image -compositingrule set
         } else {
-            qs_small blank
-            qs_small copy splash_image -subsample $block $block
-            qs_frame copy qs_small -zoom $block $block \
-                -to 0 0 $image_width $image_height -compositingrule set
+            qs_frame copy [lindex $qs_quality_images $index] -compositingrule set
         }
-        set qs_last_block $block
+        set qs_last_frame $index
     }
 }
 

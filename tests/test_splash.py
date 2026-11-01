@@ -3,7 +3,10 @@
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
+
+from qualityscaler.splash_art import JPEG_STAGES, jpeg_artifact_script
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +26,7 @@ class NativeSplashRenderingTests(unittest.TestCase):
         self.addCleanup(self.window.destroy)
         self.window.withdraw()
         self.tk = self.window.tk
-        # Deliberately not divisible by the block sizes, to catch edge clipping.
+        # Deliberately not divisible by JPEG's block size, to catch edge clipping.
         self.width, self.height = 479, 317
         self.tk.call("image", "create", "photo", "splash_image",
                      "-width", self.width, "-height", self.height)
@@ -51,6 +54,10 @@ class NativeSplashRenderingTests(unittest.TestCase):
             rename ::tcl::mathfunc::min {}
             rename ::tcl::mathfunc::max {}
         """)
+        with TemporaryDirectory() as directory:
+            image_file = Path(directory) / "logo.png"
+            self.tk.call("splash_image", "write", str(image_file), "-format", "png")
+            self.tk.eval(jpeg_artifact_script(image_file, (self.width, self.height)))
         self.tk.eval(SCRIPT)
         self.addCleanup(self.cancel_timers)
 
@@ -75,17 +82,18 @@ class NativeSplashRenderingTests(unittest.TestCase):
             self.tk.call(".root.canvas", "coords", self.tk.getvar("qs_bar")),
         ))
 
-    def test_first_frame_is_pixelated_and_bar_is_flush_with_bottom_edge(self):
+    def test_first_frame_is_jpeg_compressed_and_bar_is_flush_with_bottom_edge(self):
         self.assertEqual(self.progress(), 0)
-        self.assertEqual(int(self.tk.getvar("qs_last_block")), 24)
+        self.assertEqual(int(self.tk.getvar("qs_last_frame")), 0)
         self.assertEqual(self.bar_coords(), (0, self.height - 4, 0, self.height))
-        self.assertEqual(self.tk.call("qs_frame", "get", 0, 0),
-                         self.tk.call("qs_frame", "get", 23, 0))
-        self.assertNotEqual(self.tk.call("splash_image", "get", 0, 0),
-                            self.tk.call("splash_image", "get", 23, 0))
+        # Fine variation survives inside the former 24-pixel nearest-neighbor blocks.
+        self.assertNotEqual(self.tk.call("qs_frame", "get", 0, 0),
+                            self.tk.call("qs_frame", "get", 23, 0))
+        self.assertNotEqual(self.tk.call("qs_frame", "data", "-format", "ppm"),
+                            self.tk.call("splash_image", "data", "-format", "ppm"))
         self.assertEqual(int(self.tk.call("image", "width", "qs_frame")), self.width)
         self.assertEqual(int(self.tk.call("image", "height", "qs_frame")), self.height)
-        # The right/bottom edge is filled, not transparent after zoom/cropping.
+        # JPEG padding must not change the displayed dimensions or leave a gap.
         self.assertEqual(int(self.tk.call("qs_frame", "transparency", "get",
                                          self.width - 1, self.height - 1)), 0)
 
@@ -97,11 +105,27 @@ class NativeSplashRenderingTests(unittest.TestCase):
         self.assertTrue(0 < self.progress() < 0.7)
         self.settle()
         self.assertAlmostEqual(self.progress(), 0.7)
-        self.assertTrue(1 < int(self.tk.getvar("qs_last_block")) < 24)
+        self.assertEqual(int(self.tk.getvar("qs_last_frame")), 0)
         before = self.progress()
         self.settle()
         self.assertEqual(self.progress(), before)
         self.assertLess(self.bar_coords()[2], self.width)
+
+    def test_quality_holds_rough_until_late_loading_then_recovers_before_ready(self):
+        first = self.tk.call("qs_frame", "data", "-format", "ppm")
+        self.status("QS_PROGRESS:74:Loading...")
+        self.settle()
+        self.assertEqual(int(self.tk.getvar("qs_last_frame")), 0)
+        self.assertEqual(self.tk.call("qs_frame", "data", "-format", "ppm"), first)
+        self.status("QS_PROGRESS:88:Detecting adapters...")
+        self.settle()
+        middle = int(self.tk.getvar("qs_last_frame"))
+        self.assertTrue(0 < middle < len(JPEG_STAGES) - 1)
+        self.status("QS_PROGRESS:94:Preparing interface...")
+        self.settle()
+        self.assertEqual(int(self.tk.getvar("qs_last_frame")), len(JPEG_STAGES) - 1)
+        self.assertNotEqual(self.tk.call("qs_frame", "data", "-format", "ppm"),
+                            self.tk.call("splash_image", "data", "-format", "ppm"))
 
     def test_phase_messages_show_only_status_and_cannot_move_progress_backwards(self):
         self.status("QS_PROGRESS:88:Detecting adapters: résumé {GPU} (0)")
@@ -119,7 +143,7 @@ class NativeSplashRenderingTests(unittest.TestCase):
     def test_ready_immediately_restores_exact_original_and_fills_bar(self):
         self.status("QS_PROGRESS:100:Ready")
         self.assertEqual(self.progress(), 1)
-        self.assertEqual(int(self.tk.getvar("qs_last_block")), 1)
+        self.assertEqual(int(self.tk.getvar("qs_last_frame")), len(JPEG_STAGES))
         self.assertEqual(self.bar_coords(),
                          (0, self.height - 4, self.width, self.height))
         self.assertEqual(self.tk.call("qs_frame", "data", "-format", "ppm"),

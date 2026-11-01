@@ -45,6 +45,12 @@ class BuildSpecTests(unittest.TestCase):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"fixture")
+        script = self.root / "qualityscaler/splash.tcl"
+        script.parent.mkdir(parents=True)
+        script.write_text(
+            (ROOT / "qualityscaler/splash.tcl").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
 
         self.ctk_data = [
             ("venv/customtkinter/assets/themes/blue.json", "customtkinter/assets/themes"),
@@ -95,8 +101,21 @@ class BuildSpecTests(unittest.TestCase):
 
         self.analysis = Mock(side_effect=analyze)
         self.pyz = Mock(return_value=sentinel.pyz)
-        self.splash_target = SimpleNamespace(binaries=sentinel.splash_binaries)
-        self.splash = Mock(return_value=self.splash_target)
+        self.splash = Mock()
+        test = self
+
+        class NativeSplash:
+            def __init__(self, *args, **kwargs):
+                test.splash(*args, **kwargs)
+                test.splash_target = self
+                self.binaries = sentinel.splash_binaries
+                self.script_name = test.root / "splash_script.tcl"
+                self.script = self.generate_script()
+
+            def generate_script(self):
+                return "# Native template and IPC\n"
+
+        self.splash_base = NativeSplash
         self.exe = Mock()
 
     def execute_spec(self):
@@ -104,7 +123,7 @@ class BuildSpecTests(unittest.TestCase):
             "SPECPATH": str(self.root),
             "Analysis": self.analysis,
             "PYZ": self.pyz,
-            "Splash": self.splash,
+            "Splash": self.splash_base,
             "EXE": self.exe,
         }
         exec(SPEC_CODE, namespace)
@@ -213,6 +232,26 @@ class BuildSpecTests(unittest.TestCase):
         self.assertIs(options["always_on_top"], False)
         self.assertIs(self.exe.call_args.args[4], self.splash_target)
         self.assertIs(self.exe.call_args.args[5], sentinel.splash_binaries)
+
+    def test_native_splash_embeds_extension_after_template_and_saves_combined_script(self):
+        namespace = self.execute_spec()
+        count = len(namespace["a"].binaries) + len(namespace["a"].datas)
+        extension = (ROOT / "qualityscaler/splash.tcl").read_text(encoding="utf-8")
+        script = self.splash_target.script
+        self.assertEqual(
+            script, f"# Native template and IPC\n\nset qs_extraction_files {count}\n"
+            + extension,
+        )
+        self.assertEqual(
+            Path(self.splash_target.script_name).read_text(encoding="utf-8"), script,
+        )
+
+    def test_native_splash_rejects_non_ascii_to_avoid_resource_truncation(self):
+        with (self.root / "qualityscaler/splash.tcl").open("a", encoding="utf-8") as script:
+            script.write("\n# Non-ASCII dash: \u2013\n")
+        with self.assertRaises(UnicodeEncodeError):
+            self.execute_spec()
+        self.exe.assert_not_called()
 
     def test_build_is_single_file_windowed_with_icon_and_no_upx(self):
         self.execute_spec()

@@ -88,10 +88,24 @@ a = Analysis(
 pyz = PYZ(a.pure)
 
 # Native bootloader splash: visible while the onefile archive is still unpacking.
-# text_pos enables PyInstaller's per-file extraction progress; Python takes over
-# the same status line after freeze_support(), then closes it when the UI is ready.
-# Reuse the logo, with dark text in its clear lower margin; no generated artwork.
-splash = Splash(
+# Extend the pinned 6.16.0 Tcl template, keeping its window, image and IPC.
+# The extension is embedded in the native resource, not loaded by Python at run time.
+class ProgressiveSplash(Splash):
+    def generate_script(self):
+        script = super().generate_script()
+        extraction_files = max(1, len(a.binaries) + len(a.datas))
+        script += f"\nset qs_extraction_files {extraction_files}\n"
+        script += (ROOT / "qualityscaler" / "splash.tcl").read_text(encoding="utf-8")
+        # 6.16's resource writer counts characters but writes UTF-8 bytes.
+        # Reject non-ASCII rather than silently truncating the embedded script.
+        script.encode("ascii")
+        Path(self.script_name).write_text(script, encoding="utf-8")
+        return script
+
+
+# text_pos enables extraction status; Python sends phase milestones over the
+# same text channel after freeze_support(). Artwork stays the existing logo.
+splash = ProgressiveSplash(
     str(ASSETS / "logo.png"),
     binaries=a.binaries,
     datas=a.datas,

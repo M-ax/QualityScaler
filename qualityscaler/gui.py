@@ -2076,7 +2076,7 @@ def main():
             "selected_video_crf", "selected_video_bitrate",
         ):
             setattr(app_state, name, StringVar(master=app_state.window))
-        update_splash("Detecting graphics adapters...")
+        update_splash("Detecting graphics adapters...", progress=88)
         GPU.detect()
         if preferences.gpu not in GPU.menu_list():
             preferences.gpu = GPU.default()
@@ -2094,7 +2094,7 @@ def main():
             app_state.selected_output_path, app_state.selected_VRAM_limiter,
         ):
             app_state.traces.append((variable, variable.trace_add("write", schedule_file_widget_update)))
-        update_splash("Preparing interface...")
+        update_splash("Preparing interface...", progress=94)
         _load_ui_resources()
         App(app_state.window)
         app_state.window.file_drop_target = FileDropTarget(
@@ -2103,7 +2103,10 @@ def main():
         )
         app_state.window.deiconify()
         app_state.window.update()
-        close_splash()
+        update_splash("Ready", progress=100)
+        # Give the native Tcl thread a paint turn for the sharp/full-bar frame.
+        # The desktop is already interactive; errors still close in the launcher.
+        _schedule(200, close_splash)
         app_state.window.mainloop()
     finally:
         try:

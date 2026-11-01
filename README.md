@@ -233,19 +233,26 @@ executable containing Python, the DirectML runtime, FFmpeg, UI assets, native
 TkDND support, and **all nine standard models** listed above. A completed build
 needs no Python installation or FFmpeg PATH configuration on the target PC.
 Each launch extracts its bundled resources to the Windows temporary directory.
-PyInstaller 6.16.0's native bootloader splash shows the logo and the file currently
-being unpacked, before Python or the desktop can run. This is per-file progress,
-not a percentage; unpacking a large model can leave the same filename visible
-for a while. After extraction, the status line switches to short startup phases
-and stays until the desktop's first `window.update()` has completed. Startup
-errors close the splash before propagating.
+PyInstaller 6.16.0's native bootloader splash starts with a blocky, pixelated logo
+and a four-pixel progress bar flush with the bottom edge, before Python or the
+desktop can run. The bar advances and the logo progressively sharpens as files
+are unpacked and the application initializes. Extraction uses an estimated file
+count, followed by import/GPU/UI milestones; this is phase progress, not a byte
+percentage or time estimate. Unpacking a large model can leave progress unchanged
+for a while rather than falsely completing on a timer.
 
-The splash reuses `Assets/logo.png`, with dark status text in the lower margin;
-no separate image or second Python/Tk root is created. The lazy
-`qualityscaler.startup.update_splash(text)` and `close_splash()` helpers are
-enabled only by the frozen desktop launcher after `freeze_support()`. Source
-runs, CLI/self-test UI calls, and multiprocessing workers cannot attach to or
-close another process's splash.
+The status line shows the file being unpacked, then short startup phases. Once
+the desktop's first `window.update()` completes, the bar fills and the exact
+original logo is restored. The splash closes 200 ms later, without blocking the
+already-interactive desktop. Startup errors close it immediately.
+
+The splash reuses `Assets/logo.png`, with dark status text in the lower margin.
+`qualityscaler/splash.tcl` extends the pinned native template at build time; no
+separate artwork or second Python/Tk root is created. The lazy
+`qualityscaler.startup.update_splash(text, progress=...)` and `close_splash()`
+helpers are enabled only by the frozen desktop launcher after `freeze_support()`.
+Source runs, CLI/self-test UI calls, and multiprocessing workers cannot attach
+to or close another process's splash.
 
 An existing 4.7 executable does not contain this 2026.4 forward-port. Rebuilding
 requires the current model bundle; these instructions do not claim that a new
@@ -310,11 +317,13 @@ the command being documented is not evidence of a passing packaged build.
 
 Validate the splash separately with a normal desktop launch, with
 `PYINSTALLER_SUPPRESS_SPLASH_SCREEN` unset: it should be visible during onefile
-extraction, show import/GPU/UI preparation status, then disappear when the
+extraction, begin pixelated, show its bottom-edge bar and import/GPU/UI status,
+then briefly show the sharp original/full bar before disappearing when the
 desktop is ready, without reappearing as workers start. PyInstaller's bootloader
 also accepts `PYINSTALLER_SUPPRESS_SPLASH_SCREEN=1` for deliberately splash-free
-desktop launches. Unit tests mock the native target/IPC; they do not prove that
-a packaged splash was displayed or that desktop readiness was reached.
+desktop launches. Unit tests exercise rendering with real Tcl/Tk and mock the
+native target/IPC; they do not prove that the complete packaged application
+reaches desktop readiness.
 
 ## Video frame cache and resume
 

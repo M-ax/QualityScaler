@@ -10,6 +10,8 @@ import numpy as np
 
 from qualityscaler.ffmpeg import UpscaleCancelled
 from qualityscaler.jobs import check_if_file_is_video, upscale_image, upscale_orchestrator
+from qualityscaler.status import CacheSettingsConflict, VideoProgress
+from qualityscaler.video import CacheSettingsMismatch, upscale_video
 
 
 class BatchJobTests(unittest.TestCase):
@@ -19,18 +21,23 @@ class BatchJobTests(unittest.TestCase):
         self.source = Path(self.temp.name) / "clip.mp4"
         self.source.write_bytes(b"video")
 
-    def run_batch(self, stop=None):
+    def run_batch(self, stop=None, *, files=None, retry_from=None, clear_cache=False):
         queue = Queue()
         upscale_orchestrator(
-            queue, stop or Event(), [str(self.source)], "output", "Testx2", 1,
+            queue, stop or Event(), [str(self.source)] if files is None else files,
+            "output", "Testx2", 1,
             1, 1, "Auto", 1024, 0, True, ".png", ".mp4", "x264",
+            retry_from=retry_from, clear_cache=clear_cache,
         )
         return queue.get_nowait()
 
     @patch("qualityscaler.jobs.upscale_video")
     def test_batch_calls_modular_video_backend(self, upscale):
         self.assertEqual(self.run_batch(), "Completed")
-        upscale.assert_called_once()
+        upscale.assert_called_once_with(
+            unittest.mock.ANY, unittest.mock.ANY, str(self.source), 1, "output", "Testx2",
+            0, 1, "Auto", 1, 1, 1024, ".mp4", "x264", True,
+        )
 
     @patch("qualityscaler.jobs.upscale_video", side_effect=UpscaleCancelled)
     def test_cancelled_video_does_not_report_completed(self, upscale):
@@ -40,12 +47,117 @@ class BatchJobTests(unittest.TestCase):
     def test_failure_does_not_report_completed(self, upscale):
         self.assertEqual(self.run_batch(), "Error broken")
 
+    @patch("qualityscaler.jobs.upscale_video", side_effect=CacheSettingsMismatch("different AI"))
+    def test_cache_settings_mismatch_reports_a_structured_terminal_conflict(self, upscale):
+        self.assertEqual(self.run_batch(), CacheSettingsConflict("different AI", 1))
+        upscale.assert_called_once()
+
+    @patch("qualityscaler.jobs.upscale_video", side_effect=ValueError("different AI"))
+    def test_other_errors_with_the_same_message_are_not_cache_conflicts(self, upscale):
+        self.assertEqual(self.run_batch(), "Error different AI")
+
+    @patch("qualityscaler.jobs.upscale_video")
+    @patch("qualityscaler.jobs.upscale_image")
+    @patch("qualityscaler.jobs.AI_upscale")
+    def test_retry_skips_completed_files_and_keeps_original_batch_numbers(
+        self, engine, image, video,
+    ):
+        skipped = self.source.with_name("completed-but-now-missing.png")
+        later_image = self.source.with_name("later.png")
+        later_video = self.source.with_name("later.mp4")
+        later_image.write_bytes(b"image")
+        later_video.write_bytes(b"video")
+        files = [str(path) for path in (skipped, self.source, later_image, later_video)]
+        self.assertEqual(self.run_batch(files=files, retry_from=2, clear_cache=True), "Completed")
+        self.assertEqual(
+            [call.args[2:4] for call in video.call_args_list],
+            [(str(self.source), 2), (str(later_video), 4)],
+        )
+        self.assertEqual(
+            [call.kwargs for call in video.call_args_list], [{"clear_cache": True}, {}],
+        )
+        image.assert_called_once()
+        self.assertEqual(image.call_args.args[1:3], (str(later_image), 3))
+        engine.assert_called_once_with("Testx2", "Auto", 1, 1024)
+
+    @patch("qualityscaler.jobs.upscale_video")
+    def test_retry_does_not_authorize_clearing_a_later_video_conflict(self, video):
+        later = self.source.with_name("later.mp4")
+        later.write_bytes(b"video")
+        video.side_effect = [None, CacheSettingsMismatch("later conflict")]
+        files = ["already-completed.mp4", str(self.source), str(later)]
+        self.assertEqual(
+            self.run_batch(files=files, retry_from=2, clear_cache=True),
+            CacheSettingsConflict("later conflict", 3),
+        )
+        self.assertEqual(
+            [call.kwargs for call in video.call_args_list], [{"clear_cache": True}, {}],
+        )
+        self.assertEqual([call.args[3] for call in video.call_args_list], [2, 3])
+
+    @patch("qualityscaler.jobs.upscale_video")
+    def test_batch_position_alone_does_not_authorize_cache_reset(self, video):
+        files = ["completed.mp4", str(self.source)]
+        self.assertEqual(self.run_batch(files=files, retry_from=2), "Completed")
+        self.assertEqual(video.call_args.args[3], 2)
+        self.assertEqual(video.call_args.kwargs, {})
+
+    @patch("qualityscaler.jobs.upscale_video")
+    def test_clear_permission_without_a_retry_target_does_not_clear_anything(self, video):
+        self.assertEqual(self.run_batch(clear_cache=True), "Completed")
+        self.assertEqual(video.call_args.kwargs, {})
+
+    @patch("qualityscaler.jobs.upscale_video")
+    def test_retry_file_number_must_be_in_the_selected_batch(self, video):
+        for retry_from in (0, -1, 2, True, False, 1.0, "1"):
+            with self.subTest(retry_from=retry_from):
+                self.assertEqual(
+                    self.run_batch(retry_from=retry_from),
+                    "Error retry_from must be a 1-based file number within the selected batch",
+                )
+        self.assertEqual(
+            self.run_batch(files=[], retry_from=1),
+            "Error retry_from must be a 1-based file number within the selected batch",
+        )
+        video.assert_not_called()
+
+    @patch("qualityscaler.jobs.upscale_video")
+    def test_cancelled_retry_does_not_start_the_authorized_video(self, video):
+        stop = Event()
+        stop.set()
+        self.assertEqual(self.run_batch(stop, retry_from=1, clear_cache=True), "Stop")
+        video.assert_not_called()
+
     @patch("qualityscaler.jobs.upscale_video")
     def test_stop_before_batch_does_not_start_next_file(self, upscale):
         stop = Event()
         stop.set()
         self.assertEqual(self.run_batch(stop), "Stop")
         upscale.assert_not_called()
+
+    def test_video_adapter_sends_full_snapshots_with_the_batch_file_number(self):
+        queue = Queue()
+        with patch("qualityscaler.video.VideoUpscaler") as backend:
+            upscale_video(
+                queue, Event(), str(self.source), 2, self.temp.name, "Testx2",
+                0, 2, "Auto", 1, 1, 1024, ".mp4", "x264", True,
+            )
+        self.assertEqual(backend.return_value.run.call_args.kwargs, {})
+        report = backend.call_args.kwargs["progress"]
+        report(VideoProgress("Extracting video frames", 3, 1, 5, False))
+        report(VideoProgress("Encoding upscaled video 20%", 5, 5, 5, True))
+        self.assertEqual(queue.get_nowait(), VideoProgress(
+            "2. Encoding upscaled video 20%", 5, 5, 5, True,
+        ))
+
+    def test_video_adapter_forwards_explicit_cache_reset_authorization(self):
+        with patch("qualityscaler.video.VideoUpscaler") as backend:
+            upscale_video(
+                Queue(), Event(), str(self.source), 2, self.temp.name, "Testx2",
+                0, 2, "Auto", 1, 1, 1024, ".mp4", "x264", True, clear_cache=True,
+            )
+        self.assertEqual(backend.return_value.run.call_args.kwargs, {"clear_cache": True})
+        self.assertEqual(backend.return_value.run.call_args.args[0], str(self.source))
 
     def test_video_extensions_are_case_insensitive(self):
         self.assertTrue(check_if_file_is_video("movie.M4V"))

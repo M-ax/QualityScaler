@@ -21,7 +21,7 @@ from shutil import disk_usage as shutil_disk_usage
 import sys
 from threading import Thread
 from time import monotonic
-from tkinter import DISABLED, StringVar, TclError
+from tkinter import BooleanVar, DISABLED, StringVar, TclError
 from typing import Any, Callable, Optional
 from webbrowser import open as open_browser
 
@@ -41,7 +41,7 @@ from cv2 import (
 from PIL.Image import open as pillow_image_open, fromarray as pillow_image_fromarray
 from psutil import Process as psutil_Process, NoSuchProcess, AccessDenied
 from customtkinter import (
-    CTk, CTkFrame, CTkButton, CTkEntry, CTkFont, CTkImage, CTkLabel,
+    CTk, CTkFrame, CTkButton, CTkCheckBox, CTkEntry, CTkFont, CTkImage, CTkLabel,
     CTkOptionMenu, CTkProgressBar, CTkScrollableFrame, CTkToplevel,
     filedialog, set_appearance_mode, set_default_color_theme,
     set_widget_scaling, set_window_scaling,
@@ -59,10 +59,11 @@ from .gpu import GPU, get_AI_engine_info
 from .inputs import merge_input_files, supported_input_files
 from .jobs import upscale_orchestrator
 from .media import get_image_resolution, image_read
-from .paths import OUTPUT_PATH_CODED, find_by_relative_path
+from .paths import OUTPUT_PATH_CODED, find_by_relative_path, prepare_output_video_directory_name
 from .platform_support import prevent_sleep, allow_sleep, show_completion_notification
 from .preview_window import UpscalePreview
 from .startup import close_splash, update_splash
+from .status import CacheSettingsConflict, VideoProgress
 from .video import VideoSettings, get_resume_progress
 from .widgets import StatusBar
 
@@ -150,6 +151,7 @@ class AppState:
     selected_video_codec: Optional[StringVar] = None
     file_widget: Optional["FileWidget"] = None
     process_upscale_orchestrator: Optional[Any] = None
+    processing_config: Optional[ProcessingConfig] = None
     process_status_q: Optional[Any] = None
     event_stop_upscale_process: Optional[Any] = None
     selected_file_list: list[str] = field(default_factory=list)
@@ -158,7 +160,7 @@ class AppState:
     processing: bool = False
     stopping: bool = False
     closing: bool = False
-    pending_upscale_status: Optional[str] = None
+    pending_upscale_status: Optional[str | CacheSettingsConflict] = None
     stop_deadline: Optional[float] = None
     poll_after_id: Optional[str] = None
     preview_after_id: Optional[str] = None
@@ -217,7 +219,8 @@ def _cancel_after(handle):
 
 
 class MessageBox(CTkToplevel):
-    def __init__(self, messageType, title, subtitle, default_value, option_list):
+    def __init__(self, messageType, title, subtitle, default_value, option_list,
+                 *, action_text=None, action_command=None, action_option_text=None):
         super().__init__(master=App.get_app_window())
         self.configure(fg_color=background_color)
         self._messageType = messageType
@@ -225,6 +228,10 @@ class MessageBox(CTkToplevel):
         self._subtitle = subtitle
         self._default_value = default_value
         self._option_list = option_list
+        self._action_text = action_text
+        self._action_command = action_command
+        self._action_option_text = action_option_text
+        self._action_option = BooleanVar(master=self, value=False) if action_option_text else None
         self.title("")
         self.lift()
         self.attributes("-topmost", True)
@@ -241,11 +248,25 @@ class MessageBox(CTkToplevel):
         super().destroy()
 
     def _ok_event(self, event=None):
+        self._action_command = None
         self.grab_release()
         self.destroy()
 
     def _on_closing(self):
         self._ok_event()
+
+    def _action_event(self):
+        command = self._action_command
+        if command is None:
+            return
+        self._action_command = None  # A second click cannot start another retry.
+        option = self.__dict__.get("_action_option")
+        value = option.get() if option is not None else None
+        self._ok_event()
+        if option is None:
+            command()
+        else:
+            command(value)
 
     def _copy_log_to_clipboard(self, copy_button):
         self.clipboard_clear()
@@ -267,17 +288,24 @@ class MessageBox(CTkToplevel):
                 row=1, column=0, padx=25, sticky="ew"
             )
         CTkLabel(self, text=self._subtitle, font=bold14, text_color=CARD_VALUE_COLOR,
-                 anchor="w", justify="left").grid(
+                 anchor="w", justify="left", wraplength=600).grid(
             row=2, column=0, padx=25, pady=(0, 17), sticky="ew"
         )
         for index, option in enumerate(self._option_list, start=3):
             CTkLabel(self, text=option, width=600, height=45, font=bold13,
-                     anchor="w", justify="left", text_color=CARD_VALUE_COLOR,
+                     anchor="w", justify="left", wraplength=600, text_color=CARD_VALUE_COLOR,
                      fg_color=CARD_BACKGROUND_COLOR, corner_radius=10).grid(
                 row=index, column=0, padx=25, pady=4, sticky="ew"
             )
+        button_row = 3 + len(self._option_list)
+        if self._action_option is not None:
+            CTkCheckBox(
+                self, text=self._action_option_text, variable=self._action_option,
+                font=bold13, text_color=CARD_VALUE_COLOR,
+            ).grid(row=button_row, column=0, padx=25, pady=(12, 0), sticky="w")
+            button_row += 1
         buttons = CTkFrame(self, fg_color="transparent")
-        buttons.grid(row=3 + len(self._option_list), column=0,
+        buttons.grid(row=button_row, column=0,
                      padx=20, pady=20, sticky="e")
         style = dict(width=125, font=bold11, border_width=2,
                      corner_radius=UI_CORNER_RADIUS, fg_color=CARD_BACKGROUND_COLOR,
@@ -287,7 +315,13 @@ class MessageBox(CTkToplevel):
             copy_button = CTkButton(buttons, text="Copy log", **style)
             copy_button.configure(command=lambda: self._copy_log_to_clipboard(copy_button))
             copy_button.pack(side="left", padx=(0, 10))
-        CTkButton(buttons, text="OK", command=self._ok_event, **style).pack(side="left")
+        if self._action_command is not None:
+            CTkButton(
+                buttons, text=self._action_text, command=self._action_event,
+                **{**style, "width": 240},
+            ).pack(side="left", padx=(0, 10))
+        dismiss_text = "Cancel" if self._action_command is not None else "OK"
+        CTkButton(buttons, text=dismiss_text, command=self._ok_event, **style).pack(side="left")
 
 
 class FileWidget(CTkScrollableFrame):
@@ -357,6 +391,7 @@ class FileWidget(CTkScrollableFrame):
         self.clean_file_list()
         self._render_cards()
         app_state.selected_file_list = list(self.file_list)
+        _display_status(f"Ready — {len(self.file_list)} input file(s)")
 
     def _create_file_card(self, file_path):
         is_video, width, height, num_frames, frame_rate = self._read_media_properties(file_path)
@@ -734,9 +769,26 @@ def build_processing_config():
     return config
 
 
-def show_error_message(exception):
-    MessageBox("error", "Upscale error", "Please report the error on Github or Telegram",
-               None, [f"\n {exception} \n"])
+def show_error_message(exception, *, clear_cache_command=None):
+    if clear_cache_command is None:
+        MessageBox("error", "Upscale error", "Please report the error on Github or Telegram",
+                   None, [f"\n {exception} \n"])
+    else:
+        MessageBox(
+            "error", "Upscale error",
+            "The cached video frames cannot be reused with the selected settings.\n"
+            "Current UI settings are used by default.",
+            None, [
+                f"\n {exception} \n",
+                "Clear cache and continue deletes this video's cached source and AI frames, "
+                "then restarts it. Other caches are untouched. If the current output folder "
+                "differs from the failed run's folder, its old cache is kept. "
+                "Any existing output is replaced only after the new video encodes successfully. "
+                "Cancel leaves the cache unchanged; you can edit settings before trying again.",
+            ],
+            action_text="Clear cache and continue", action_command=clear_cache_command,
+            action_option_text="Use settings from failed run",
+        )
 
 
 def show_disk_space_error_message(warning):
@@ -835,7 +887,7 @@ def select_input_files(paths):
     message = f"Ready — {len(readable)} input file(s)"
     if skipped:
         message += f" ({skipped} skipped)"
-    app_state.info_message.set(message)
+    _display_status(message)
     return True
 
 
@@ -849,7 +901,7 @@ def clear_input_files():
     app_state.file_widget = None
     app_state.selected_file_list = []
     App.place_loadFile_section()
-    app_state.info_message.set("Drop input files here or use SELECT FILES")
+    _display_status("Drop input files here or use SELECT FILES")
     return True
 
 
@@ -927,6 +979,15 @@ def open_info_messagebox(title, subtitle, option_list):
 
 # Process control: Tk owns UI updates; no GUI callbacks run on worker threads.
 
+def _display_status(status: str | VideoProgress):
+    """Keep the general message and both video rows in sync on Tk's thread."""
+    progress = status if isinstance(status, VideoProgress) else None
+    message = progress.message if progress is not None else status
+    app_state.info_message.set(message)
+    if app_state.status_bar is not None:
+        app_state.status_bar.set_video_progress(progress)
+
+
 def _drain_status_queue():
     if app_state.process_status_q is None:
         return
@@ -975,24 +1036,33 @@ def stop_upscale_process():
         if event is not None:
             event.clear()
         app_state.processing = False
+        app_state.processing_config = None
         app_state.stopping = False
         app_state.pending_upscale_status = None
         app_state.stop_deadline = None
         allow_sleep()
 
 
-def _finish_upscale(status: str) -> bool:
+def _is_error_status(status):
+    return isinstance(status, CacheSettingsConflict) or (
+        isinstance(status, str) and status.startswith(ERROR_STATUS)
+    )
+
+
+def _finish_upscale(status: str | CacheSettingsConflict) -> bool:
     """Record a terminal result, but settle the UI only after the worker exits."""
     state = app_state
     process = state.process_upscale_orchestrator
     if not state.processing and process is None:
         return True  # A stale/duplicate completion must not notify twice.
-    if state.pending_upscale_status is None or status.startswith(ERROR_STATUS):
+    if state.pending_upscale_status is None or _is_error_status(status):
         state.pending_upscale_status = status
     if process is not None and process.pid is not None:
         if process.is_alive():
             if not state.stopping:
                 state.info_message.set("Finalizing — waiting for worker cleanup...")
+                if state.status_bar is not None:
+                    state.status_bar.set_video_status("finalizing")
             return False
         process.join(timeout=0)
     status = state.pending_upscale_status
@@ -1005,6 +1075,8 @@ def _finish_upscale(status: str) -> bool:
         state.event_stop_upscale_process.clear()
     state.pending_upscale_status = None
     state.stop_deadline = None
+    config = state.processing_config
+    state.processing_config = None
     allow_sleep()
     if state.closing:
         state.processing = False
@@ -1017,6 +1089,10 @@ def _finish_upscale(status: str) -> bool:
     state.processing = False
     state.stopping = False
     App.place_upscale_button()
+    if state.status_bar is not None:
+        video_status = ("job finished" if status == COMPLETED_STATUS else
+                        "stopped" if status == STOP_STATUS else "error")
+        state.status_bar.set_video_status(video_status)
     if status == COMPLETED_STATUS:
         state.info_message.set("All files completed! :)")
         # Provider imports and PowerShell/toast delivery may block. This worker
@@ -1029,7 +1105,20 @@ def _finish_upscale(status: str) -> bool:
         state.info_message.set("Upscaling stopped")
     else:
         state.info_message.set("Error while upscaling :(")
-        show_error_message(status.removeprefix(ERROR_STATUS).strip())
+        if (isinstance(status, CacheSettingsConflict) and config is not None
+                and 1 <= status.file_number <= len(config.selected_file_list)):
+            show_error_message(
+                f"Video: {config.selected_file_list[status.file_number - 1]}\n"
+                f"Failed run output folder: {config.selected_output_path}\n\n{status.message}",
+                clear_cache_command=lambda use_failed_settings: _retry_after_cache_conflict(
+                    config, status.file_number, use_failed_settings=use_failed_settings,
+                ),
+            )
+        else:
+            message = status.message if isinstance(status, CacheSettingsConflict) else (
+                status.removeprefix(ERROR_STATUS).strip()
+            )
+            show_error_message(message)
     return True
 
 
@@ -1044,17 +1133,16 @@ def check_upscale_steps():
         actual_step = app_state.process_status_q.get_nowait()
     except Empty:
         actual_step = None
-    if actual_step in (COMPLETED_STATUS, STOP_STATUS) or (
-        actual_step is not None and str(actual_step).startswith(ERROR_STATUS)
-    ):
-        if _finish_upscale(str(actual_step)):
+    if _is_error_status(actual_step) or actual_step in (COMPLETED_STATUS, STOP_STATUS):
+        if _finish_upscale(actual_step):
             return
     elif (actual_step is not None and actual_step != CLOSE_APP_STATUS
           and app_state.pending_upscale_status is None
           and not app_state.stopping and not app_state.closing):
-        app_state.info_message.set(actual_step)
+        _display_status(actual_step)
+        message = actual_step.message if isinstance(actual_step, VideoProgress) else actual_step
         try:
-            file_number = int(str(actual_step).split(".")[0])
+            file_number = int(message.split(".")[0])
         except (ValueError, IndexError):
             pass
         else:
@@ -1090,10 +1178,12 @@ def stop_button_command():
         app_state.stop_deadline = monotonic() + 10
         if app_state.event_stop_upscale_process is not None:
             app_state.event_stop_upscale_process.set()
-    if not (app_state.pending_upscale_status or "").startswith(ERROR_STATUS):
+    if not _is_error_status(app_state.pending_upscale_status):
         app_state.pending_upscale_status = STOP_STATUS
     if not app_state.closing:
         app_state.info_message.set("Stopping — saving progress and cleaning up...")
+        if app_state.status_bar is not None:
+            app_state.status_bar.set_video_status("stopping")
     check_upscale_steps()
 
 
@@ -1103,13 +1193,51 @@ def upscale_button_command():
     config = build_processing_config()
     if config is None:
         return
-    close_upscale_preview()  # Release its GPU session before the batch allocates VRAM.
+    _start_upscale(config)
+
+
+def _video_cache_directory(config, file_number):
+    return Path(prepare_output_video_directory_name(
+        config.selected_file_list[file_number - 1], config.selected_output_path,
+        config.selected_AI_model, config.input_resize_factor,
+        config.output_resize_factor, config.selected_sharpening_amount,
+    )).resolve()
+
+
+def _retry_after_cache_conflict(config, file_number, *, use_failed_settings=False):
+    if app_state.closing or inputs_are_busy():
+        return
+    try:
+        retry_config = config if use_failed_settings else _processing_config(config.selected_file_list)
+    except ValueError as error:
+        app_state.info_message.set(str(error))
+        return
+    warning = check_disk_space(
+        retry_config.selected_output_path, retry_config.selected_file_list[file_number - 1:],
+    )
+    if warning is not None:
+        app_state.info_message.set("Not enough disk space")
+        show_disk_space_error_message(warning)
+        return
+    # Consent applies only to the reported cache, not a cache in a newly chosen
+    # output folder. A different folder can continue without deleting either.
+    clear_cache = (
+        _video_cache_directory(config, file_number)
+        == _video_cache_directory(retry_config, file_number)
+    )
+    _start_upscale(retry_config, retry_from=file_number, clear_cache=clear_cache)
+
+
+def _start_upscale(config, *, retry_from=None, clear_cache=False):
+    """Keep batch position separate from the explicit permission to reset a cache."""
+    close_upscale_preview()  # Release VRAM for both normal starts and cache retries.
     _drain_status_queue()
     app_state.event_stop_upscale_process.clear()
     app_state.pending_upscale_status = None
+    app_state.processing_config = config
     app_state.stop_deadline = None
     app_state.stopping = False
-    app_state.info_message.set("Loading")
+    _display_status("Loading")
     app_state.processing = True
     App.place_stop_button()
     app_state.process_upscale_orchestrator = Process(
@@ -1131,6 +1259,8 @@ def upscale_button_command():
             config.selected_video_extension,
             config.selected_video_codec,
         ),
+        **({"kwargs": {"retry_from": retry_from, "clear_cache": clear_cache}}
+           if retry_from is not None else {}),
     )
     try:
         prevent_sleep()
